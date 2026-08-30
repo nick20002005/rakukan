@@ -209,15 +209,38 @@ struct LearnHistoryFileV1 {
     entries: HashMap<String, Vec<LearnEntryV1>>,
 }
 
+/// 1 日 1 回確定し続けたときに `suggestion_freq` が収束する値。
+///
+/// v2 の更新式 `f = f * 0.5^(dt / HALF_LIFE) + 1` の不動点なので、
+/// 半減期を変えればこの値も追随する。1 日に複数回確定する候補は
+/// これより高い値に収束するため、v2 における上限ではない点に注意。
+fn learn_freq_daily_equilibrium() -> f32 {
+    (1.0 / (1.0 - 0.5_f64.powf(1.0 / LEARN_HALF_LIFE_DAYS))) as f32
+}
+
+/// v1 の減衰なし通算カウンタを v2 のアキュムレータ相当に写す。
+///
+/// v1 は減衰しないので、通算 1000 回のような値がそのまま入ると半減期 30 日では
+/// 平衡値まで落ちるのに 4 か月以上かかり、移行直後の候補順位が固定されてしまう。
+/// かといって一律に丸めると常用候補どうしの相対順位が消え、保存後は復元できない。
+/// そこで平衡値までは素通しし、それを超えた分だけ対数圧縮する。狭義単調なので
+/// 順序は保たれ、かつ絶対値は暴走しない。
+fn migrate_v1_freq(count: u32) -> f32 {
+    let knee = learn_freq_daily_equilibrium();
+    let c = count as f32;
+    if c <= knee {
+        c
+    } else {
+        knee + (1.0 + (c - knee)).ln()
+    }
+}
+
 impl From<LearnEntryV1> for LearnEntry {
     fn from(e: LearnEntryV1) -> Self {
-        // v1 の生カウンタはそのまま f に流し込む。v2 の上限（毎日利用で約 44）を
-        // 超えている場合だけ丸めて、移行直後に旧エントリが不当に強くならないようにする。
-        const V2_DAILY_CAP: f32 = 44.0;
         LearnEntry {
             surface: e.surface,
             last_access_time: e.last_access_time,
-            suggestion_freq: (e.suggestion_freq as f32).min(V2_DAILY_CAP),
+            suggestion_freq: migrate_v1_freq(e.suggestion_freq),
             shown_freq: e.shown_freq,
         }
     }
@@ -1387,13 +1410,33 @@ priority = "low"
         let entries = &loaded["もりの"];
         let mori = entries.iter().find(|e| e.surface == "森の").unwrap();
         let mori_no = entries.iter().find(|e| e.surface == "杜野").unwrap();
+        // 平衡値以下の通算カウンタはそのまま引き継ぐ
         assert!((mori.suggestion_freq - 3.0).abs() < 1e-5);
-        // v1 の青天井カウンタは v2 の毎日利用上限で頭打ちにする
+        // 平衡値を超えた分は対数圧縮する。頭打ちにはせず、必ず上回る。
+        let knee = learn_freq_daily_equilibrium();
         assert!(
-            (mori_no.suggestion_freq - 44.0).abs() < 1e-5,
-            "got {}",
+            mori_no.suggestion_freq > knee,
+            "圧縮しても平衡値は上回るはず: {}",
             mori_no.suggestion_freq
         );
+        assert!(
+            mori_no.suggestion_freq < knee + 10.0,
+            "圧縮が効いていない: {}",
+            mori_no.suggestion_freq
+        );
+    }
+
+    #[test]
+    fn test_migrate_v1_freq_is_monotonic() {
+        // 常用候補どうしの相対順位が移行で潰れないこと
+        let knee = learn_freq_daily_equilibrium();
+        assert!(migrate_v1_freq(44) < migrate_v1_freq(100));
+        assert!(migrate_v1_freq(100) < migrate_v1_freq(1000));
+        assert!(migrate_v1_freq(1000) < migrate_v1_freq(100_000));
+        // 平衡値以下は素通し
+        assert!(migrate_v1_freq(0).abs() < 1e-5);
+        assert!((migrate_v1_freq(10) - 10.0).abs() < 1e-5);
+        assert!(migrate_v1_freq(knee as u32) <= knee);
     }
 
     /// v1 形式を書き出すテスト用シリアライザ
