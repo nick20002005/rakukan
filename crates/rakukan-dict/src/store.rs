@@ -131,7 +131,11 @@ fn is_learnable_without_dict(c: char) -> bool {
 
 struct DictStoreInner {
     /// ユーザー辞書（手動登録のみ）。Phase 2b 以降は `learn()` で更新しない。
+    /// `priority = "normal"`（既定）のエントリだけを保持する。
     user: RwLock<HashMap<String, Vec<String>>>,
+    /// ユーザー辞書のうち `priority = "low"` のエントリ。
+    /// 学習履歴の後ろ・システム辞書の前に差し込む。
+    user_low: RwLock<HashMap<String, Vec<String>>>,
     /// ユーザー辞書ファイル。設定画面や外部エディタで編集された場合の
     /// hot reload 判定に使う。
     user_path: Option<PathBuf>,
@@ -184,16 +188,16 @@ impl DictStore {
     ) -> Result<Self> {
         let user_file_state = user_path.map(user_dict_file_state).unwrap_or_default();
         // ユーザー辞書: 失敗しても空で続行（パスエラー・パースエラー問わず）
-        let user = if let Some(p) = user_path {
+        let (user, user_low) = if let Some(p) = user_path {
             match UserDict::load(p) {
-                Ok(ud) => ud.to_map(),
+                Ok(ud) => ud.to_maps(),
                 Err(e) => {
                     warn!("user_dict load failed ({}): {}", p.display(), e);
-                    HashMap::new()
+                    (HashMap::new(), HashMap::new())
                 }
             }
         } else {
-            HashMap::new()
+            (HashMap::new(), HashMap::new())
         };
 
         // mozc辞書: 失敗しても None で続行
@@ -261,6 +265,7 @@ impl DictStore {
         Ok(Self {
             inner: Arc::new(DictStoreInner {
                 user: RwLock::new(user),
+                user_low: RwLock::new(user_low),
                 user_path: user_path.map(|p| p.to_path_buf()),
                 user_file_state: RwLock::new(user_file_state),
                 mozc,
@@ -274,6 +279,7 @@ impl DictStore {
         Self {
             inner: Arc::new(DictStoreInner {
                 user: RwLock::new(HashMap::new()),
+                user_low: RwLock::new(HashMap::new()),
                 user_path: None,
                 user_file_state: RwLock::new(UserDictFileState::default()),
                 mozc: None,
@@ -299,8 +305,8 @@ impl DictStore {
             return false;
         }
 
-        let loaded = match UserDict::load(path) {
-            Ok(ud) => ud.to_map(),
+        let (loaded, loaded_low) = match UserDict::load(path) {
+            Ok(ud) => ud.to_maps(),
             Err(e) => {
                 warn!(
                     "user_dict hot reload failed ({}): {}; keeping previous entries",
@@ -313,11 +319,17 @@ impl DictStore {
                 return false;
             }
         };
-        let count = loaded.len();
+        let count = loaded.len() + loaded_low.len();
         if let Ok(mut user) = self.inner.user.write() {
             *user = loaded;
         } else {
             warn!("user_dict hot reload failed: user lock poisoned");
+            return false;
+        }
+        if let Ok(mut user_low) = self.inner.user_low.write() {
+            *user_low = loaded_low;
+        } else {
+            warn!("user_dict hot reload failed: user_low lock poisoned");
             return false;
         }
         if let Ok(mut state) = self.inner.user_file_state.write() {
@@ -477,13 +489,25 @@ impl DictStore {
         !surface.is_empty() && surface.chars().all(is_learnable_without_dict)
     }
 
-    /// ひらがな読みからユーザー辞書候補のみを返す（merge_candidates 用）
+    /// ひらがな読みからユーザー辞書候補（`priority = "normal"`）のみを返す
+    /// （merge_candidates 用）
     pub fn lookup_user(&self, reading: &str) -> Vec<String> {
         self.reload_user_if_changed();
         let Ok(user) = self.inner.user.read() else {
             return vec![];
         };
         user.get(reading).cloned().unwrap_or_default()
+    }
+
+    /// ひらがな読みから低優先ユーザー辞書候補（`priority = "low"`）を返す。
+    ///
+    /// `lookup_user` と違い、学習履歴より後ろに差し込むことを想定している。
+    pub fn lookup_user_low(&self, reading: &str) -> Vec<String> {
+        self.reload_user_if_changed();
+        let Ok(user_low) = self.inner.user_low.read() else {
+            return vec![];
+        };
+        user_low.get(reading).cloned().unwrap_or_default()
     }
 
     /// ひらがな読みから mozc 候補を返す（ユーザー辞書を除く）
@@ -580,8 +604,11 @@ impl DictStore {
     pub fn is_mozc_loaded(&self) -> bool {
         self.inner.mozc.is_some()
     }
+    /// ユーザー辞書の読み数を返す（normal + low、テスト/診断用）
     pub fn user_entry_count(&self) -> usize {
-        self.inner.user.read().map(|u| u.len()).unwrap_or(0)
+        let normal = self.inner.user.read().map(|u| u.len()).unwrap_or(0);
+        let low = self.inner.user_low.read().map(|u| u.len()).unwrap_or(0);
+        normal + low
     }
 
     /// 学習履歴の合計エントリ数を返す（テスト/診断用）
@@ -705,6 +732,7 @@ mod tests {
         DictStore {
             inner: Arc::new(DictStoreInner {
                 user: RwLock::new(user_map),
+                user_low: RwLock::new(HashMap::new()),
                 user_path: None,
                 user_file_state: RwLock::new(UserDictFileState::default()),
                 mozc: None,
@@ -720,6 +748,62 @@ mod tests {
         let r = store.lookup("zzz", 10);
         assert!(r.candidates.is_empty());
         assert_eq!(r.source, DictSource::None);
+    }
+
+    #[test]
+    fn test_lookup_user_low_is_separated_from_normal() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_path = dir.path().join("user_dict.toml");
+        std::fs::write(
+            &user_path,
+            r#"
+[[entries]]
+reading = "りんぜ"
+surfaces = ["凛世"]
+
+[[entries]]
+reading = "みどり"
+surfaces = ["ミドリ"]
+priority = "low"
+"#,
+        )
+        .unwrap();
+
+        let store = DictStore::load(Some(&user_path), None, None).unwrap();
+
+        assert_eq!(store.lookup_user("りんぜ"), vec!["凛世"]);
+        assert!(store.lookup_user("みどり").is_empty());
+
+        assert_eq!(store.lookup_user_low("みどり"), vec!["ミドリ"]);
+        assert!(store.lookup_user_low("りんぜ").is_empty());
+
+        // normal + low の読み数を数える
+        assert_eq!(store.user_entry_count(), 2);
+    }
+
+    #[test]
+    fn test_user_dict_hot_reload_picks_up_priority_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_path = dir.path().join("user_dict.toml");
+        std::fs::write(
+            &user_path,
+            "[[entries]]\nreading = \"みどり\"\nsurfaces = [\"ミドリ\"]\n",
+        )
+        .unwrap();
+
+        let store = DictStore::load(Some(&user_path), None, None).unwrap();
+        assert_eq!(store.lookup_user("みどり"), vec!["ミドリ"]);
+        assert!(store.lookup_user_low("みどり").is_empty());
+
+        // mtime だけでは変化を拾えない環境があるのでサイズも変わる内容にする
+        std::fs::write(
+            &user_path,
+            "[[entries]]\nreading = \"みどり\"\nsurfaces = [\"ミドリ\"]\npriority = \"low\"\n",
+        )
+        .unwrap();
+
+        assert!(store.lookup_user("みどり").is_empty());
+        assert_eq!(store.lookup_user_low("みどり"), vec!["ミドリ"]);
     }
 
     #[test]
