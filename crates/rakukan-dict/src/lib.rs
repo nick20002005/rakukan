@@ -1,8 +1,10 @@
 //! rakukan-dict — 辞書パーサー・ユーザー辞書管理
 //!
 //! 辞書の優先順位:
-//! 1. ユーザー登録語（user_dict.toml）
-//! 2. mozc バイナリ辞書（rakukan.dict, インストール時にビルド）
+//! 1. ユーザー登録語（user_dict.toml、`priority = "normal"`）
+//! 2. 学習履歴（learn_history.bin、スコア順）
+//! 3. ユーザー登録語（user_dict.toml、`priority = "low"`）
+//! 4. mozc バイナリ辞書（rakukan.dict, インストール時にビルド）
 //!
 //! 辞書ファイルは %LOCALAPPDATA%\rakukan\dict\ に配置する。
 
