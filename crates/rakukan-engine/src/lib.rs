@@ -746,12 +746,23 @@ impl RakunEngine {
         llm_candidates: Vec<String>,
         limit: usize,
     ) -> Vec<String> {
-        // 優先順位: ユーザー辞書 → 学習済み辞書候補（スコア順） → 残り辞書候補 → LLM
+        // 優先順位: ユーザー辞書(normal) → 学習済み辞書候補（スコア順）
+        //           → ユーザー辞書(low) → 残り辞書候補 → LLM
         // 学習スコアで上位に来た辞書候補を先に表示し、LLM は空きスロットを埋める。
+        //
+        // `priority = "low"` のユーザー辞書エントリを学習履歴より後ろに置くことで、
+        // 一般語と読みが衝突する固有名詞を大量登録しても通常変換を壊さない。
+        // 一度選べば学習履歴に載って前に出て、使わなくなれば学習スコアの減衰で戻る。
         let user_cands: Vec<String> = self
             .dict_store
             .as_ref()
             .map(|d| d.lookup_user(hiragana))
+            .unwrap_or_default();
+
+        let user_low_cands: Vec<String> = self
+            .dict_store
+            .as_ref()
+            .map(|d| d.lookup_user_low(hiragana))
             .unwrap_or_default();
 
         let learn_cands: Vec<String> = self
@@ -767,7 +778,7 @@ impl RakunEngine {
             .unwrap_or_default();
 
         debug!(
-            "engine::merge: reading={:?} dict_store={} user_cands={:?} learn_cands={:?} dict_cands={:?} llm_cands={:?}",
+            "engine::merge: reading={:?} dict_store={} user_cands={:?} user_low_cands={:?} learn_cands={:?} dict_cands={:?} llm_cands={:?}",
             hiragana,
             if self.dict_store.is_some() {
                 "Some"
@@ -775,6 +786,7 @@ impl RakunEngine {
                 "None"
             },
             user_cands,
+            user_low_cands,
             learn_cands,
             dict_cands,
             llm_candidates
@@ -805,7 +817,17 @@ impl RakunEngine {
             }
         }
 
-        // 3. 残りの辞書候補（学習で上昇済みのものは既に merged に含まれる）
+        // 3. 低優先ユーザー辞書（学習履歴の後ろ・システム辞書の前）
+        for c in &user_low_cands {
+            if merged.len() >= limit {
+                break;
+            }
+            if !merged.contains(c) {
+                merged.push(c.clone());
+            }
+        }
+
+        // 4. 残りの辞書候補（学習で上昇済みのものは既に merged に含まれる）
         for c in &dict_cands {
             if merged.len() >= limit {
                 break;
@@ -815,7 +837,7 @@ impl RakunEngine {
             }
         }
 
-        // 4. LLM候補（残りスロット、文脈考慮）
+        // 5. LLM候補（残りスロット、文脈考慮）
         for c in llm_candidates {
             if merged.len() >= limit {
                 break;
@@ -1441,6 +1463,78 @@ surfaces = ["』"]
         assert_eq!(merged.first().map(String::as_str), Some("』"));
         assert!(merged.iter().any(|candidate| candidate == "かっことじ"));
         assert!(!merged.iter().any(|candidate| candidate == "べつのよみ"));
+    }
+
+    #[test]
+    fn merge_candidates_places_low_priority_user_dict_after_learn_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_path = dir.path().join("user_dict.toml");
+        fs::write(
+            &user_path,
+            r#"
+[[entries]]
+reading = "みどり"
+surfaces = ["ミドリ"]
+priority = "low"
+"#,
+        )
+        .unwrap();
+
+        let store = DictStore::load(Some(&user_path), None, None).unwrap();
+        let mut engine = RakunEngine::new(EngineConfig {
+            num_candidates: 9,
+            ..Default::default()
+        });
+        engine.set_dict_store(store);
+
+        // 学習前: 低優先エントリしか無いので先頭に出る
+        let merged = engine.merge_candidates_for_reading("みどり", vec!["翠".to_string()], 40);
+        assert_eq!(merged.first().map(String::as_str), Some("ミドリ"));
+
+        // 「緑」を一度選んだことにすると、学習履歴が低優先エントリを追い越す
+        engine.learn_force("みどり", "緑");
+        let merged = engine.merge_candidates_for_reading("みどり", vec!["翠".to_string()], 40);
+        let pos_learn = merged.iter().position(|c| c == "緑").unwrap();
+        let pos_low = merged.iter().position(|c| c == "ミドリ").unwrap();
+        let pos_llm = merged.iter().position(|c| c == "翠").unwrap();
+        assert!(
+            pos_learn < pos_low,
+            "学習履歴は低優先ユーザー辞書より前: {merged:?}"
+        );
+        assert!(
+            pos_low < pos_llm,
+            "低優先ユーザー辞書は LLM 候補より前: {merged:?}"
+        );
+    }
+
+    #[test]
+    fn merge_candidates_normal_priority_still_outranks_learn_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_path = dir.path().join("user_dict.toml");
+        fs::write(
+            &user_path,
+            r#"
+[[entries]]
+reading = "りんぜ"
+surfaces = ["凛世"]
+"#,
+        )
+        .unwrap();
+
+        let store = DictStore::load(Some(&user_path), None, None).unwrap();
+        let mut engine = RakunEngine::new(EngineConfig {
+            num_candidates: 9,
+            ..Default::default()
+        });
+        engine.set_dict_store(store);
+        engine.learn_force("りんぜ", "臨済");
+
+        let merged = engine.merge_candidates_for_reading("りんぜ", vec![], 40);
+        assert_eq!(
+            merged.first().map(String::as_str),
+            Some("凛世"),
+            "既定優先度のユーザー辞書は従来どおり最優先: {merged:?}"
+        );
     }
 }
 
