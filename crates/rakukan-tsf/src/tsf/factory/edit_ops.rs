@@ -185,6 +185,51 @@ impl super::TextServiceFactory_Impl {
         Ok(true)
     }
 
+    /// 入力中の予測ウィンドウ（`suggestion` モジュール）を候補リストとして開く。
+    ///
+    /// 予測は表示しているだけで `SessionState` は Preedit / LiveConv のままなので、
+    /// ↓ / Tab が来たここで初めて `Selecting` に遷移させる。開けた場合 `true`。
+    fn open_suggestion_list(
+        &self,
+        sess: &mut crate::engine::state::SessionState,
+        ctx: ITfContext,
+        tid: u32,
+        sink: ITfCompositionSink,
+    ) -> Result<bool> {
+        let reading = sess.original_preedit().unwrap_or("").to_string();
+        if reading.is_empty() {
+            return Ok(false);
+        }
+        let Some(items) = crate::tsf::suggestion::take_for(&reading) else {
+            return Ok(false);
+        };
+        let caret = caret_rect_get();
+        // ライブ変換の preview が候補表示を上書きしないよう、タイマーを止めてから遷移する。
+        candidate_window::stop_live_timer();
+        crate::tsf::live_session::queue_preview_clear();
+        sess.activate_selecting_with_affixes(
+            items,
+            reading,
+            caret.left,
+            caret.bottom,
+            false,
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        );
+        let page_cands = sess.page_candidates();
+        let page_info = sess.page_info();
+        let text = sess
+            .current_candidate()
+            .or_else(|| sess.original_preedit())
+            .unwrap_or("")
+            .to_string();
+        candidate_window::show(&page_cands, 0, &page_info, caret.left, caret.bottom);
+        update_composition(ctx, tid, sink, text)?;
+        Ok(true)
+    }
+
     pub(super) fn on_candidate_move(
         &self,
         ctx: ITfContext,
@@ -200,6 +245,12 @@ impl super::TextServiceFactory_Impl {
         drop(guard);
         let mut sess = session_get()?;
         if !sess.is_candidate_list_active() {
+            // 予測ウィンドウ表示中の ↓ → 予測候補を候補リストとして開く
+            if matches!(dir, CandidateDir::Next)
+                && self.open_suggestion_list(&mut sess, ctx.clone(), tid, sink.clone())?
+            {
+                return Ok(true);
+            }
             return Ok(has_pre);
         }
         // BlockSelecting: 現在ブロックの候補をサイクル
@@ -264,6 +315,12 @@ impl super::TextServiceFactory_Impl {
         drop(guard);
         let mut sess = session_get()?;
         if !sess.is_candidate_list_active() {
+            // 予測ウィンドウ表示中の Tab（プリセットでは CandidatePageDown）→ 候補リストを開く
+            if matches!(dir, CandidateDir::Next)
+                && self.open_suggestion_list(&mut sess, ctx.clone(), tid, sink.clone())?
+            {
+                return Ok(true);
+            }
             return Ok(has_pre);
         }
         // BlockSelecting: ページ切り替えは候補サイクルと同じ扱い（1ページのみ）
@@ -301,6 +358,74 @@ impl super::TextServiceFactory_Impl {
         let caret = caret_rect_get();
         candidate_window::show(&page_cands, page_sel, &page_info, caret.left, caret.bottom);
         update_composition_candidate_parts(ctx, tid, sink, prefix, text, remainder)?;
+        Ok(true)
+    }
+
+    /// 選択中の候補を学習履歴から削除する（Ctrl+Delete、Google 日本語入力相当）。
+    ///
+    /// 短文予測の候補は「現在の読み」より長いキーで登録されているため、
+    /// エンジン側は読みの**前方一致**で削除する（`DictStore::forget_matching`）。
+    /// 辞書・LLM 由来で学習履歴に無い候補を消そうとした場合は削除件数 0 になるが、
+    /// 候補リストからは一時的に取り除く（次の変換では再び出る）。
+    pub(super) fn on_candidate_forget(
+        &self,
+        ctx: ITfContext,
+        tid: u32,
+        sink: ITfCompositionSink,
+        mut guard: crate::engine::state::EngineGuard,
+    ) -> Result<bool> {
+        let engine = match guard.as_mut() {
+            Some(e) => e,
+            None => return Ok(false),
+        };
+        let has_pre = !engine.preedit_is_empty();
+        let mut sess = session_get()?;
+        // BlockSelecting は読みとブロックの対応付けが別管理なので対象外。
+        if !sess.is_candidate_list_active() || sess.is_block_selecting() {
+            return Ok(has_pre);
+        }
+        let reading = sess.original_preedit().unwrap_or("").to_string();
+        let text = sess.current_candidate().unwrap_or("").to_string();
+        if reading.is_empty() || text.is_empty() || text == reading {
+            return Ok(true);
+        }
+
+        let removed = engine.forget(&reading, &text);
+        tracing::info!(
+            "candidate_forget reading={:?} text={:?} removed={}",
+            reading,
+            text,
+            removed
+        );
+        sess.remove_current_candidate();
+
+        let page_cands = sess.page_candidates();
+        if page_cands.is_empty() {
+            // 候補が尽きた → 読みに戻して候補ウィンドウを閉じる
+            sess.set_preedit(reading.clone());
+            drop(sess);
+            candidate_window::hide();
+            engine.force_preedit(reading.clone());
+            drop(guard);
+            update_composition(ctx, tid, sink, reading)?;
+            return Ok(true);
+        }
+
+        let page_sel = sess.page_selected();
+        let page_info = sess.page_info();
+        let next_text = sess
+            .current_candidate()
+            .or_else(|| sess.original_preedit())
+            .unwrap_or("")
+            .to_string();
+        let prefix = sess.selecting_prefix_clone();
+        let remainder = sess.selecting_remainder_clone();
+        drop(sess);
+        drop(guard);
+        let caret = caret_rect_get();
+        candidate_window::update_selection(page_sel, &page_info);
+        candidate_window::show(&page_cands, page_sel, &page_info, caret.left, caret.bottom);
+        update_composition_candidate_parts(ctx, tid, sink, prefix, next_text, remainder)?;
         Ok(true)
     }
 
@@ -343,14 +468,8 @@ impl super::TextServiceFactory_Impl {
             text.clone()
         };
         if crate::engine::state::should_learn_and_log(&reading, &text, candidate_source) {
-            if matches!(
-                candidate_source,
-                Some(crate::engine::state::CandidateViewSource::Bg)
-            ) {
-                engine.learn_force(&reading, &text);
-            } else {
-                engine.learn(&reading, &text);
-            }
+            // 確定した合成は辞書ガードなしで学習する（Google 日本語入力相当）
+            engine.learn_force(&reading, &text);
         }
         candidate_window::hide();
         let confirmed = format!("{prefix}{commit_text}");

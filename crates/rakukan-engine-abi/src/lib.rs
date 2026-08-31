@@ -18,7 +18,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use libloading::{Library, Symbol};
 
-const EXPECTED_ENGINE_ABI_VERSION: u32 = 9;
+const EXPECTED_ENGINE_ABI_VERSION: u32 = 11;
 
 // ─── Segments モデル（CONVERTER_REDESIGN Phase A） ────────────────────────────
 
@@ -146,6 +146,8 @@ struct EngineVTable {
     // 学習
     learn: unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char),
     learn_force: unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char),
+    forget: unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char) -> bool,
+    predict: unsafe extern "C" fn(*mut c_void, *const c_char, u32) -> *mut c_char,
 
     // 診断
     last_error: unsafe extern "C" fn() -> *mut c_char,
@@ -230,6 +232,8 @@ impl EngineVTable {
             available_models_json: load_sym!(lib, b"engine_available_models_json\0"),
             learn: load_sym!(lib, b"engine_learn\0"),
             learn_force: load_sym!(lib, b"engine_learn_force\0"),
+            forget: load_sym!(lib, b"engine_forget\0"),
+            predict: load_sym!(lib, b"engine_predict\0"),
             last_error: load_sym!(lib, b"engine_last_error\0"),
             dict_status: load_sym!(lib, b"engine_dict_status\0"),
         })
@@ -585,6 +589,25 @@ impl DynEngine {
         unsafe {
             (self.vtable.learn_force)(self.handle, r.as_ptr(), s.as_ptr());
         }
+    }
+
+    /// 入力中の予測候補を返す（学習履歴のみ、LLM/MOZC は引かない）。
+    pub fn predict(&self, reading: &str, limit: usize) -> Vec<String> {
+        let creading = Self::to_cstring(reading);
+        unsafe {
+            let ptr = (self.vtable.predict)(self.handle, creading.as_ptr(), limit as u32);
+            match self.take_cstr(ptr) {
+                Some(s) => serde_json::from_str(&s).unwrap_or_default(),
+                None => vec![],
+            }
+        }
+    }
+
+    /// 学習履歴から候補を削除する。`reading` に前方一致するキーも対象。
+    pub fn forget(&mut self, reading: &str, surface: &str) -> bool {
+        let r = Self::to_cstring(reading);
+        let s = Self::to_cstring(surface);
+        unsafe { (self.vtable.forget)(self.handle, r.as_ptr(), s.as_ptr()) }
     }
 
     /// エンジン DLL 側の最後のエラー/ステータスメッセージを返す（診断用）

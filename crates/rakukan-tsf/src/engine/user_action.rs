@@ -38,6 +38,8 @@ pub enum UserAction {
     CandidatePageDown,   // PageDown
     CandidatePageUp,     // PageUp
     CandidateSelect(u8), // 数字 1–9
+    /// 選択中の候補を学習履歴から削除（Ctrl+Delete）
+    CandidateForget,
 
     // ─── IME オン/オフ ───────────────────────────────────────────────────
     /// IME をオフにする（英数パススルーモードへ）

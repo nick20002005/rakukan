@@ -17,7 +17,7 @@ pub const PIPE_BASE_NAME: &str = "rakukan-engine";
 /// - v4: `MergeCandidatesForReading` を追加
 /// - (v4 のまま) `MergeCandidates` を廃止して `_ReservedMergeCandidates` に。
 ///   ホストは `Error` を返す（TSF 側の呼び出しは同時に削除済み）
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// `InputChar` バッチ RPC で指定する入力モード。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -231,6 +231,24 @@ pub enum Request {
     /// `Shutdown` にフォールバックするため互換性は保たれる。
     ShutdownIfConfigDiffers {
         config_json: Option<String>,
+    },
+
+    // ─── 学習履歴の削除 (v5) ───────────────────────────────
+    /// 候補ウィンドウでの明示削除（Ctrl+Delete）。`reading` に**前方一致**する
+    /// キーもまとめて対象にするため、短文予測で出た候補も消せる。
+    ///
+    /// postcard の discriminant は宣言順なので、この variant も末尾に追加する。
+    Forget {
+        reading: String,
+        surface: String,
+    },
+
+    // ─── 入力中の予測候補 (v6) ─────────────────────────────
+    /// 学習履歴だけを引く軽量な予測。打鍵ごとに呼ばれるため LLM も MOZC も触らない。
+    /// postcard の discriminant は宣言順なので、この variant も末尾に追加する。
+    Predict {
+        reading: String,
+        limit: u32,
     },
 }
 

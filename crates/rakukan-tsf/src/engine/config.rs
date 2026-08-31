@@ -19,6 +19,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub conversion: ConversionConfig,
     #[serde(default)]
+    pub prediction: PredictionConfig,
+    #[serde(default)]
     pub appearance: AppearanceConfig,
     #[serde(default)]
     pub diagnostics: DiagnosticsConfig,
@@ -36,6 +38,7 @@ impl Default for AppConfig {
             input: InputConfig::default(),
             live_conversion: LiveConversionConfig::default(),
             conversion: ConversionConfig::default(),
+            prediction: PredictionConfig::default(),
             appearance: AppearanceConfig::default(),
             diagnostics: DiagnosticsConfig::default(),
             num_candidates: None,
@@ -342,6 +345,58 @@ impl Default for ConversionConfig {
     }
 }
 
+/// 短文予測（Google 日本語入力の「予測候補」相当）。
+///
+/// 確定済みのフレーズを、その読みの**先頭一致**で候補に差し込む。
+/// 例: 「かんたんなことばでぶんせき → 簡単な言葉で分析」を確定したあとに
+/// 「かんたん」まで入力すると、候補 2 番目に全体が出る。
+/// 不要になった予測は候補選択中に Ctrl+Delete で削除できる。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PredictionConfig {
+    #[serde(default = "default_prediction_enabled")]
+    pub enabled: bool,
+    /// 候補リストに差し込む予測の最大件数。
+    #[serde(default = "default_prediction_max_candidates")]
+    pub max_candidates: usize,
+    /// 予測を開始する読みの最小文字数。短すぎると候補が発散する。
+    #[serde(default = "default_prediction_min_reading_chars")]
+    pub min_reading_chars: usize,
+    /// 入力中（Space を押す前）に予測ウィンドウを自動で出す。
+    #[serde(default = "default_suggest_while_typing")]
+    pub suggest_while_typing: bool,
+    /// 予測ウィンドウに並べる最大件数（1〜9）。
+    #[serde(default = "default_suggest_max_candidates")]
+    pub suggest_max_candidates: usize,
+}
+
+fn default_prediction_enabled() -> bool {
+    true
+}
+fn default_prediction_max_candidates() -> usize {
+    2
+}
+fn default_prediction_min_reading_chars() -> usize {
+    2
+}
+fn default_suggest_while_typing() -> bool {
+    true
+}
+fn default_suggest_max_candidates() -> usize {
+    4
+}
+
+impl Default for PredictionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_prediction_enabled(),
+            max_candidates: default_prediction_max_candidates(),
+            min_reading_chars: default_prediction_min_reading_chars(),
+            suggest_while_typing: default_suggest_while_typing(),
+            suggest_max_candidates: default_suggest_max_candidates(),
+        }
+    }
+}
+
 fn default_dump_active_config() -> bool {
     false
 }
@@ -590,6 +645,23 @@ beam_size = 6
 # Space 変換で表示する候補数（1〜30、デフォルト 6）。
 # 新形式は [conversion].num_candidates。旧形式のルート直下 num_candidates も引き続き読める。
 # num_candidates = 6
+
+[prediction]
+# 短文予測（Google 日本語入力の「予測候補」相当）。
+# 一度確定したフレーズを、その読みの前方一致で候補に差し込む。
+# 例:「かんたんなことばでぶんせき → 簡単な言葉で分析」を確定したあと、
+#     「かんたん」まで入力すると候補 2 番目に全体が出る。
+# 不要な予測は候補選択中に Ctrl+Delete で学習履歴ごと削除できる。
+enabled = true
+# 候補リストに差し込む予測の最大件数（0〜9、既定 2）
+max_candidates = 2
+# 予測を開始する読みの最小文字数（既定 2）
+min_reading_chars = 2
+# 入力中（Space を押す前）に予測ウィンドウを自動で出す（既定 true）。
+# 出た予測は Tab / ↓ で候補リストとして開ける。
+suggest_while_typing = true
+# 予測ウィンドウに並べる最大件数（1〜9、既定 4）
+suggest_max_candidates = 4
 
 [appearance]
 # 候補ウィンドウのフォント高さ（ピクセル）。既定 17

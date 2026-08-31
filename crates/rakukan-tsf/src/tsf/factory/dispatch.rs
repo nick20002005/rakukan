@@ -410,6 +410,7 @@ impl super::TextServiceFactory_Impl {
                 self.on_candidate_page(ctx, tid, sink, guard, CandidateDir::Prev)
             }
             UserAction::CandidateSelect(n) => self.on_candidate_select(n, ctx, tid, sink, guard),
+            UserAction::CandidateForget => self.on_candidate_forget(ctx, tid, sink, guard),
             UserAction::CursorLeft => self.on_segment_move_left(ctx, tid, sink, guard),
             UserAction::CursorRight => self.on_segment_move_right(ctx, tid, sink, guard),
             UserAction::Punctuate(c) => self.on_punctuate(c, ctx, tid, sink, guard),

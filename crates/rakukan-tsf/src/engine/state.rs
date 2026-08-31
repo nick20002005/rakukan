@@ -599,6 +599,9 @@ fn build_engine_config_json() -> String {
     };
     let live_conv_beam_size = cfg.live_conversion.beam_size.clamp(1, 9);
     let convert_beam_size = cfg.conversion.beam_size.clamp(1, 30);
+    let prediction_enabled = cfg.prediction.enabled;
+    let prediction_max_candidates = cfg.prediction.max_candidates.clamp(0, 9);
+    let prediction_min_reading_chars = cfg.prediction.min_reading_chars.max(1);
     let digit_separator_auto = cfg.input.digit_separator_auto;
     let digit_candidates_order = cfg
         .input
@@ -615,14 +618,14 @@ fn build_engine_config_json() -> String {
         .join(",");
 
     tracing::info!(
-        "engine config: num_candidates={num_candidates} n_gpu_layers={n_gpu_layers} main_gpu={main_gpu} model_variant={model_variant:?} digit_width={digit_width} alpha_width={alpha_width} symbol_width={symbol_width} digit_separator_auto={digit_separator_auto} digit_candidates_order=[{digit_candidates_order}] live_conv_beam_size={live_conv_beam_size} convert_beam_size={convert_beam_size}"
+        "engine config: num_candidates={num_candidates} n_gpu_layers={n_gpu_layers} main_gpu={main_gpu} model_variant={model_variant:?} digit_width={digit_width} alpha_width={alpha_width} symbol_width={symbol_width} digit_separator_auto={digit_separator_auto} digit_candidates_order=[{digit_candidates_order}] live_conv_beam_size={live_conv_beam_size} convert_beam_size={convert_beam_size} prediction_enabled={prediction_enabled} prediction_max_candidates={prediction_max_candidates} prediction_min_reading_chars={prediction_min_reading_chars}"
     );
     let mv_json = match &model_variant {
         Some(v) => format!(r#","model_variant":"{}""#, v),
         None => String::new(),
     };
     format!(
-        r#"{{"num_candidates":{num_candidates},"n_gpu_layers":{n_gpu_layers},"main_gpu":{main_gpu},"n_threads":0,"digit_width":"{digit_width}","alpha_width":"{alpha_width}","symbol_width":"{symbol_width}","digit_separator_auto":{digit_separator_auto},"digit_candidates_order":[{digit_candidates_order}],"live_conv_beam_size":{live_conv_beam_size},"convert_beam_size":{convert_beam_size}{mv_json}}}"#
+        r#"{{"num_candidates":{num_candidates},"n_gpu_layers":{n_gpu_layers},"main_gpu":{main_gpu},"n_threads":0,"digit_width":"{digit_width}","alpha_width":"{alpha_width}","symbol_width":"{symbol_width}","digit_separator_auto":{digit_separator_auto},"digit_candidates_order":[{digit_candidates_order}],"live_conv_beam_size":{live_conv_beam_size},"convert_beam_size":{convert_beam_size},"prediction_enabled":{prediction_enabled},"prediction_max_candidates":{prediction_max_candidates},"prediction_min_reading_chars":{prediction_min_reading_chars}{mv_json}}}"#
     )
 }
 
@@ -2072,6 +2075,36 @@ impl SessionState {
                 }
             }
             _ => false,
+        }
+    }
+
+    /// 選択中の候補を候補リストから取り除く（学習履歴の削除に伴う UI 更新用）。
+    ///
+    /// 戻り値: 取り除いた候補テキスト。`Selecting` 以外、または候補が空なら `None`。
+    /// 取り除いた結果 `selected` が末尾を超える場合は末尾に寄せる。
+    pub fn remove_current_candidate(&mut self) -> Option<String> {
+        if let SessionState::Selecting {
+            candidates,
+            candidate_views,
+            selected,
+            ..
+        } = self
+        {
+            if *selected >= candidate_views.len() {
+                return None;
+            }
+            let removed = candidate_views.remove(*selected).text;
+            if *selected < candidates.len() {
+                candidates.remove(*selected);
+            }
+            if candidate_views.is_empty() {
+                *selected = 0;
+            } else if *selected >= candidate_views.len() {
+                *selected = candidate_views.len() - 1;
+            }
+            Some(removed)
+        } else {
+            None
         }
     }
 

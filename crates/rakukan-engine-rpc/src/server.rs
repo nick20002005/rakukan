@@ -202,6 +202,8 @@ fn request_label(req: &Request) -> &'static str {
         DictStatus => "DictStatus",
         InputChar { .. } => "InputChar",
         ShutdownIfConfigDiffers { .. } => "ShutdownIfConfigDiffers",
+        Forget { .. } => "Forget",
+        Predict { .. } => "Predict",
     }
 }
 
@@ -430,6 +432,8 @@ fn dispatch_engine(eng: &mut DynEngine, req: Request) -> Response {
             eng.learn_force(&reading, &surface);
             Response::Unit
         }
+        Forget { reading, surface } => Response::Bool(eng.forget(&reading, &surface)),
+        Predict { reading, limit } => Response::Strings(eng.predict(&reading, limit as usize)),
         MergeCandidatesForReading {
             reading,
             llm_cands,

@@ -256,10 +256,118 @@ pub struct EngineConfig {
     /// 詳細は `kanji::ConversionConfig::min_top_confidence` を参照。
     #[serde(default)]
     pub min_top_confidence: Option<f32>,
+    /// 短文予測（学習済みフレーズの前方一致予測）を有効にする。
+    #[serde(default = "default_prediction_enabled")]
+    pub prediction_enabled: bool,
+    /// 1 回の候補リストに差し込む短文予測の最大件数。
+    #[serde(default = "default_prediction_max_candidates")]
+    pub prediction_max_candidates: usize,
+    /// 短文予測を開始する読みの最小文字数。
+    #[serde(default = "default_prediction_min_reading_chars")]
+    pub prediction_min_reading_chars: usize,
+}
+
+fn is_kana_or_cjk(c: char) -> bool {
+    matches!(c,
+        '\u{3041}'..='\u{309f}'   // ひらがな
+        | '\u{30a0}'..='\u{30ff}' // カタカナ
+        | '\u{3400}'..='\u{4dbf}' // CJK 拡張A
+        | '\u{4e00}'..='\u{9fff}' // CJK 統合漢字
+        | '\u{f900}'..='\u{faff}' // CJK 互換漢字
+        | '\u{ff66}'..='\u{ff9f}' // 半角カタカナ
+    )
+}
+
+/// 「記号だけでできている候補」か。
+///
+/// MOZC 辞書には 1 つの読みに記号がまとめて登録されていることがあり、
+/// 「たんい」は ¢ £ ¤ ¥ ° ‰ ′ ″ ₠… だけで 50 件を占める。辞書候補を
+/// 素直に前へ並べると表示スロット（既定 8）が記号で埋まり、LLM が返す
+/// 「単位」が 1 件も入らない。記号だけの候補は LLM の後ろへ回す。
+///
+/// ASCII 英数字だけの候補（"PC" など）は語として扱う。"°C" のように
+/// 記号が混ざるものは記号側。
+fn is_symbol_only_candidate(s: &str) -> bool {
+    !s.is_empty()
+        && !s.chars().any(is_kana_or_cjk)
+        && !s.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// 「ん」補完を試す読みの最小文字数。
+const N_INSERTION_MIN_READING_CHARS: usize = 3;
+/// 1 回の変換で試す代替読みの上限。
+const N_INSERTION_MAX_READINGS: usize = 4;
+/// 代替読みから拾う候補の上限。
+const N_INSERTION_MAX_CANDIDATES: usize = 3;
+
+/// な行かなを「ん + 母音」に開いた代替読みを列挙する。
+///
+/// ローマ字入力では `n` + 母音 が な行になるので、「げんいん」を出すには
+/// `gennin` と n を 2 回打つ必要がある。1 回で済ませると「げにん」になり、
+/// 目的の語が候補に出てこない（原因 / 雰囲気 / 恋愛 / 千円 / 全員 / 金曜 …）。
+///
+/// 先頭のかなは対象外（「ん」で始まる読みは作らない）。
+/// 2 文字以下の読みも対象外。「たに」を「たんい」に開くのは踏み込みすぎで、
+/// 谷 のような正当な変換の後ろに無関係な候補を足すだけになる。
+fn n_insertion_readings(reading: &str) -> Vec<String> {
+    let chars: Vec<char> = reading.chars().collect();
+    if chars.len() < N_INSERTION_MIN_READING_CHARS {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 1;
+    while i < chars.len() {
+        // にゃ/にゅ/にょ は 2 文字まとめて「んや/んゆ/んよ」に開く（きにょう → きんよう）
+        let (consumed, vowel) = match (chars[i], chars.get(i + 1)) {
+            ('に', Some('ゃ')) => (2, 'や'),
+            ('に', Some('ゅ')) => (2, 'ゆ'),
+            ('に', Some('ょ')) => (2, 'よ'),
+            ('な', _) => (1, 'あ'),
+            ('に', _) => (1, 'い'),
+            ('ぬ', _) => (1, 'う'),
+            ('ね', _) => (1, 'え'),
+            ('の', _) => (1, 'お'),
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        let mut alt: String = chars[..i].iter().collect();
+        alt.push('ん');
+        alt.push(vowel);
+        alt.extend(chars[i + consumed..].iter());
+        out.push(alt);
+        if out.len() >= N_INSERTION_MAX_READINGS {
+            break;
+        }
+        i += consumed;
+    }
+    out
+}
+
+/// ASCII 図形文字 (U+0021..U+007E) を全角形 (U+FF01..U+FF5E) に写す。
+fn ascii_to_fullwidth(c: char) -> char {
+    if ('!'..='~').contains(&c) {
+        char::from_u32(c as u32 + 0xFEE0).unwrap_or(c)
+    } else {
+        c
+    }
 }
 
 fn default_confidence_margin() -> Option<f32> {
     Some(3.0)
+}
+
+fn default_prediction_enabled() -> bool {
+    true
+}
+
+fn default_prediction_max_candidates() -> usize {
+    2
+}
+
+fn default_prediction_min_reading_chars() -> usize {
+    2
 }
 
 impl Default for EngineConfig {
@@ -279,6 +387,9 @@ impl Default for EngineConfig {
             convert_beam_size: 30,
             confidence_margin: default_confidence_margin(),
             min_top_confidence: None,
+            prediction_enabled: default_prediction_enabled(),
+            prediction_max_candidates: default_prediction_max_candidates(),
+            prediction_min_reading_chars: default_prediction_min_reading_chars(),
         }
     }
 }
@@ -732,12 +843,78 @@ impl RakunEngine {
         }
     }
 
+    /// 入力中の予測候補（Google 日本語入力の予測ウィンドウ相当）を返す。
+    ///
+    /// 学習履歴のみを引く（LLM も MOZC 辞書も引かない）ので、打鍵ごとに呼んでも
+    /// HashMap の前方一致走査だけで済む。
+    pub fn predict(&self, reading: &str, limit: usize) -> Vec<String> {
+        if !self.config.prediction_enabled {
+            return vec![];
+        }
+        if reading.chars().count() < self.config.prediction_min_reading_chars {
+            return vec![];
+        }
+        self.dict_store
+            .as_ref()
+            .map(|d| d.lookup_learn_suggest(reading, limit))
+            .unwrap_or_default()
+    }
+
+    /// 学習履歴から候補を削除する（候補ウィンドウでの明示削除）。
+    ///
+    /// `reading` に前方一致するキーもまとめて対象にするため、短文予測で出てきた
+    /// 候補（現在の読みより長いキーで登録されている）もその場で消せる。
+    pub fn forget(&mut self, reading: &str, surface: &str) -> bool {
+        if let Some(store) = &self.dict_store {
+            store.forget_matching(reading, surface) > 0
+        } else {
+            tracing::warn!("forget: dict_store not initialized");
+            false
+        }
+    }
+
     pub fn is_dict_ready(&self) -> bool {
         self.dict_store.is_some()
     }
 
     pub fn dict_store_ref(&self) -> Option<&DictStore> {
         self.dict_store.as_ref()
+    }
+
+    /// 入力したローマ字をそのまま出す「英数候補」。戻り値は (半角, 全角)。
+    ///
+    /// `claude` のように日本語のローマ字綴りとして成立しない語は、かな変換を
+    /// 通すと `cぁうで` のような無意味な読みになり、どの候補も当たらない。
+    /// F9/F10 を押せば `romaji_input_log` から復元できるが、それは「変換候補に
+    /// 出ていないだけで、打った文字列はエンジンが保持している」という状態なので、
+    /// 候補として提示する。
+    ///
+    /// `hiragana` がプリエディット全体と一致する時だけ返す。文節分割された
+    /// 部分読みに対してプリエディット全体のローマ字を出さないためのガード。
+    fn romaji_literal_candidates(&self, hiragana: &str) -> Option<(String, String)> {
+        let romaji = self.romaji_log_str();
+        if romaji.is_empty() {
+            return None;
+        }
+        // 英字を含む純粋な英数字列のみ。記号・空白が混ざるものは
+        // digits.rs のリテラル保護レイヤーの担当。
+        if !romaji.chars().all(|c| c.is_ascii_alphanumeric())
+            || !romaji.chars().any(|c| c.is_ascii_alphabetic())
+        {
+            return None;
+        }
+        if self.hiragana_from_romaji_log() != hiragana {
+            return None;
+        }
+        // 読みに ASCII 英字が残っている = ローマ字がかなに変換しきれていない、
+        // という場合だけ出す。"つづけて" のような普通の読みにまで "tudukete" を
+        // 添えると、候補リストが英数字で埋まるうえ、変換途中で候補が 0 件の
+        // 瞬間に先頭を奪ってしまう。普通の読みは従来どおり F9/F10 の担当。
+        if !hiragana.chars().any(|c| c.is_ascii_alphabetic()) {
+            return None;
+        }
+        let full: String = romaji.chars().map(ascii_to_fullwidth).collect();
+        Some((romaji, full))
     }
 
     pub fn merge_candidates_for_reading(
@@ -771,14 +948,59 @@ impl RakunEngine {
             .map(|d| d.lookup_learn(hiragana))
             .unwrap_or_default();
 
-        let dict_cands: Vec<String> = self
+        // MOZC 辞書候補は「語」と「記号だけ」に分ける。記号だけのものは LLM の
+        // 後ろへ回す（`is_symbol_only_candidate` のコメント参照）。
+        let (dict_cands, dict_symbol_cands): (Vec<String>, Vec<String>) = self
             .dict_store
             .as_ref()
             .map(|d| d.lookup_dict(hiragana, limit))
+            .unwrap_or_default()
+            .into_iter()
+            .partition(|c| !is_symbol_only_candidate(c));
+
+        // 「ん」を 1 打鍵で済ませたときの取りこぼしを辞書だけで補う。
+        // LLM は呼ばないので変換の待ち時間は増えない。
+        let n_fix_cands: Vec<String> = self
+            .dict_store
+            .as_ref()
+            .map(|d| {
+                let mut out: Vec<String> = Vec::new();
+                for alt in n_insertion_readings(hiragana) {
+                    let alt_cands = d
+                        .lookup_user(&alt)
+                        .into_iter()
+                        .chain(d.lookup_learn(&alt))
+                        .chain(d.lookup_dict(&alt, N_INSERTION_MAX_CANDIDATES * 2));
+                    for c in alt_cands {
+                        if is_symbol_only_candidate(&c) || out.contains(&c) {
+                            continue;
+                        }
+                        out.push(c);
+                        if out.len() >= N_INSERTION_MAX_CANDIDATES {
+                            return out;
+                        }
+                    }
+                }
+                out
+            })
             .unwrap_or_default();
 
+        // 短文予測（Google 日本語入力の「予測候補」相当）。
+        // 読みが前方一致する学習済みフレーズを引く。読みが短いうちは候補が
+        // 発散するので `prediction_min_reading_chars` 未満では引かない。
+        let prediction_cands: Vec<String> = if self.config.prediction_enabled
+            && hiragana.chars().count() >= self.config.prediction_min_reading_chars
+        {
+            self.dict_store
+                .as_ref()
+                .map(|d| d.lookup_learn_prefix(hiragana, self.config.prediction_max_candidates))
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
         debug!(
-            "engine::merge: reading={:?} dict_store={} user_cands={:?} user_low_cands={:?} learn_cands={:?} dict_cands={:?} llm_cands={:?}",
+            "engine::merge: reading={:?} dict_store={} user_cands={:?} user_low_cands={:?} learn_cands={:?} prediction_cands={:?} dict_cands={:?} llm_cands={:?}",
             hiragana,
             if self.dict_store.is_some() {
                 "Some"
@@ -788,8 +1010,13 @@ impl RakunEngine {
             user_cands,
             user_low_cands,
             learn_cands,
+            prediction_cands,
             dict_cands,
             llm_candidates
+        );
+        debug!(
+            "engine::merge: dict_symbol_cands={:?} n_fix_cands={:?}",
+            dict_symbol_cands, n_fix_cands
         );
 
         let mut merged: Vec<String> = Vec::new();
@@ -837,6 +1064,16 @@ impl RakunEngine {
             }
         }
 
+        // 4.5 「ん」補完（辞書引きのみ）。げにん → げんいん → 原因。
+        for c in &n_fix_cands {
+            if merged.len() >= limit {
+                break;
+            }
+            if !merged.contains(c) {
+                merged.push(c.clone());
+            }
+        }
+
         // 5. LLM候補（残りスロット、文脈考慮）
         for c in llm_candidates {
             if merged.len() >= limit {
@@ -847,10 +1084,65 @@ impl RakunEngine {
             }
         }
 
+        // 5.5 記号だけの辞書候補。表示スロットを奪わないよう LLM の後ろに置く。
+        for c in &dict_symbol_cands {
+            if merged.len() >= limit {
+                break;
+            }
+            if !merged.contains(c) {
+                merged.push(c.clone());
+            }
+        }
+
+        // 6. 短文予測（Google 日本語入力相当）: 読みが前方一致する学習済みの長い
+        //    フレーズを、先頭候補の直後に差し込む。先頭を奪わないのは、ライブ変換の
+        //    preview が候補 0 番を採用するため（打鍵途中に長文が出続けるのを避ける）。
+        if !prediction_cands.is_empty() {
+            // 重複した予測は挿入しないので、挿入位置は「実際に入れた数」で進める
+            // （enumerate の添字で進めると len を超えて insert が panic する）。
+            let mut at = 1.min(merged.len());
+            for c in &prediction_cands {
+                if merged.contains(c) {
+                    continue;
+                }
+                merged.insert(at, c.clone());
+                at += 1;
+            }
+            merged.truncate(limit.max(1));
+        }
+
         // 候補不足時は元の読みを末尾に追加（変換せず確定する退避路）
         let desired_visible = self.config.num_candidates.min(limit);
         if merged.len() < desired_visible && !merged.iter().any(|c| c == hiragana) {
             merged.push(hiragana.to_string());
+        }
+
+        // 7. 英数候補: 入力したローマ字をそのまま出す。
+        //
+        //    退避路の追加より後に置く。Space 直後の同期パスでは LLM がまだ
+        //    返っておらず merged が空になりうるので、先に読みを入れておかないと
+        //    「末尾に足したつもり」が先頭になってしまう。
+        //
+        //    ここに来るのは読みに ASCII 英字が残っている場合だけなので、先頭に置く。
+        //    ローマ字がかなに変換しきれていない = 日本語の語として読む余地が無い、
+        //    という判定であり、`つづけて` のような普通の読みはそもそも
+        //    `romaji_literal_candidates` が None を返して届かない。
+        if let Some((half, full)) = self.romaji_literal_candidates(hiragana) {
+            let ordered = match self.config.alpha_width {
+                AlphaWidth::Halfwidth => [half, full],
+                AlphaWidth::Fullwidth => [full, half],
+            };
+            let mut at = 0usize;
+            for c in ordered {
+                // 既にリストにある場合は取り除いてから入れ直す。読みそのものが
+                // 半角英数（"xy"）だと退避路として末尾に入っており、そのまま
+                // skip すると全角だけが前に出て alpha_width の指定と逆になる。
+                merged.retain(|existing| existing != &c);
+                at = at.min(merged.len());
+                merged.insert(at, c);
+                at += 1;
+            }
+            merged.truncate(limit.max(1));
         }
 
         if merged.is_empty() {
@@ -1579,5 +1871,164 @@ mod passthrough_sync_tests {
         let log = e.romaji_log_str();
         let pending = e.current_preedit().pending_romaji.clone();
         assert_eq!(format!("{}{}", log, pending), "qwrty");
+    }
+
+    fn engine_with_alpha_width(width: crate::AlphaWidth) -> RakunEngine {
+        RakunEngine::new(EngineConfig {
+            num_candidates: 9,
+            alpha_width: width,
+            ..Default::default()
+        })
+    }
+
+    fn type_romaji(engine: &mut RakunEngine, romaji: &str) {
+        for c in romaji.chars() {
+            engine.push_char(c);
+        }
+    }
+
+    #[test]
+    fn romaji_literal_candidate_leads_when_reading_keeps_ascii() {
+        let mut engine = engine_with_alpha_width(crate::AlphaWidth::Halfwidth);
+        type_romaji(&mut engine, "claude");
+
+        // "cl" はローマ字表に無いので 'c' が素通しになり、読みに ASCII が残る。
+        let reading = engine.hiragana_text().to_string();
+        assert!(
+            reading.chars().any(|c| c.is_ascii_alphabetic()),
+            "reading={reading:?}"
+        );
+
+        let merged = engine.merge_candidates(vec!["cぁうで".to_string()], 40);
+        assert_eq!(merged.first().map(String::as_str), Some("claude"));
+        assert_eq!(merged.get(1).map(String::as_str), Some("ｃｌａｕｄｅ"));
+    }
+
+    #[test]
+    fn romaji_literal_candidate_leads_when_reading_is_all_ascii() {
+        let mut engine = engine_with_alpha_width(crate::AlphaWidth::Halfwidth);
+        type_romaji(&mut engine, "xyz");
+
+        let reading = engine.hiragana_text().to_string();
+        assert!(
+            !reading.is_empty() && reading.chars().all(|c| c.is_ascii()),
+            "reading={reading:?}"
+        );
+
+        let merged = engine.merge_candidates(vec![], 40);
+        assert_eq!(merged.first().map(String::as_str), Some(reading.as_str()));
+    }
+
+    #[test]
+    fn romaji_literal_candidate_order_follows_alpha_width() {
+        let mut engine = engine_with_alpha_width(crate::AlphaWidth::Fullwidth);
+        type_romaji(&mut engine, "claude");
+
+        let merged = engine.merge_candidates(vec!["cぁうで".to_string()], 40);
+        assert_eq!(merged.first().map(String::as_str), Some("ｃｌａｕｄｅ"));
+        assert_eq!(merged.get(1).map(String::as_str), Some("claude"));
+    }
+
+    #[test]
+    fn romaji_literal_candidate_is_absent_for_normal_readings() {
+        let mut engine = engine_with_alpha_width(crate::AlphaWidth::Halfwidth);
+        type_romaji(&mut engine, "tudukete");
+        assert_eq!(engine.hiragana_text(), "つづけて");
+
+        // 読みに ASCII が残っていない普通の語には英数候補を出さない。
+        // Space 直後は LLM がまだ返らず候補が空なので、ここで足すと先頭を奪う。
+        let merged = engine.merge_candidates(vec![], 40);
+        assert!(
+            !merged.iter().any(|c| c.chars().any(|c| c.is_ascii_alphabetic())),
+            "merged={merged:?}"
+        );
+    }
+
+    #[test]
+    fn romaji_literal_candidate_is_skipped_for_partial_readings() {
+        let mut engine = engine_with_alpha_width(crate::AlphaWidth::Halfwidth);
+        type_romaji(&mut engine, "claude");
+
+        // 文節分割された部分読みに対して、プリエディット全体のローマ字を出さない
+        let merged =
+            engine.merge_candidates_for_reading("べつのよみ", vec!["別の読み".to_string()], 40);
+        assert!(
+            !merged.iter().any(|c| c == "claude"),
+            "merged={merged:?}"
+        );
+    }
+
+    #[test]
+    fn symbol_only_candidate_classification() {
+        for s in ["¢", "£", "€", "°", "‰", "″", "°C", "「」", "→"] {
+            assert!(crate::is_symbol_only_candidate(s), "{s:?} は記号扱いのはず");
+        }
+        for s in ["単位", "矢印", "カンイ", "たんい", "PC", "R18", "A"] {
+            assert!(!crate::is_symbol_only_candidate(s), "{s:?} は語扱いのはず");
+        }
+        assert!(!crate::is_symbol_only_candidate(""));
+    }
+
+    #[test]
+    fn n_insertion_opens_na_row_kana() {
+        assert_eq!(crate::n_insertion_readings("げにん"), vec!["げんいん"]);
+        assert_eq!(crate::n_insertion_readings("ふにき"), vec!["ふんいき"]);
+        assert_eq!(crate::n_insertion_readings("れない"), vec!["れんあい"]);
+        assert_eq!(crate::n_insertion_readings("せねん"), vec!["せんえん"]);
+        // 拗音は 2 文字まとめて開く
+        assert_eq!(crate::n_insertion_readings("きにょう"), vec!["きんよう"]);
+    }
+
+    #[test]
+    fn n_insertion_skips_short_readings_and_leading_kana() {
+        // 「たに → たんい」は踏み込みすぎなので 2 文字は対象外
+        assert!(crate::n_insertion_readings("たに").is_empty());
+        assert!(crate::n_insertion_readings("かに").is_empty());
+        // 先頭のかなは開かない（「ん」で始まる読みを作らない）。
+        // 「ないよう」の な は先頭なので候補が出ない。
+        assert!(crate::n_insertion_readings("ないよう").is_empty());
+        // な行が無ければ何も出さない
+        assert!(crate::n_insertion_readings("かぎかっこ").is_empty());
+    }
+
+    #[test]
+    fn n_insertion_enumerates_each_position() {
+        // 「の」と「に」の両方をそれぞれ開いた読みが出る
+        let out = crate::n_insertion_readings("このに");
+        assert!(out.contains(&"こんおに".to_string()), "{out:?}");
+        assert!(out.contains(&"このんい".to_string()), "{out:?}");
+    }
+
+    #[test]
+    fn merge_adds_n_insertion_candidates_from_dictionary() {
+        use crate::DictStore;
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let user_path = dir.path().join("user_dict.toml");
+        fs::write(
+            &user_path,
+            r#"
+[[entries]]
+reading = "げんいん"
+surfaces = ["原因"]
+"#,
+        )
+        .unwrap();
+
+        let store = DictStore::load(Some(&user_path), None, None).unwrap();
+        let mut engine = RakunEngine::new(EngineConfig {
+            num_candidates: 9,
+            ..Default::default()
+        });
+        engine.set_dict_store(store);
+
+        // n を 1 回しか打っていない読みでも、開いた読みの辞書候補が出る
+        let merged = engine.merge_candidates_for_reading("げにん", vec!["下人".to_string()], 40);
+        assert!(merged.iter().any(|c| c == "原因"), "merged={merged:?}");
+        // 元の読みの正当な変換（LLM）を押しのけない
+        let pos_llm = merged.iter().position(|c| c == "下人").unwrap();
+        let pos_fix = merged.iter().position(|c| c == "原因").unwrap();
+        assert!(pos_fix < pos_llm, "merged={merged:?}");
     }
 }
