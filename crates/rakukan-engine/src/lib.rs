@@ -37,6 +37,7 @@ pub use rakukan_dict::mozc_dict::MozcDict;
 pub use rakukan_dict::{DictStore, find_mozc_dict, user_dict_path};
 
 use kanji::{Backend as KarukanBackend, registry};
+use std::sync::Mutex;
 use thiserror::Error;
 use tracing::{debug, info};
 
@@ -522,6 +523,12 @@ pub struct RakunEngine {
     romaji_input_log: Vec<String>,
     committed: String,
     dict_store: Option<DictStore>,
+    /// 直近に「短文予測」として提示した候補: `(提示した読み, [(登録キー, surface)])`。
+    ///
+    /// 予測候補は現在の読みより**長いキー**の学習フレーズなので、確定時にそのまま
+    /// 現在の読みで学習すると「読みに無い文字を含む表記」が完全一致エントリになる
+    /// （`learn_rekeyed_to_prediction` 参照）。学習を元のキーへ振り直すために覚える。
+    last_predictions: Mutex<Option<(String, Vec<(String, String)>)>>,
 }
 
 impl RakunEngine {
@@ -535,6 +542,7 @@ impl RakunEngine {
             romaji_input_log: Vec::new(),
             committed: String::new(),
             dict_store: None,
+            last_predictions: Mutex::new(None),
         }
     }
 
@@ -868,7 +876,8 @@ impl RakunEngine {
     /// 学習語を DictStore に即時反映してファイルにも保存する。
     pub fn learn(&mut self, reading: &str, surface: &str) {
         if let Some(store) = &self.dict_store {
-            store.learn(reading, surface);
+            let key = self.learn_key_for(reading, surface);
+            store.learn(&key, surface);
         } else {
             tracing::warn!("learn: dict_store not initialized");
         }
@@ -876,10 +885,64 @@ impl RakunEngine {
 
     pub fn learn_force(&mut self, reading: &str, surface: &str) {
         if let Some(store) = &self.dict_store {
-            store.learn_force(reading, surface);
+            let key = self.learn_key_for(reading, surface);
+            store.learn_force(&key, surface);
         } else {
             tracing::warn!("learn_force: dict_store not initialized");
         }
+    }
+
+    /// 直近に提示した予測候補（`predict` / merge の 6. ブロック）を覚える。
+    fn remember_predictions(&self, reading: &str, inserted: Vec<(String, String)>) {
+        if inserted.is_empty() {
+            return;
+        }
+        let Ok(mut slot) = self.last_predictions.lock() else {
+            return;
+        };
+        // 同じ読みなら足し込む。予測ウィンドウ（`predict`）と変換候補（merge）は
+        // どちらが後に呼ばれるか決まっていないので、上書きすると片方が消える。
+        match slot.as_mut() {
+            Some((prev_reading, entries)) if prev_reading == reading => {
+                for e in inserted {
+                    if !entries.contains(&e) {
+                        entries.push(e);
+                    }
+                }
+            }
+            _ => *slot = Some((reading.to_string(), inserted)),
+        }
+    }
+
+    /// 学習キーを決める。予測候補として出した表記を確定した場合は、**現在の読みでは
+    /// なく登録元の（より長い）読み**を返す。
+    ///
+    /// 🔴 予測は「読みの前方一致で長いフレーズを出す」機能なので、確定を通常の学習と
+    /// 同じ扱いにすると必ず「短い読み → 読みに無い文字を含む表記」の完全一致エントリが
+    /// できる。学習履歴はマージ順 2 番＝辞書にも LLM にも勝つので、以後その読みを打つ
+    /// たびに毎回それが先頭に出る（ライブ変換の preview も奪う）。しかも確定するたび
+    /// 強化されるので自己増幅する。実害 2026-09-01: `せいふくのさわりかた` を打つと
+    /// preview が `制服のさわりかたの`（末尾の「の」は読みに無い）になった。
+    fn learn_key_for(&self, reading: &str, surface: &str) -> String {
+        let Ok(slot) = self.last_predictions.lock() else {
+            return reading.to_string();
+        };
+        let Some((pred_reading, entries)) = slot.as_ref() else {
+            return reading.to_string();
+        };
+        if pred_reading != reading {
+            return reading.to_string();
+        }
+        for (key, pred_surface) in entries {
+            if pred_surface == surface && key != reading {
+                info!(
+                    "learn: rekey prediction reading={:?} → key={:?} surface={:?}",
+                    reading, key, surface
+                );
+                return key.clone();
+            }
+        }
+        reading.to_string()
     }
 
     /// 入力中の予測候補（Google 日本語入力の予測ウィンドウ相当）を返す。
@@ -893,10 +956,22 @@ impl RakunEngine {
         if reading.chars().count() < self.config.prediction_min_reading_chars {
             return vec![];
         }
-        self.dict_store
+        let keyed = self
+            .dict_store
             .as_ref()
-            .map(|d| d.lookup_learn_suggest(reading, limit))
-            .unwrap_or_default()
+            .map(|d| d.lookup_learn_suggest_keyed(reading, limit))
+            .unwrap_or_default();
+        // 予測ウィンドウから確定した場合も学習キーを振り直せるよう覚えておく
+        // （読みと同じキーのものは振り直す必要が無いので記録しない）。
+        self.remember_predictions(
+            reading,
+            keyed
+                .iter()
+                .filter(|(key, _)| key != reading)
+                .cloned()
+                .collect(),
+        );
+        keyed.into_iter().map(|(_, s)| s).collect()
     }
 
     /// 学習履歴から候補を削除する（候補ウィンドウでの明示削除）。
@@ -1052,12 +1127,14 @@ impl RakunEngine {
         // 短文予測（Google 日本語入力の「予測候補」相当）。
         // 読みが前方一致する学習済みフレーズを引く。読みが短いうちは候補が
         // 発散するので `prediction_min_reading_chars` 未満では引かない。
-        let prediction_cands: Vec<String> = if self.config.prediction_enabled
+        let prediction_cands: Vec<(String, String)> = if self.config.prediction_enabled
             && hiragana.chars().count() >= self.config.prediction_min_reading_chars
         {
             self.dict_store
                 .as_ref()
-                .map(|d| d.lookup_learn_prefix(hiragana, self.config.prediction_max_candidates))
+                .map(|d| {
+                    d.lookup_learn_prefix_keyed(hiragana, self.config.prediction_max_candidates)
+                })
                 .unwrap_or_default()
         } else {
             Vec::new()
@@ -1217,14 +1294,19 @@ impl RakunEngine {
             // 重複した予測は挿入しないので、挿入位置は「実際に入れた数」で進める
             // （enumerate の添字で進めると len を超えて insert が panic する）。
             let mut at = first_real + 1;
-            for c in &prediction_cands {
+            let mut inserted: Vec<(String, String)> = Vec::new();
+            for (key, c) in &prediction_cands {
+                // 既に merged にある = この読みからも直接引ける表記なので、
+                // 予測由来としては記録しない（学習を振り直す必要が無い）。
                 if merged.contains(c) {
                     continue;
                 }
                 merged.insert(at, c.clone());
+                inserted.push((key.clone(), c.clone()));
                 at += 1;
             }
             merged.truncate(limit.max(1));
+            self.remember_predictions(hiragana, inserted);
         }
 
         // 7. 英数候補（先頭）: 入力したローマ字をそのまま出す。
