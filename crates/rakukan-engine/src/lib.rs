@@ -346,6 +346,45 @@ fn n_insertion_readings(reading: &str) -> Vec<String> {
 }
 
 /// ASCII 図形文字 (U+0021..U+007E) を全角形 (U+FF01..U+FF5E) に写す。
+/// 読みが「外来語っぽい」かを判定する。
+///
+/// 辞書に載っていない外来語（`でもりっしゃー` → `デモリッシャー`）を、辞書引きが
+/// 空振りしたときにカタカナで先頭に出すための手掛かり。Google 日本語入力は
+/// 未知語でもカタカナを上位に出してくるが、rakukan は辞書か LLM 頼みなので
+/// 「変換できない」ように見えていた。
+///
+/// 誤爆を避けるため、和語・漢語の読みには現れないシグナルだけを見る:
+/// 長音符 `ー` と、外来語専用の拗音（`ふぁ` `てぃ` `うぃ` `しぇ` `つぁ` など）。
+/// `まいめ` `つづけて` のような普通の読みは該当しない。
+///
+/// 呼び出し側で「辞書に完全一致が 1 件も無い」ことを必ず確認すること。
+/// 単独で使うと `らーめん` のような辞書に載っている語まで巻き込む。
+fn is_loanword_reading(reading: &str) -> bool {
+    // 🔴 語 1 個ぶんの長さに限る。rakukan は **区読点でしかブロック分割しない**ので、
+    //    読点の無い文は全体が 1 つの読みとして渡ってくる。長さで縛らないと
+    //    「れーるがんいますぐにつくれない」が「ー を含む未知語」と判定され、
+    //    文まるごとカタカナが第 1 候補になる（2026-08-31 に実害）。
+    //    外来語は「いんたーふぇーす」「こみゅにけーしょん」あたりが上限なので 10。
+    const MAX_WORD_CHARS: usize = 10;
+    let len = reading.chars().count();
+    if !(3..=MAX_WORD_CHARS).contains(&len) {
+        return false;
+    }
+    // ひらがな以外（ASCII・数字・記号・漢字）が混ざる読みは対象外。
+    // 英数まじりは英数候補、数字まじりは digits.rs の担当。
+    if !reading.chars().all(|c| matches!(c, 'ぁ'..='ゟ' | 'ー')) {
+        return false;
+    }
+    if reading.contains('ー') || reading.contains('ゔ') {
+        return true;
+    }
+    const FOREIGN_DIGRAPHS: [&str; 22] = [
+        "ふぁ", "ふぃ", "ふぇ", "ふぉ", "ふゅ", "てぃ", "てゅ", "でぃ", "でゅ", "うぃ", "うぇ",
+        "うぉ", "しぇ", "ちぇ", "じぇ", "つぁ", "つぃ", "つぇ", "つぉ", "くぁ", "くぉ", "ぐぁ",
+    ];
+    FOREIGN_DIGRAPHS.iter().any(|d| reading.contains(d))
+}
+
 fn ascii_to_fullwidth(c: char) -> char {
     if ('!'..='~').contains(&c) {
         char::from_u32(c as u32 + 0xFEE0).unwrap_or(c)
@@ -1109,6 +1148,40 @@ impl RakunEngine {
             }
         }
 
+        // 5.4 外来語っぽい読みで辞書が空振りしたら、カタカナを先頭に出す。
+        //
+        //     `でもりっしゃー` のような未登録の外来語は、辞書に無く LLM も漢字に
+        //     割ろうとするので「変換できない」ように見える。Google 日本語入力は
+        //     未知語でもカタカナを上位に置くので、それに合わせる。
+        //
+        //     条件は「辞書（ユーザー / 学習 / MOZC）に完全一致が 1 件も無い」
+        //     AND「読みが外来語シグナルを持つ」の AND。片方だけだと
+        //     `らーめん`（辞書にある）や `まいめ`（シグナル無し）を巻き込む。
+        //     記号だけの辞書ヒットは語ではないので、空振り判定には数えない。
+        //
+        //     🔴 **先頭ではなく 2 番目に置く**。rakukan は区読点でしかブロック分割
+        //     しないので、ここへ来る読みは「語」とは限らず「外来語＋助詞／活用」
+        //     （`れーるがんだ` `こーひーを` `れーるがんつくれない`）でありうる。
+        //     それを先頭に置くと日常的な入力が軒並みカタカナに化ける
+        //     （2026-08-31 に実害。長さ上限だけでは助詞・活用が防げなかった）。
+        //     助詞リストで弾く案も、動詞が続く形が残るので不十分。
+        //     **文節分割を入れるまで先頭は LLM に譲り、2 番目で確実に選べる状態に
+        //     とどめる**。一度選べば学習履歴が先頭へ上げるので 2 回目以降は一発になる。
+        //
+        //     🔴 実候補が 0 件のときは入れない。`1.min(len)` は空リストで 0＝先頭に
+        //     なり、ライブ変換の preview を奪う（このセッションで 3 回踏んだ穴）。
+        let dict_miss = user_cands.is_empty()
+            && user_low_cands.is_empty()
+            && learn_cands.is_empty()
+            && dict_cands.is_empty();
+        if dict_miss && !merged.is_empty() && is_loanword_reading(hiragana) {
+            let kata = hiragana_to_katakana(hiragana);
+            if !kata.is_empty() && kata != hiragana {
+                merged.retain(|c| c != &kata);
+                merged.insert(1.min(merged.len()), kata);
+            }
+        }
+
         // 5.5 記号だけの辞書候補。表示スロットを奪わないよう LLM の後ろに置く。
         for c in &dict_symbol_cands {
             if merged.len() >= limit {
@@ -1869,6 +1942,95 @@ priority = "low"
             pos_low < pos_llm,
             "低優先ユーザー辞書は LLM 候補より前: {merged:?}"
         );
+    }
+
+    #[test]
+    fn loanword_reading_detection() {
+        use super::is_loanword_reading;
+
+        // 長音符
+        assert!(is_loanword_reading("でもりっしゃー"));
+        assert!(is_loanword_reading("ぶーめらん"));
+        // 外来語専用の拗音
+        assert!(is_loanword_reading("ふぁいる"));
+        assert!(is_loanword_reading("うぃんどう"));
+        assert!(is_loanword_reading("ちぇんじ"));
+
+        // 普通の和語・漢語は該当しない
+        assert!(!is_loanword_reading("まいめ"));
+        assert!(!is_loanword_reading("つづけて"));
+        assert!(!is_loanword_reading("かんじへんかん"));
+        // 短すぎる読み
+        assert!(!is_loanword_reading("かー"));
+        // 文まるごと（区読点が無いと文全体が 1 つの読みで渡ってくる）
+        assert!(!is_loanword_reading("れーるがんいますぐにつくれない"));
+        assert!(!is_loanword_reading("こーひーをのみながらかんがえる"));
+        // 語 1 個ぶんの長い外来語は通す
+        assert!(is_loanword_reading("こみゅにけーしょん"));
+        // かな以外が混ざる読みは他のレイヤーの担当
+        assert!(!is_loanword_reading("まc"));
+        assert!(!is_loanword_reading("4まい"));
+    }
+
+    #[test]
+    fn katakana_is_promoted_for_unknown_loanwords() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_path = dir.path().join("user_dict.toml");
+        fs::write(&user_path, "").unwrap();
+        let store = DictStore::load(Some(&user_path), None, None).unwrap();
+
+        let mut engine = RakunEngine::new(EngineConfig::default());
+        engine.set_dict_store(store);
+
+        // 辞書が空振り + 外来語シグナル → カタカナは 2 番目。
+        // 先頭は LLM に譲る（`れーるがんだ` のような外来語＋助詞を壊さないため）。
+        let merged = engine.merge_candidates_for_reading(
+            "でもりっしゃー",
+            vec!["出モリッシャー".to_string()],
+            40,
+        );
+        assert_eq!(merged.first().map(String::as_str), Some("出モリッシャー"));
+        assert_eq!(merged.get(1).map(String::as_str), Some("デモリッシャー"));
+
+        // 外来語＋助詞・活用も先頭は LLM のまま
+        for (reading, top) in [
+            ("れーるがんだ", "レールガンだ"),
+            ("れーるがんいますぐにつくれない", "レールガン今すぐに作れない"),
+        ] {
+            let merged =
+                engine.merge_candidates_for_reading(reading, vec![top.to_string()], 40);
+            assert_eq!(merged.first().map(String::as_str), Some(top), "{reading}");
+        }
+
+        // 実候補が 0 件のときは入れない（ライブ変換の preview を奪わない）
+        let merged = engine.merge_candidates_for_reading("でもりっしゃー", vec![], 40);
+        assert_eq!(merged.first().map(String::as_str), Some("でもりっしゃー"));
+
+        // 一度選べば学習履歴が先頭へ上げる = 2 回目以降は一発
+        engine.learn_force("でもりっしゃー", "デモリッシャー");
+        let merged = engine.merge_candidates_for_reading(
+            "でもりっしゃー",
+            vec!["出モリッシャー".to_string()],
+            40,
+        );
+        assert_eq!(merged.first().map(String::as_str), Some("デモリッシャー"));
+
+        // シグナルが無い読みは昇格しない（末尾の文字種候補には出る）
+        let merged = engine.merge_candidates_for_reading("まいめ", vec!["毎目".to_string()], 40);
+        assert_eq!(merged.first().map(String::as_str), Some("毎目"));
+        assert!(merged.iter().any(|c| c == "マイメ"), "merged={merged:?}");
+
+        // 辞書に当たる読みは昇格しない
+        fs::write(
+            &user_path,
+            "[[entries]]\nreading = \"らーめん\"\nsurfaces = [\"拉麺\"]\n",
+        )
+        .unwrap();
+        let store = DictStore::load(Some(&user_path), None, None).unwrap();
+        let mut engine = RakunEngine::new(EngineConfig::default());
+        engine.set_dict_store(store);
+        let merged = engine.merge_candidates_for_reading("らーめん", vec![], 40);
+        assert_eq!(merged.first().map(String::as_str), Some("拉麺"));
     }
 
     #[test]
