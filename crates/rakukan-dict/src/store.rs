@@ -549,6 +549,20 @@ impl DictStore {
     /// 走査は `learn_history` の全キー（上限 `LEARN_LRU_CAPACITY` = 30,000）に対する
     /// 前方一致比較のみで、1 打鍵あたり数百 µs 程度に収まる。
     pub fn lookup_learn_prefix(&self, prefix: &str, limit: usize) -> Vec<String> {
+        self.lookup_learn_prefix_keyed(prefix, limit)
+            .into_iter()
+            .map(|(_, s)| s)
+            .collect()
+    }
+
+    /// `lookup_learn_prefix` の「どのキーから出たか」つき版。
+    ///
+    /// 予測候補は**現在の読みより長いキー**に紐づいているので、それを確定した時に
+    /// 現在の読みで学習し直すと「読みに無い文字を含む表記」が完全一致エントリとして
+    /// 焼き付く（実害 2026-09-01: `せいふくのさわりかた → 制服のさわりかたの`。
+    /// 学習履歴はマージ順 2 番なので、以後その読みを打つたび最優先で出続ける）。
+    /// 呼び出し側が元のキーへ学習を振り直せるようにキーを返す。
+    pub fn lookup_learn_prefix_keyed(&self, prefix: &str, limit: usize) -> Vec<(String, String)> {
         if prefix.is_empty() || limit == 0 {
             return vec![];
         }
@@ -556,23 +570,23 @@ impl DictStore {
             return vec![];
         };
         let now = now_unix_secs();
-        let mut scored: Vec<(f64, String)> = Vec::new();
+        let mut scored: Vec<(f64, String, String)> = Vec::new();
         for (reading, entries) in hist.iter() {
             if reading.len() <= prefix.len() || !reading.starts_with(prefix) {
                 continue;
             }
             for e in entries {
-                scored.push((e.score(now), e.surface.clone()));
+                scored.push((e.score(now), reading.clone(), e.surface.clone()));
             }
         }
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        let mut out: Vec<String> = Vec::new();
-        for (_, s) in scored {
+        let mut out: Vec<(String, String)> = Vec::new();
+        for (_, key, s) in scored {
             if out.len() >= limit {
                 break;
             }
-            if !out.contains(&s) {
-                out.push(s);
+            if !out.iter().any(|(_, existing)| existing == &s) {
+                out.push((key, s));
             }
         }
         out
@@ -585,6 +599,16 @@ impl DictStore {
     /// 予測候補は「かんたん → 簡単 / 簡単な言葉で分析」のように、素の変換と長い
     /// フレーズを同じリストに並べるため。
     pub fn lookup_learn_suggest(&self, prefix: &str, limit: usize) -> Vec<String> {
+        self.lookup_learn_suggest_keyed(prefix, limit)
+            .into_iter()
+            .map(|(_, s)| s)
+            .collect()
+    }
+
+    /// `lookup_learn_suggest` の「どのキーから出たか」つき版
+    /// （理由は `lookup_learn_prefix_keyed` を参照）。完全一致キーも含むので、
+    /// 呼び出し側は `key == prefix` を「読みどおり」として扱ってよい。
+    pub fn lookup_learn_suggest_keyed(&self, prefix: &str, limit: usize) -> Vec<(String, String)> {
         if prefix.is_empty() || limit == 0 {
             return vec![];
         }
@@ -592,25 +616,40 @@ impl DictStore {
             return vec![];
         };
         let now = now_unix_secs();
-        let mut scored: Vec<(f64, String)> = Vec::new();
+        let mut scored: Vec<(f64, String, String)> = Vec::new();
         for (reading, entries) in hist.iter() {
             if !reading.starts_with(prefix) {
                 continue;
             }
             for e in entries {
-                scored.push((e.score(now), e.surface.clone()));
+                scored.push((e.score(now), reading.clone(), e.surface.clone()));
             }
         }
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        let mut out: Vec<String> = Vec::new();
-        for (_, s) in scored {
+        let mut out: Vec<(String, String)> = Vec::new();
+        for (_, key, s) in scored {
             if out.len() >= limit {
                 break;
             }
-            if !out.contains(&s) {
-                out.push(s);
+            if !out.iter().any(|(_, existing)| existing == &s) {
+                out.push((key, s));
             }
         }
+        out
+    }
+
+    /// 学習履歴の全エントリ (reading, surface) を返す（棚卸し・掃除ツール用）。
+    pub fn learn_entries_snapshot(&self) -> Vec<(String, String)> {
+        let Ok(hist) = self.inner.learn_history.read() else {
+            return vec![];
+        };
+        let mut out: Vec<(String, String)> = Vec::new();
+        for (reading, entries) in hist.iter() {
+            for e in entries {
+                out.push((reading.clone(), e.surface.clone()));
+            }
+        }
+        out.sort();
         out
     }
 
@@ -1687,6 +1726,35 @@ priority = "low"
         // 空文字・limit 0 は空
         assert!(store.lookup_learn_prefix("", 5).is_empty());
         assert!(store.lookup_learn_prefix("かんたん", 0).is_empty());
+    }
+
+    #[test]
+    fn test_lookup_learn_prefix_keyed_returns_source_key() {
+        let store = make_store(&[
+            ("かんたん", vec!["簡単"]),
+            ("かんたんなことばでぶんせき", vec!["簡単な言葉で分析"]),
+        ]);
+        store.learn("かんたん", "簡単");
+        store.learn("かんたんなことばでぶんせき", "簡単な言葉で分析");
+
+        // 予測候補の確定を元のキーへ振り直せるよう、登録キーを一緒に返す
+        assert_eq!(
+            store.lookup_learn_prefix_keyed("かんたん", 5),
+            vec![(
+                "かんたんなことばでぶんせき".to_string(),
+                "簡単な言葉で分析".to_string()
+            )]
+        );
+        assert_eq!(
+            store.lookup_learn_suggest_keyed("かんたん", 5),
+            vec![
+                ("かんたん".to_string(), "簡単".to_string()),
+                (
+                    "かんたんなことばでぶんせき".to_string(),
+                    "簡単な言葉で分析".to_string()
+                ),
+            ]
+        );
     }
 
     #[test]
