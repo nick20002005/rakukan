@@ -1773,16 +1773,18 @@ impl super::TextServiceFactory_Impl {
                     return Ok(true);
                 }
             }
-            // BlockSelecting → Backspace → ESC と同様、元のひらがなに戻す
+            // BlockSelecting → Backspace → ESC と同様、元のひらがなに戻す。
+            // 戻すのは未確定ブロックの読みだけ（Enter で確定済みのブロックまで
+            // 戻すと、アプリに残っている確定テキストの後ろに同じ読みが入る）。
             if sess.is_block_selecting() {
-                let full_reading = sess.block_selecting_full_reading().unwrap_or_default();
-                sess.set_preedit(full_reading.clone());
+                let pending_reading = sess.block_selecting_pending_reading().unwrap_or_default();
+                sess.set_preedit(pending_reading.clone());
                 drop(sess);
                 candidate_window::hide();
                 engine.bg_reclaim();
-                engine.force_preedit(full_reading.clone());
+                engine.force_preedit(pending_reading.clone());
                 drop(guard);
-                update_composition(ctx, tid, sink, full_reading)?;
+                update_composition(ctx, tid, sink, pending_reading)?;
                 return Ok(true);
             }
             if sess.is_selecting() {
@@ -1856,17 +1858,17 @@ impl super::TextServiceFactory_Impl {
                 update_composition(ctx, tid, sink, reading)?;
                 return Ok(true);
             }
-            // BlockSelecting → ESC → 元のひらがなに戻す
+            // BlockSelecting → ESC → 元のひらがなに戻す（未確定ブロックのみ）
             if sess.is_block_selecting() {
-                let full_reading = sess.block_selecting_full_reading().unwrap_or_default();
-                sess.set_preedit(full_reading.clone());
+                let pending_reading = sess.block_selecting_pending_reading().unwrap_or_default();
+                sess.set_preedit(pending_reading.clone());
                 drop(sess);
                 candidate_window::hide();
                 engine.bg_reclaim();
-                // engine のプリエディットを元の全体読みに復元
-                engine.force_preedit(full_reading.clone());
+                // engine のプリエディットを未確定ぶんの読みに復元
+                engine.force_preedit(pending_reading.clone());
                 drop(guard);
-                update_composition(ctx, tid, sink, full_reading)?;
+                update_composition(ctx, tid, sink, pending_reading)?;
                 return Ok(true);
             }
             // RangeSelect → ESC → LiveConv に戻る（元の preview を復元）

@@ -1354,13 +1354,21 @@ impl SessionState {
 
     /// BlockSelecting: composition 表示用の (prefix, cand_text, remainder) を返す。
     ///
-    /// - `prefix`   : current_index より前のブロックのテキスト（確定済みイメージ）
+    /// - `prefix`   : current_index より前で、**まだドキュメントへ物理コミット
+    ///   していない**ブロックのテキスト（`blocks[committed_blocks..current_index]`）
     /// - `cand_text`: 現在ブロックの選択候補
     /// - `remainder`: current_index より後のブロックのテキスト（区読点含む）+ 現在の区読点
+    ///
+    /// 🔴 `committed_blocks` より前のブロックを prefix に含めてはいけない。
+    /// Enter で確定したブロックは `commit_then_start_composition` で既にアプリへ
+    /// 書き込まれ、composition から外れている。そこを prefix として再描画すると
+    /// **確定済みテキストがアプリへ二重に入る**（実害 2026-09-01: 読点入りの文を
+    /// Enter で途中確定したあと Space で候補を回すと先頭文節がダブった）。
     pub fn block_selecting_composition_parts(&self) -> Option<(String, String, String)> {
         if let SessionState::BlockSelecting {
             blocks,
             current_index,
+            committed_blocks,
             ..
         } = self
         {
@@ -1374,8 +1382,11 @@ impl SessionState {
                     .map(|c| c.to_string())
                     .unwrap_or_default();
                 if i < *current_index {
-                    prefix.push_str(cand);
-                    prefix.push_str(&punct);
+                    // 物理コミット済みのブロックは composition の外にある
+                    if i >= *committed_blocks {
+                        prefix.push_str(cand);
+                        prefix.push_str(&punct);
+                    }
                 } else if i == *current_index {
                     cand_text = cand.to_string();
                     // 現在ブロックの区読点は remainder の先頭に
@@ -1402,6 +1413,62 @@ impl SessionState {
                 }
             }
             Some(text)
+        } else {
+            None
+        }
+    }
+
+    /// BlockSelecting: **まだドキュメントへ物理コミットしていない**ブロック
+    /// （`blocks[committed_blocks..]`）のテキストを返す。
+    ///
+    /// composition に載っているのはこの範囲だけなので、composition を書き換える
+    /// 経路（文字入力・記号入力での確定など）は `block_selecting_full_text()`
+    /// ではなくこちらを使う。全ブロックを書き戻すと Enter で確定済みのブロックが
+    /// アプリへ二重に入る。学習・`engine.commit()` は文全体が正しい単位なので
+    /// `block_selecting_full_text()` のままでよい。
+    pub fn block_selecting_pending_text(&self) -> Option<String> {
+        if let SessionState::BlockSelecting {
+            blocks,
+            committed_blocks,
+            ..
+        } = self
+        {
+            let mut text = String::new();
+            for block in blocks.iter().skip(*committed_blocks) {
+                text.push_str(block.current_candidate());
+                if let Some(p) = block.trailing_punct {
+                    text.push(p);
+                }
+            }
+            Some(text)
+        } else {
+            None
+        }
+    }
+
+    /// BlockSelecting: `block_selecting_pending_text()` の読み版（ESC の復元用）。
+    ///
+    /// 1 ブロックも確定していなければ `full_reading` をそのまま返す
+    /// （分割前の読みと 1 文字も違わないことを保証するため）。
+    pub fn block_selecting_pending_reading(&self) -> Option<String> {
+        if let SessionState::BlockSelecting {
+            blocks,
+            full_reading,
+            committed_blocks,
+            ..
+        } = self
+        {
+            if *committed_blocks == 0 {
+                return Some(full_reading.clone());
+            }
+            let mut reading = String::new();
+            for block in blocks.iter().skip(*committed_blocks) {
+                reading.push_str(&block.reading);
+                if let Some(p) = block.trailing_punct {
+                    reading.push(p);
+                }
+            }
+            Some(reading)
         } else {
             None
         }
@@ -1582,10 +1649,16 @@ impl SessionState {
         false
     }
 
-    /// BlockSelecting: 現在ブロックのコミットテキスト（candidate + trailing_punct）を
+    /// BlockSelecting: 未コミットのブロックから現在ブロックまで
+    /// （`blocks[committed_blocks..=current_index]`）のテキストを
     /// `committed_prefix` に積算し、そのテキストを返す。
     ///
     /// Enter でブロックを1つずつ確定する際に呼ぶ。`advance()` の前に呼ぶこと。
+    ///
+    /// 🔴 現在ブロック**だけ**を返してはいけない。→ で先の文節へ移動してから
+    /// Enter を押すと、飛ばした手前の文節が composition に載ったまま
+    /// `committed_prefix` にも入らず、`end_composition` が composition 全体を
+    /// 現在ブロックだけで置き換えて**手前の文節が消える**。
     pub fn block_selecting_commit_current(&mut self) -> Option<String> {
         if let SessionState::BlockSelecting {
             blocks,
@@ -1595,13 +1668,20 @@ impl SessionState {
             ..
         } = self
         {
-            let block = blocks.get(*current_index)?;
-            let cand = block.current_candidate().to_string();
-            let punct = block
-                .trailing_punct
-                .map(|c| c.to_string())
-                .unwrap_or_default();
-            let text = format!("{cand}{punct}");
+            if *current_index >= blocks.len() {
+                return None;
+            }
+            let mut text = String::new();
+            for block in blocks
+                .iter()
+                .take(*current_index + 1)
+                .skip(*committed_blocks)
+            {
+                text.push_str(block.current_candidate());
+                if let Some(p) = block.trailing_punct {
+                    text.push(p);
+                }
+            }
             committed_prefix.push_str(&text);
             *committed_blocks = (*current_index + 1).max(*committed_blocks);
             Some(text)

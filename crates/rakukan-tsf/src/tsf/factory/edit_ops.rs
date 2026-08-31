@@ -523,13 +523,15 @@ impl super::TextServiceFactory_Impl {
                             s.live_conv_parts().map(|(_, p)| p.to_string())
                         }
                         Ok(s) if s.is_block_selecting() => {
-                            // prefix（確定済みブロック）は既にドキュメントへ
-                            // コミットされているので、composition に載っているのは
-                            // 現在ブロック + 残りブロックだけ。
-                            // （on_commit_raw[BlockSelecting] の advance 経路が
-                            //   `new_cand + new_rem` で composition を張り直すのに合わせる）
+                            // composition に載っているのは未コミットのブロックだけ。
+                            // `block_selecting_composition_parts()` の prefix は
+                            // `committed_blocks` 以降しか返さないので、prefix も含めて
+                            // 確定する（→ で先の文節へ動いてから半角/全角を押した時に
+                            // 手前の文節を落とさないため）。
                             s.block_selecting_composition_parts()
-                                .map(|(_, cand, remainder)| format!("{cand}{remainder}"))
+                                .map(|(prefix, cand, remainder)| {
+                                    format!("{prefix}{cand}{remainder}")
+                                })
                         }
                         Ok(s) if s.is_selecting() => {
                             let cand = s
@@ -818,12 +820,15 @@ impl super::TextServiceFactory_Impl {
         }
 
         if sess.is_block_selecting() {
-            let full_text = sess.block_selecting_full_text().unwrap_or_default();
-            let full_reading = sess.block_selecting_full_reading().unwrap_or_default();
-            engine.force_preedit(full_reading.clone());
+            // composition に載っている（＝まだアプリへ書いていない）範囲だけを
+            // 引き継ぐ。全ブロックを display にすると Enter で確定済みの
+            // ブロックがもう一度書かれて二重に入る。
+            let pending_text = sess.block_selecting_pending_text().unwrap_or_default();
+            let pending_reading = sess.block_selecting_pending_reading().unwrap_or_default();
+            engine.force_preedit(pending_reading.clone());
             engine.push_raw(symbol);
-            let display = format!("{full_text}{symbol}");
-            sess.set_live_conv(format!("{full_reading}{symbol}"), display.clone());
+            let display = format!("{pending_text}{symbol}");
+            sess.set_live_conv(format!("{pending_reading}{symbol}"), display.clone());
             drop(sess);
             drop(guard);
             update_composition(ctx, tid, sink, display)?;
