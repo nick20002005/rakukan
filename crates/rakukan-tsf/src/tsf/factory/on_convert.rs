@@ -702,6 +702,27 @@ impl super::TextServiceFactory_Impl {
         {
             let mut sess = session_get()?;
             if sess.is_block_selecting() {
+                // 遅延展開: 文節分割で作ったブロックは候補を 1 件しか持たないので、
+                // Space が押された時点でその文節の読みだけ変換し直す。
+                // 分割時に全文節ぶん変換すると、その場で数百 ms × 文節数かかる。
+                if !sess.block_selecting_current_expanded() {
+                    let reading = sess.block_selecting_current_reading().unwrap_or_default();
+                    drop(sess);
+                    if !reading.is_empty() {
+                        const BLOCK_DICT_LIMIT: usize = 9;
+                        let llm_limit = crate::engine::state::get_num_candidates();
+                        engine.force_preedit(reading.clone());
+                        let cands =
+                            engine_convert_sync_multi(engine, llm_limit, BLOCK_DICT_LIMIT, &reading, &reading);
+                        tracing::debug!(
+                            "on_convert[block]: 遅延展開 {:?} → {} 件",
+                            reading,
+                            cands.len()
+                        );
+                        session_get()?.block_selecting_set_candidates(cands);
+                    }
+                    sess = session_get()?;
+                }
                 sess.block_selecting_next();
                 let page_cands = sess.block_selecting_page_candidates();
                 let page_sel = sess.block_selecting_page_selected();
@@ -794,6 +815,7 @@ impl super::TextServiceFactory_Impl {
                         trailing_punct,
                         candidates: Vec::new(),
                         selected: 0,
+                        expanded: true,
                     });
                     continue;
                 }
@@ -806,12 +828,46 @@ impl super::TextServiceFactory_Impl {
                     &reading,
                     &reading,
                 );
-                blocks.push(ConversionBlock {
-                    reading,
-                    trailing_punct,
-                    candidates,
-                    selected: 0,
-                });
+
+                // 文節分割: 変換結果（第 1 候補）を文字種で区切り、読みを逆算する。
+                //
+                // 読み側を辞書で割るのではなく **変換後の surface から割る** ので、
+                // 第 1 候補は文全体を一発変換した結果そのままになる。文全体の文脈が
+                // 効いたままで「文節移動」「部分確定」「語単位の候補」が手に入る。
+                // 割れなければ（アンカーが合わない・1 文節）従来どおり 1 ブロック。
+                let split = candidates
+                    .first()
+                    .and_then(|top| crate::engine::clause::split_into_clauses(&reading, top));
+                match split {
+                    Some(clauses) => {
+                        tracing::debug!(
+                            "on_convert: 文節分割 {:?} → {:?}",
+                            reading,
+                            clauses.iter().map(|c| &c.surface).collect::<Vec<_>>()
+                        );
+                        let last = clauses.len() - 1;
+                        for (i, c) in clauses.into_iter().enumerate() {
+                            blocks.push(ConversionBlock {
+                                reading: c.reading,
+                                // 区読点は元のブロックの末尾に付いていたものなので
+                                // 最後の文節にだけ引き継ぐ
+                                trailing_punct: if i == last { trailing_punct } else { None },
+                                candidates: vec![c.surface],
+                                selected: 0,
+                                // 候補は文全体の変換から取った 1 件だけ。Space が
+                                // 押されたときにその文節の読みで引き直す
+                                expanded: false,
+                            });
+                        }
+                    }
+                    None => blocks.push(ConversionBlock {
+                        reading,
+                        trailing_punct,
+                        candidates,
+                        selected: 0,
+                        expanded: true,
+                    }),
+                }
             }
             // engine のプリエディットを最初の（非空）ブロックの読みに戻す
             if let Some(first_non_empty) = blocks.iter().find(|b| !b.reading.is_empty()) {

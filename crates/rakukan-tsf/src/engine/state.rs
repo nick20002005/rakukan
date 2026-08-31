@@ -1024,6 +1024,12 @@ pub struct ConversionBlock {
     pub trailing_punct: Option<char>,
     pub candidates: Vec<String>,
     pub selected: usize,
+    /// この文節の候補一覧を引き済みか。
+    ///
+    /// 文節分割で作ったブロックは、文全体の変換結果から取った surface 1 件しか
+    /// 持たない（分割のために全文節ぶんの変換を走らせるとその場で数百 ms×文節数
+    /// かかる）。Space が押された時点でその文節の読みだけ変換し直す＝遅延展開。
+    pub expanded: bool,
 }
 
 impl ConversionBlock {
@@ -1473,6 +1479,49 @@ impl SessionState {
             blocks.get(*current_index).map(|b| b.reading.clone())
         } else {
             None
+        }
+    }
+
+    /// BlockSelecting: 現在ブロックの候補一覧を引き済みか。
+    pub fn block_selecting_current_expanded(&self) -> bool {
+        if let SessionState::BlockSelecting {
+            blocks,
+            current_index,
+            ..
+        } = self
+        {
+            blocks.get(*current_index).is_some_and(|b| b.expanded)
+        } else {
+            true
+        }
+    }
+
+    /// BlockSelecting: 現在ブロックの候補一覧を差し替える（遅延展開）。
+    ///
+    /// 表示中の候補を先頭に置いたうえで `selected = 0` に戻す。こうしないと
+    /// 展開した瞬間に composition の文字が別の候補へ飛ぶ。呼び出し側は展開の
+    /// 直後に `block_selecting_next()` を呼ぶので、ユーザーから見ると
+    /// 「Space を押したら 2 番目の候補に進んだ」という自然な動きになる。
+    pub fn block_selecting_set_candidates(&mut self, candidates: Vec<String>) {
+        if let SessionState::BlockSelecting {
+            blocks,
+            current_index,
+            ..
+        } = self
+        {
+            let Some(block) = blocks.get_mut(*current_index) else {
+                return;
+            };
+            let shown = block.current_candidate().to_string();
+            let mut merged = vec![shown.clone()];
+            for c in candidates {
+                if c != shown && !merged.contains(&c) {
+                    merged.push(c);
+                }
+            }
+            block.candidates = merged;
+            block.selected = 0;
+            block.expanded = true;
         }
     }
 
