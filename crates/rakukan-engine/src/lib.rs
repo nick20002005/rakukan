@@ -1193,20 +1193,30 @@ impl RakunEngine {
         }
 
         // 6. 短文予測（Google 日本語入力相当）: 読みが前方一致する学習済みの長い
-        //    フレーズを、先頭候補の直後に差し込む。先頭を奪わないのは、ライブ変換の
-        //    preview が候補 0 番を採用するため（打鍵途中に長文が出続けるのを避ける）。
+        //    フレーズを、実候補の直後に差し込む。先頭を奪わないのは、ライブ変換の
+        //    preview が先頭の実候補を採用するため（打鍵途中に長文が出続けるのを避ける）。
         //
-        //    🔴 実候補が 1 件も無いときは予測を入れない。`1.min(merged.len())` は
-        //    merged が空だと 0＝先頭になり、予測フレーズがライブ変換の preview に
-        //    昇格して「打っている途中で過去の長文が勝手に確定される」事故になる
-        //    （2026-08-31 に実害）。TSF は preview 判定に
-        //    `merge_candidates_for_reading(reading, vec![], 40)` を使うので、
-        //    LLM 候補が無く辞書も引けない読みでは merged がここで空になりうる。
-        //    予測はあくまで「実候補の隣に並べる」もので、単独で先頭に立たせない。
-        if !prediction_cands.is_empty() && !merged.is_empty() {
+        //    🔴 挿入位置は固定の 1 番目ではなく「**読みと異なる最初の候補**の直後」。
+        //    ライブ変換の preview は `merge_candidates_for_reading(reading, .., 40)` の
+        //    結果から `find(|c| c != reading)` で先頭の実候補を採る。MOZC はひらがな
+        //    表記を先頭に返すことが多く（`たしかに → ["たしかに", "たし蟹", ..]`）、
+        //    固定で 1 番目に入れると候補 0 番が読みそのものだったときに予測が
+        //    preview へ昇格し、打鍵の途中で過去の長文が composition に出てしまう
+        //    （2026-08-31 に「たしかに」→「確かに、なんか」で実害）。
+        //
+        //    🔴 読みと異なる候補が 1 件も無いときは予測を入れない。merged が
+        //    空、あるいは読みしか無い状態で予測を足すと、それが preview に昇格して
+        //    「打っている途中で過去の長文が勝手に確定される」事故になる。予測はあくまで
+        //    「実候補の隣に並べる」もので、単独で preview に立たせない。Space 変換では
+        //    LLM 候補が入るので、この条件で予測が落ちることは実質起きない。
+        if let Some(first_real) = merged
+            .iter()
+            .position(|c| c != hiragana)
+            .filter(|_| !prediction_cands.is_empty())
+        {
             // 重複した予測は挿入しないので、挿入位置は「実際に入れた数」で進める
             // （enumerate の添字で進めると len を超えて insert が panic する）。
-            let mut at = 1.min(merged.len());
+            let mut at = first_real + 1;
             for c in &prediction_cands {
                 if merged.contains(c) {
                     continue;
@@ -2061,6 +2071,27 @@ priority = "low"
             engine.merge_candidates_for_reading("またつうじょう", vec!["また通常".to_string()], 40);
         assert_eq!(merged.first().map(String::as_str), Some("また通常"));
         assert_eq!(merged.get(1).map(String::as_str), Some("また通常の候補"));
+
+        // 候補 0 番が読みそのもの（MOZC はひらがな表記を先頭に返しがち）でも、
+        // 予測はその次ではなく「読みと異なる最初の候補」の後ろに入る。
+        // ライブ変換の preview は `find(|c| c != reading)` で採るので、ここで
+        // 1 番目に入れると打鍵の途中で予測が composition に出てしまう。
+        let merged = engine.merge_candidates_for_reading(
+            "またつうじょう",
+            vec!["またつうじょう".to_string(), "また通常".to_string()],
+            40,
+        );
+        assert_eq!(merged.first().map(String::as_str), Some("またつうじょう"));
+        assert_eq!(merged.get(1).map(String::as_str), Some("また通常"));
+        assert_eq!(merged.get(2).map(String::as_str), Some("また通常の候補"));
+        assert_eq!(
+            merged
+                .iter()
+                .find(|c| c.as_str() != "またつうじょう")
+                .map(String::as_str),
+            Some("また通常"),
+            "ライブ変換の preview が予測を拾ってはいけない: {merged:?}"
+        );
     }
 
     #[test]
