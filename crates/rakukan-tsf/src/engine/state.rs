@@ -1163,6 +1163,11 @@ pub enum SessionState {
         /// Enter で1ブロックずつ確定した際に積算するコミット済みテキスト。
         /// 学習・最終コミット時に全体テキストとして使う。
         committed_prefix: String,
+        /// Enter で **ドキュメントへ物理コミット済み** のブロック数。
+        ///
+        /// ← の戻り先の下限。既にアプリへ書き込んだブロックへ戻ると、
+        /// composition の prefix として再描画されて二重に入るため。
+        committed_blocks: usize,
         pos_x: i32,
         pos_y: i32,
     },
@@ -1243,6 +1248,7 @@ impl SessionState {
             current_index: 0,
             full_reading,
             committed_prefix: String::new(),
+            committed_blocks: 0,
             pos_x,
             pos_y,
         };
@@ -1453,6 +1459,65 @@ impl SessionState {
 
     /// BlockSelecting: 次のブロックへ進む（Enter 押下時）。
     /// 最終ブロックの場合は false を返す（呼び出し元は全確定処理を行う）。
+    /// BlockSelecting: 現在ブロックの読みを返す。
+    ///
+    /// ← / → で移動したあと、エンジンのプリエディットをそのブロックの読みへ
+    /// 揃えるために使う（`set_block_selecting` の初期化と同じ状態にする）。
+    pub fn block_selecting_current_reading(&self) -> Option<String> {
+        if let SessionState::BlockSelecting {
+            blocks,
+            current_index,
+            ..
+        } = self
+        {
+            blocks.get(*current_index).map(|b| b.reading.clone())
+        } else {
+            None
+        }
+    }
+
+    /// BlockSelecting: ← / → で文節（ブロック）を移動する。確定はしない。
+    ///
+    /// `advance()` と違って:
+    /// - 逆方向へも動ける（← で選び直しに戻れる）
+    /// - 読みが空のブロック（区読点だけのブロック）は飛ばす。候補が無く、
+    ///   止まっても候補ウィンドウが空になるだけなので
+    /// - Enter で **ドキュメントへ書き込み済み** のブロックより手前へは戻さない。
+    ///   戻ると composition の prefix として再描画され、アプリ側に二重に入る
+    ///
+    /// 戻り値は実際に移動したかどうか。端では `false`（呼び出し側はキーを
+    /// 食うだけにして、アプリへ矢印キーを漏らさない）。
+    pub fn block_selecting_move(&mut self, forward: bool) -> bool {
+        if let SessionState::BlockSelecting {
+            blocks,
+            current_index,
+            committed_blocks,
+            ..
+        } = self
+        {
+            let floor = *committed_blocks;
+            let mut i = *current_index;
+            loop {
+                if forward {
+                    if i + 1 >= blocks.len() {
+                        return false;
+                    }
+                    i += 1;
+                } else {
+                    if i == 0 || i <= floor {
+                        return false;
+                    }
+                    i -= 1;
+                }
+                if blocks.get(i).is_some_and(|b| !b.reading.is_empty()) {
+                    *current_index = i;
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     pub fn block_selecting_advance(&mut self) -> bool {
         if let SessionState::BlockSelecting {
             blocks,
@@ -1477,6 +1542,7 @@ impl SessionState {
             blocks,
             current_index,
             committed_prefix,
+            committed_blocks,
             ..
         } = self
         {
@@ -1488,6 +1554,7 @@ impl SessionState {
                 .unwrap_or_default();
             let text = format!("{cand}{punct}");
             committed_prefix.push_str(&text);
+            *committed_blocks = (*current_index + 1).max(*committed_blocks);
             Some(text)
         } else {
             None
