@@ -213,6 +213,9 @@ impl super::TextServiceFactory_Impl {
             if sess.is_block_selecting() {
                 let full_text = sess.block_selecting_full_text().unwrap_or_default();
                 let full_reading = sess.block_selecting_full_reading().unwrap_or_default();
+                // ドキュメントへ書き戻すのは composition に載っている範囲だけ
+                // （Enter で確定済みのブロックは既にアプリ側にある）。
+                let pending_text = sess.block_selecting_pending_text().unwrap_or_default();
                 sess.set_idle();
                 drop(sess);
                 candidate_window::hide();
@@ -247,7 +250,7 @@ impl super::TextServiceFactory_Impl {
                 }
                 // 確定テキスト + 新規入力プリエディットを表示
                 use super::commit_then_start_composition;
-                commit_then_start_composition(ctx, tid, sink, full_text, preedit2)?;
+                commit_then_start_composition(ctx, tid, sink, pending_text, preedit2)?;
                 return Ok(true);
             }
             if sess.is_selecting() {
