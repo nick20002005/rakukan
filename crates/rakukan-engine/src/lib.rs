@@ -891,7 +891,12 @@ impl RakunEngine {
     ///
     /// `hiragana` がプリエディット全体と一致する時だけ返す。文節分割された
     /// 部分読みに対してプリエディット全体のローマ字を出さないためのガード。
-    fn romaji_literal_candidates(&self, hiragana: &str) -> Option<(String, String)> {
+    /// 打鍵したローマ字（半角英数）と、その全角版を返す。
+    ///
+    /// 読みが打鍵ログから復元できる場合だけ返す。F9/F10 で `force_preedit`
+    /// された後や、記号・空白が混ざった入力では `None`（記号混じりは
+    /// digits.rs のリテラル保護レイヤーの担当）。
+    fn romaji_alnum_candidates(&self, hiragana: &str) -> Option<(String, String)> {
         let romaji = self.romaji_log_str();
         if romaji.is_empty() {
             return None;
@@ -906,15 +911,23 @@ impl RakunEngine {
         if self.hiragana_from_romaji_log() != hiragana {
             return None;
         }
-        // 読みに ASCII 英字が残っている = ローマ字がかなに変換しきれていない、
-        // という場合だけ出す。"つづけて" のような普通の読みにまで "tudukete" を
-        // 添えると、候補リストが英数字で埋まるうえ、変換途中で候補が 0 件の
-        // 瞬間に先頭を奪ってしまう。普通の読みは従来どおり F9/F10 の担当。
+        let full: String = romaji.chars().map(ascii_to_fullwidth).collect();
+        Some((romaji, full))
+    }
+
+    /// 候補の**先頭**に置いてよい英数候補。
+    ///
+    /// 読みに ASCII 英字が残っている = ローマ字がかなに変換しきれていない、
+    /// という場合だけ返す。"つづけて" のような普通の読みで先頭を "tudukete" に
+    /// 奪われると、候補リストが英数字で埋まるうえ、変換途中で候補が 0 件の
+    /// 瞬間にライブ変換の preview まで英字になってしまう。
+    /// 普通の読みの英数候補は末尾の文字種候補（`merge_candidates_for_reading`
+    /// の 8. ブロック）が拾う。
+    fn romaji_literal_candidates(&self, hiragana: &str) -> Option<(String, String)> {
         if !hiragana.chars().any(|c| c.is_ascii_alphabetic()) {
             return None;
         }
-        let full: String = romaji.chars().map(ascii_to_fullwidth).collect();
-        Some((romaji, full))
+        self.romaji_alnum_candidates(hiragana)
     }
 
     pub fn merge_candidates_for_reading(
@@ -1111,17 +1124,7 @@ impl RakunEngine {
             merged.truncate(limit.max(1));
         }
 
-        // 候補不足時は元の読みを末尾に追加（変換せず確定する退避路）
-        let desired_visible = self.config.num_candidates.min(limit);
-        if merged.len() < desired_visible && !merged.iter().any(|c| c == hiragana) {
-            merged.push(hiragana.to_string());
-        }
-
-        // 7. 英数候補: 入力したローマ字をそのまま出す。
-        //
-        //    退避路の追加より後に置く。Space 直後の同期パスでは LLM がまだ
-        //    返っておらず merged が空になりうるので、先に読みを入れておかないと
-        //    「末尾に足したつもり」が先頭になってしまう。
+        // 7. 英数候補（先頭）: 入力したローマ字をそのまま出す。
         //
         //    ここに来るのは読みに ASCII 英字が残っている場合だけなので、先頭に置く。
         //    ローマ字がかなに変換しきれていない = 日本語の語として読む余地が無い、
@@ -1135,14 +1138,53 @@ impl RakunEngine {
             let mut at = 0usize;
             for c in ordered {
                 // 既にリストにある場合は取り除いてから入れ直す。読みそのものが
-                // 半角英数（"xy"）だと退避路として末尾に入っており、そのまま
+                // 半角英数（"xy"）だと後段の文字種候補と重複するので、
                 // skip すると全角だけが前に出て alpha_width の指定と逆になる。
                 merged.retain(|existing| existing != &c);
                 at = at.min(merged.len());
                 merged.insert(at, c);
                 at += 1;
             }
-            merged.truncate(limit.max(1));
+        }
+        merged.truncate(limit.max(1));
+
+        // 8. 文字種候補（末尾）: ひらがな → カタカナ → 半角英数 → 全角英数。
+        //
+        //    Google 日本語入力と同じく、通常候補を出し切った後ろに常に添える。
+        //    F6〜F10 を押さなくても候補リストから選べるようにするのが目的で、
+        //    「候補が足りないときに読みを末尾へ足す」退避路もここへ統合した。
+        //
+        //    🔴 必ず他のすべての候補を積んだ *後* に push すること。Space 直後の
+        //    同期パスは LLM 未完了で merged が 0 件になりうるので、insert で前へ
+        //    差し込むとライブ変換の preview と composition が化ける（候補 0 番が
+        //    プリエディットに採用されるため）。
+        //
+        //    truncate も済ませた後に足すので、返る件数は limit + 4 まで伸びうる。
+        //    候補ウィンドウはページャを持っており、表示ページ数（num_candidates）
+        //    とは無関係なので問題ない。
+        //
+        //    🔴 実候補が 1 件も無いときは読みだけを足して打ち切る。TSF のライブ変換は
+        //    `merge_candidates_for_reading(reading, vec![], 40)` に「読み以外の候補が
+        //    あるか」を尋ねて preview を出すか決めており（`start_live_bg_if_ready` /
+        //    `has_immediate_live_preview_candidate` / `on_live_timer`）、候補 0 件の
+        //    状態でカタカナを足すと打鍵のたびに preview がカタカナに化ける。
+        if merged.is_empty() {
+            merged.push(hiragana.to_string());
+        } else {
+            let mut char_type_cands: Vec<String> =
+                vec![hiragana.to_string(), hiragana_to_katakana(hiragana)];
+            if let Some((half, full)) = self.romaji_alnum_candidates(hiragana) {
+                match self.config.alpha_width {
+                    AlphaWidth::Halfwidth => char_type_cands.extend([half, full]),
+                    AlphaWidth::Fullwidth => char_type_cands.extend([full, half]),
+                }
+            }
+            for c in char_type_cands {
+                if c.is_empty() || merged.contains(&c) {
+                    continue;
+                }
+                merged.push(c);
+            }
         }
 
         if merged.is_empty() {
@@ -1671,7 +1713,7 @@ mod candidate_merge_tests {
     use std::fs;
 
     #[test]
-    fn merge_candidates_pads_short_list_with_original_reading() {
+    fn merge_candidates_appends_hiragana_and_katakana_at_tail() {
         let mut engine = RakunEngine::new(EngineConfig {
             num_candidates: 9,
             ..Default::default()
@@ -1681,8 +1723,22 @@ mod candidate_merge_tests {
         let llm_candidates = (1..=8).map(|n| format!("候補{n}")).collect();
         let merged = engine.merge_candidates(llm_candidates, 40);
 
-        assert_eq!(merged.len(), 9);
-        assert_eq!(merged.last().map(String::as_str), Some("てすと"));
+        // 通常候補を出し切った後ろに、ひらがな → カタカナ が常に付く。
+        assert_eq!(merged.len(), 10, "merged={merged:?}");
+        assert_eq!(merged[8], "てすと");
+        assert_eq!(merged[9], "テスト");
+    }
+
+    #[test]
+    fn merge_candidates_keeps_only_reading_when_no_candidates() {
+        // 候補 0 件（Space 直後の同期パス / ライブ変換の打鍵途中）では読みだけ。
+        // ここでカタカナまで足すと、TSF 側の「読み以外の候補があるか」判定が
+        // 常に真になり、打鍵のたびに preview がカタカナに化ける。
+        let mut engine = RakunEngine::new(EngineConfig::default());
+        engine.force_preedit("てすと".to_string());
+
+        let merged = engine.merge_candidates(vec![], 40);
+        assert_eq!(merged, vec!["てすと".to_string()]);
     }
 
     #[test]
@@ -1930,18 +1986,37 @@ mod passthrough_sync_tests {
     }
 
     #[test]
-    fn romaji_literal_candidate_is_absent_for_normal_readings() {
+    fn romaji_literal_candidate_is_not_promoted_for_normal_readings() {
         let mut engine = engine_with_alpha_width(crate::AlphaWidth::Halfwidth);
         type_romaji(&mut engine, "tudukete");
         assert_eq!(engine.hiragana_text(), "つづけて");
 
-        // 読みに ASCII が残っていない普通の語には英数候補を出さない。
-        // Space 直後は LLM がまだ返らず候補が空なので、ここで足すと先頭を奪う。
-        let merged = engine.merge_candidates(vec![], 40);
-        assert!(
-            !merged.iter().any(|c| c.chars().any(|c| c.is_ascii_alphabetic())),
-            "merged={merged:?}"
-        );
+        // 読みに ASCII が残っていない普通の語では、英数候補は末尾の文字種候補
+        // としてだけ出す。Space 直後は LLM がまだ返らず候補が空になりうるので、
+        // 先頭に置くとライブ変換の preview を英字が奪う。
+        // 候補 0 件のときは読みだけ（先頭を英字に奪われない）
+        assert_eq!(engine.merge_candidates(vec![], 40), vec!["つづけて".to_string()]);
+
+        // 通常候補があるときは、その後ろに文字種候補として並ぶ
+        let merged = engine.merge_candidates(vec!["続けて".to_string()], 40);
+        let expected: Vec<String> = ["続けて", "つづけて", "ツヅケテ", "tudukete", "ｔｕｄｕｋｅｔｅ"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(merged, expected);
+    }
+
+    #[test]
+    fn char_type_candidates_follow_alpha_width_at_tail() {
+        let mut engine = engine_with_alpha_width(crate::AlphaWidth::Fullwidth);
+        type_romaji(&mut engine, "tudukete");
+
+        let merged = engine.merge_candidates(vec!["続けて".to_string()], 40);
+        let expected: Vec<String> = ["続けて", "つづけて", "ツヅケテ", "ｔｕｄｕｋｅｔｅ", "tudukete"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(merged, expected);
     }
 
     #[test]
