@@ -897,7 +897,12 @@ impl RakunEngine {
     /// された後や、記号・空白が混ざった入力では `None`（記号混じりは
     /// digits.rs のリテラル保護レイヤーの担当）。
     fn romaji_alnum_candidates(&self, hiragana: &str) -> Option<(String, String)> {
-        let romaji = self.romaji_log_str();
+        // かなに変換しきれず末尾に残っているローマ字（pending）も含める。
+        // 「mac」は 'm','a' が「ま」になり 'c' が pending に残るため、ログだけを
+        // 見ると "ma" になって "mac" がどこにも出てこない。プリエディットの
+        // 表示は「まc」なので、確定すると composition 全体が置き換わる＝
+        // "mac" を候補に出して問題ない。
+        let romaji = format!("{}{}", self.romaji_log_str(), self.pending_romaji_buf);
         if romaji.is_empty() {
             return None;
         }
@@ -1971,8 +1976,12 @@ mod passthrough_sync_tests {
             "reading={reading:?}"
         );
 
+        // 先頭候補は「打鍵したローマ字ぜんぶ」。かなに落ちなかった末尾が
+        // pending に残っていても、画面のプリエディットは "xyz" なので
+        // ここで reading（pending を含まない）を出すと末尾が落ちる。
         let merged = engine.merge_candidates(vec![], 40);
-        assert_eq!(merged.first().map(String::as_str), Some(reading.as_str()));
+        assert_eq!(merged.first().map(String::as_str), Some("xyz"));
+        assert_eq!(merged.get(1).map(String::as_str), Some("\u{FF58}\u{FF59}\u{FF5A}"));
     }
 
     #[test]
@@ -2017,6 +2026,22 @@ mod passthrough_sync_tests {
             .map(|s| s.to_string())
             .collect();
         assert_eq!(merged, expected);
+    }
+
+    #[test]
+    fn pending_romaji_is_included_in_char_type_candidates() {
+        // "mac" は 'm','a' が「ま」になり 'c' が pending に残る。ログだけ見ると
+        // "ma" になってしまい "mac" がどこにも出てこなかった。
+        let mut engine = engine_with_alpha_width(crate::AlphaWidth::Halfwidth);
+        type_romaji(&mut engine, "mac");
+        assert_eq!(engine.hiragana_text(), "ま");
+
+        let merged = engine.merge_candidates(vec!["真".to_string()], 40);
+        assert!(merged.iter().any(|c| c == "mac"), "merged={merged:?}");
+        assert!(
+            merged.iter().any(|c| c == "\u{FF4D}\u{FF41}\u{FF43}"),
+            "merged={merged:?}"
+        );
     }
 
     #[test]
