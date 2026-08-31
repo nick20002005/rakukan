@@ -876,13 +876,68 @@ impl super::TextServiceFactory_Impl {
     }
 
     /// Left: 選択文節を左へ移動する。
+    /// ←: 変換中に一つ前の文節（ブロック）へ戻って選び直す。
     pub(super) fn on_segment_move_left(
         &self,
-        _ctx: ITfContext,
-        _tid: u32,
-        _sink: ITfCompositionSink,
-        mut guard: crate::engine::state::EngineGuard,
+        ctx: ITfContext,
+        tid: u32,
+        sink: ITfCompositionSink,
+        guard: crate::engine::state::EngineGuard,
     ) -> Result<bool> {
+        self.on_segment_move(ctx, tid, sink, guard, false)
+    }
+
+    /// →: 変換中に次の文節（ブロック）へ進む。Enter と違って確定はしない。
+    pub(super) fn on_segment_move_right_impl(
+        &self,
+        ctx: ITfContext,
+        tid: u32,
+        sink: ITfCompositionSink,
+        guard: crate::engine::state::EngineGuard,
+    ) -> Result<bool> {
+        self.on_segment_move(ctx, tid, sink, guard, true)
+    }
+
+    /// ← / → の共通処理。
+    ///
+    /// BlockSelecting のときだけ文節を移動し、候補ウィンドウと composition を
+    /// 描き直す。移動先ブロックの候補は変換時に計算済みなので再変換は不要。
+    ///
+    /// 🔴 端に到達しても `Ok(true)` を返してキーを食う。`Ok(false)` にすると
+    /// 矢印キーがアプリへ流れ、composition の外へキャレットが飛んで変換が壊れる。
+    fn on_segment_move(
+        &self,
+        ctx: ITfContext,
+        tid: u32,
+        sink: ITfCompositionSink,
+        mut guard: crate::engine::state::EngineGuard,
+        forward: bool,
+    ) -> Result<bool> {
+        let mut sess = session_get()?;
+        if sess.is_block_selecting() {
+            if !sess.block_selecting_move(forward) {
+                return Ok(true);
+            }
+            let reading = sess.block_selecting_current_reading().unwrap_or_default();
+            let page_cands = sess.block_selecting_page_candidates();
+            let page_sel = sess.block_selecting_page_selected();
+            let (prefix, cand_text, remainder) =
+                sess.block_selecting_composition_parts().unwrap_or_default();
+            let caret = caret_rect_get();
+            drop(sess);
+            // 移動先ブロックの読みへエンジンを揃える（set_block_selecting の初期化と同じ）
+            if !reading.is_empty() {
+                if let Some(engine) = guard.as_mut() {
+                    engine.force_preedit(reading);
+                }
+            }
+            drop(guard);
+            candidate_window::update_selection(page_sel, "");
+            candidate_window::show(&page_cands, page_sel, "", caret.left, caret.bottom);
+            update_composition_candidate_parts(ctx, tid, sink, prefix, cand_text, remainder)?;
+            return Ok(true);
+        }
+        drop(sess);
         let engine = match guard.as_mut() {
             Some(e) => e,
             None => return Ok(false),
@@ -1010,16 +1065,12 @@ impl super::TextServiceFactory_Impl {
     /// Right: 選択文節を右へ移動する。
     pub(super) fn on_segment_move_right(
         &self,
-        _ctx: ITfContext,
-        _tid: u32,
-        _sink: ITfCompositionSink,
-        mut guard: crate::engine::state::EngineGuard,
+        ctx: ITfContext,
+        tid: u32,
+        sink: ITfCompositionSink,
+        guard: crate::engine::state::EngineGuard,
     ) -> Result<bool> {
-        let engine = match guard.as_mut() {
-            Some(e) => e,
-            None => return Ok(false),
-        };
-        Ok(!engine.preedit_is_empty())
+        self.on_segment_move_right_impl(ctx, tid, sink, guard)
     }
 
     /// Shift+Right: 選択範囲を右へ広げる。
