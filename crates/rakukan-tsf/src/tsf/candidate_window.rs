@@ -181,6 +181,11 @@ struct CandData {
     page_info: String,
     /// 候補の上に表示するステータス行（選択不可、グレー表示）
     status_line: Option<String>,
+    /// 行頭に選択番号（1〜9）を出すか。
+    ///
+    /// 予測ウィンドウ（入力中に自動で出るリスト）では **false**。この状態の
+    /// 数字キーは候補選択ではなく通常の数字入力なので、番号を出すと嘘になる。
+    numbered: bool,
 }
 
 // ─── HWND ヘルパー ────────────────────────────────────────────────────────────
@@ -490,7 +495,11 @@ unsafe fn draw(hdc: HDC) {
         let is_sel = i == data.selected;
         FillRect(hdc, &row, if is_sel { sel_brush } else { wht_brush });
         SetTextColor(hdc, if is_sel { COLOR_SEL_FG } else { COLOR_FG });
-        let text = format!("{} {}", i + 1, cand);
+        let text = if data.numbered {
+            format!("{} {}", i + 1, cand)
+        } else {
+            cand.clone()
+        };
         let text_w: Vec<u16> = text.encode_utf16().collect();
         let _ = TextOutW(hdc, padding_x(), y + (item_height() - font_height()) / 2, &text_w);
     }
@@ -557,6 +566,34 @@ pub fn show_with_status(
     y: i32,
     status_line: Option<&str>,
 ) {
+    show_inner(page_candidates, page_selected, page_info, x, y, status_line, true)
+}
+
+/// 入力中の予測ウィンドウ用。行頭の選択番号を出さない（数字キーはまだ
+/// 通常の数字入力なので、番号を振ると押せるように見えてしまう）。
+pub fn show_suggestion(page_candidates: &[String], x: i32, y: i32, status_line: Option<&str>) {
+    // selected にリスト外の添字を渡してどの行もハイライトしない
+    show_inner(
+        page_candidates,
+        page_candidates.len(),
+        "",
+        x,
+        y,
+        status_line,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn show_inner(
+    page_candidates: &[String],
+    page_selected: usize,
+    page_info: &str,
+    x: i32,
+    y: i32,
+    status_line: Option<&str>,
+    numbered: bool,
+) {
     if page_candidates.is_empty() {
         hide();
         return;
@@ -573,6 +610,7 @@ pub fn show_with_status(
         d.selected = page_selected;
         d.page_info = page_info.to_string();
         d.status_line = status_line.map(|s| s.to_string());
+        d.numbered = numbered;
     });
 
     let n = page_candidates.len();
@@ -709,6 +747,9 @@ pub fn update_selection(page_selected: usize, page_info: &str) {
 
 /// 候補ウィンドウを隠す。ウィンドウ自体は破棄しない（次回 show で再利用）。
 pub fn hide() {
+    // 予測ウィンドウとして出していた状態も同時に捨てる（確定・キャンセル経路は
+    // hide() だけを呼ぶので、ここで面倒を見ないと表示状態が残る）。
+    crate::tsf::suggestion::forget_shown();
     let hwnd = get_hwnd();
     if is_valid(hwnd) {
         unsafe {

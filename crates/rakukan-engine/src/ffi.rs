@@ -12,7 +12,7 @@ use crate::{EngineConfig, RakunEngine};
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::OnceLock;
 
-pub const ENGINE_ABI_VERSION: u32 = 9;
+pub const ENGINE_ABI_VERSION: u32 = 11;
 
 static LOG_INIT: OnceLock<()> = OnceLock::new();
 
@@ -360,7 +360,8 @@ pub extern "C" fn engine_merge_candidates(
     llm_json: *const c_char,
     limit: u32,
 ) -> *mut c_char {
-    let engine = unsafe { &*(handle as *const RakunEngine) };
+    let engine = unsafe { &mut *(handle as *mut RakunEngine) };
+    inject_pending_dict(engine);
     let s = unsafe { from_cstr(llm_json) };
     let llm_cands: Vec<String> = serde_json::from_str(s).unwrap_or_default();
     // 辞書検索を直接デバッグ
@@ -387,7 +388,8 @@ pub extern "C" fn engine_merge_candidates_for_reading(
     llm_json: *const c_char,
     limit: u32,
 ) -> *mut c_char {
-    let engine = unsafe { &*(handle as *const RakunEngine) };
+    let engine = unsafe { &mut *(handle as *mut RakunEngine) };
+    inject_pending_dict(engine);
     let reading = unsafe { from_cstr(reading) };
     let s = unsafe { from_cstr(llm_json) };
     let llm_cands: Vec<String> = serde_json::from_str(s).unwrap_or_default();
@@ -561,6 +563,21 @@ static PENDING_DICT: LazyLock<Mutex<Option<crate::DictStore>>> = LazyLock::new(|
 #[unsafe(no_mangle)]
 pub extern "C" fn engine_poll_dict_ready(handle: *mut c_void) -> bool {
     let engine = unsafe { &mut *(handle as *mut RakunEngine) };
+    inject_pending_dict(engine)
+}
+
+/// `PENDING_DICT` に届いている辞書をエンジンへ注入する。戻り値 true = 今注入した。
+///
+/// 🔴 `engine_poll_dict_ready` を待つだけにしてはいけない。TSF 側の
+/// `poll_dict_ready_cached` はプロセスごとの **ラッチ** で「一度 ready になったら
+/// 二度と poll しない」実装なので、**エンジンホストだけを再起動すると**
+/// （DLL 差し替えや watchdog 復帰）ラッチが立ったままの TSF は新しいホストに
+/// 対して二度と poll せず、辞書が永久に注入されないままになる。
+/// 症状は「ユーザー辞書と学習履歴だけが丸ごと効かない」で、変換自体は
+/// LLM だけで動くので気付きにくい（`learn: dict_store not initialized` の
+/// WARN だけが手掛かりになる）。
+/// そのため辞書を実際に使う入口でも都度取りに行く。
+fn inject_pending_dict(engine: &mut RakunEngine) -> bool {
     if engine.is_dict_ready() {
         return false;
     }
@@ -568,6 +585,7 @@ pub extern "C" fn engine_poll_dict_ready(handle: *mut c_void) -> bool {
         if let Some(store) = g.take() {
             engine.set_dict_store(store);
             set_dict_status("injected: mozc=true".to_string());
+            tracing::info!("dict injected into engine");
             return true;
         }
     }
@@ -630,6 +648,7 @@ pub extern "C" fn engine_learn(
     surface: *const c_char,
 ) {
     let engine = unsafe { &mut *(handle as *mut RakunEngine) };
+    inject_pending_dict(engine);
     let reading = unsafe { from_cstr(reading) }.to_string();
     let surface = unsafe { from_cstr(surface) }.to_string();
     if reading.is_empty() || surface.is_empty() {
@@ -646,12 +665,47 @@ pub extern "C" fn engine_learn_force(
     surface: *const c_char,
 ) {
     let engine = unsafe { &mut *(handle as *mut RakunEngine) };
+    inject_pending_dict(engine);
     let reading = unsafe { from_cstr(reading) }.to_string();
     let surface = unsafe { from_cstr(surface) }.to_string();
     if reading.is_empty() || surface.is_empty() {
         return;
     }
     engine.learn_force(&reading, &surface);
+}
+
+/// 入力中の予測候補を JSON 配列で返す（学習履歴のみを引く軽量経路）。
+/// `engine_free_string` で解放すること。
+#[unsafe(no_mangle)]
+pub extern "C" fn engine_predict(
+    handle: *mut c_void,
+    reading: *const c_char,
+    limit: u32,
+) -> *mut c_char {
+    let engine = unsafe { &mut *(handle as *mut RakunEngine) };
+    inject_pending_dict(engine);
+    let reading = unsafe { from_cstr(reading) };
+    let preds = engine.predict(reading, limit as usize);
+    let json = serde_json::to_string(&preds).unwrap_or_else(|_| "[]".into());
+    unsafe { to_cstr(json) }
+}
+
+/// 学習履歴から候補を削除する（候補ウィンドウでの明示削除）。
+/// `reading` に前方一致するキーも対象にするため、短文予測の候補も消せる。
+/// 戻り値: 1 件以上削除できたか。
+#[unsafe(no_mangle)]
+pub extern "C" fn engine_forget(
+    handle: *mut c_void,
+    reading: *const c_char,
+    surface: *const c_char,
+) -> bool {
+    let engine = unsafe { &mut *(handle as *mut RakunEngine) };
+    let reading = unsafe { from_cstr(reading) }.to_string();
+    let surface = unsafe { from_cstr(surface) }.to_string();
+    if reading.is_empty() || surface.is_empty() {
+        return false;
+    }
+    engine.forget(&reading, &surface)
 }
 
 // ─── 最後のエラーメッセージ（診断用）────────────────────────────────────────

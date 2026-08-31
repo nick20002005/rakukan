@@ -785,15 +785,62 @@ pub fn verify_digits_preserved(input: &str, output: &str) -> bool {
 /// 「5万」が数字改変とみなされて捨てられ、生成順の都合で候補が全滅しうる。
 /// 呼び出し側は verify の後に直接差し込むこと。
 fn numeric_unit_kanji(reading: &str) -> Option<(&'static str, bool)> {
-    match reading {
-        "まん" => Some(("万", true)),
-        "おく" => Some(("億", true)),
-        "ちょう" => Some(("兆", false)),
-        "せん" => Some(("千", false)),
-        "ひゃく" => Some(("百", false)),
-        "じゅう" => Some(("十", false)),
-        _ => None,
+    NUMERIC_UNITS
+        .iter()
+        .find(|(r, _, _)| *r == reading)
+        .map(|(_, kanji, promote)| (*kanji, *promote))
+}
+
+/// (読み, 漢数詞, 第 1 候補に置いてよいか)
+const NUMERIC_UNITS: [(&str, &str, bool); 6] = [
+    ("まん", "万", true),
+    ("おく", "億", true),
+    ("ちょう", "兆", false),
+    ("せん", "千", false),
+    ("ひゃく", "百", false),
+    ("じゅう", "十", false),
+];
+
+/// 数字 run 直後のかな run が数詞「で始まり」、かつ後ろに語が続く場合に
+/// その (読み, 漢数詞) を返す。完全一致は `numeric_unit_kanji` の担当なので除く。
+///
+/// これ単独では「3まんが」を「3万が」に壊しうるため、呼び出し側は
+/// 「既存候補が『数字＋カタカナ数詞』で始まっている」= 変換に失敗している
+/// ことを確認してから使うこと。
+fn numeric_unit_prefix(reading: &str) -> Option<(&'static str, &'static str)> {
+    NUMERIC_UNITS
+        .iter()
+        .filter(|(r, _, _)| reading.starts_with(r) && reading.len() > r.len())
+        .max_by_key(|(r, _, _)| r.len())
+        .map(|(r, kanji, _)| (*r, *kanji))
+}
+
+/// 「数字＋カタカナ数詞」で始まる候補を「数字＋漢数詞」に書き換えた候補を返す。
+///
+/// 例: `["10マン以上", "１０マン以上"]` → `["10万以上", "１０万以上"]`。
+/// 先頭が一致しない候補（「3漫画」のように語として変換できているもの）は
+/// 何も返さないので、このルールが誤爆しないことがここで保証される。
+fn rewrite_katakana_unit_prefix(
+    digits: &[String],
+    unit_reading: &str,
+    unit: &str,
+    verified: &[String],
+) -> Vec<String> {
+    let kata = crate::kana::hiragana_to_katakana(unit_reading);
+    let mut rewritten: Vec<String> = Vec::new();
+    for cand in verified {
+        for digit in digits {
+            let prefix = format!("{digit}{kata}");
+            if let Some(rest) = cand.strip_prefix(&prefix) {
+                let fixed = format!("{digit}{unit}{rest}");
+                if !verified.contains(&fixed) && !rewritten.contains(&fixed) {
+                    rewritten.push(fixed);
+                }
+                break;
+            }
+        }
     }
+    rewritten
 }
 
 fn build_local_context(runs: &[Run], kana_index: usize, global_context: &str) -> String {
@@ -890,6 +937,32 @@ pub fn convert_with_digit_protection(
                 let cand = format!("{digit}{unit}");
                 verified.retain(|c| c != &cand);
                 verified.insert(at.min(verified.len()), cand);
+            }
+        }
+    }
+
+    // 「10まんいじょう」→「10万以上」の救済。
+    //
+    // 完全一致（"10まん"）は上のブロックが扱う。ここは数詞のあとに語が続く場合。
+    // かな run は数字 run と切り離して変換されるため、LLM は「まんいじょう」を
+    // 「マン以上」と読んでしまう（「まん」単独を数詞と判断する手掛かりが無い）。
+    //
+    // 前方一致だけを条件に「数字＋漢数詞」を組み立てると「3まんが」を「3万が」に
+    // 壊すので、**既存候補が「数字＋カタカナ数詞」で始まっているもの** だけを
+    // 書き換える。LLM が「3漫画」のように語として変換できているものは先頭が
+    // 「3マン」にならないため、ここは発動しない。
+    //
+    // 上のブロックと同じ理由で verify_digits_preserved は通していない
+    // （「万」が数値 10000 と解釈されて捨てられるため）。
+    if let [Run::Digit(d), Run::Kana(k)] = runs.as_slice() {
+        if numeric_unit_kanji(k).is_none() {
+            if let Some((unit_reading, unit)) = numeric_unit_prefix(k) {
+                let digits = digit_candidates(d, digit_candidates_order);
+                let rewritten =
+                    rewrite_katakana_unit_prefix(&digits, unit_reading, unit, &verified);
+                for (at, cand) in rewritten.into_iter().enumerate() {
+                    verified.insert(at.min(verified.len()), cand);
+                }
             }
         }
     }
@@ -1344,7 +1417,6 @@ mod tests {
         assert_eq!(runs[1].text(), "まん");
     }
     #[test]
-    #[test]
     fn numeric_unit_promotion_depends_on_ambiguity() {
         // 数字の直後でほぼ一意 → 第 1 候補に置いてよい
         assert_eq!(numeric_unit_kanji("まん"), Some(("万", true)));
@@ -1361,6 +1433,42 @@ mod tests {
         assert_eq!(numeric_unit_kanji("まんが"), None);
         assert_eq!(numeric_unit_kanji("せんち"), None);
         assert_eq!(numeric_unit_kanji("かわ"), None);
+    }
+
+    #[test]
+    fn numeric_unit_prefix_matches_only_when_a_word_follows() {
+        assert_eq!(numeric_unit_prefix("まんいじょう"), Some(("まん", "万")));
+        assert_eq!(numeric_unit_prefix("おくえん"), Some(("おく", "億")));
+        assert_eq!(numeric_unit_prefix("まんが"), Some(("まん", "万")));
+
+        // 完全一致は numeric_unit_kanji の担当なので、ここでは拾わない
+        assert_eq!(numeric_unit_prefix("まん"), None);
+        // 数詞で始まらない読み
+        assert_eq!(numeric_unit_prefix("かわ"), None);
+    }
+
+    #[test]
+    fn katakana_unit_prefix_is_rewritten_to_kanji() {
+        // 「10まんいじょう」で LLM が返す形。かな run が数字と切り離されるので
+        // 「まん」がカタカナのまま残る。
+        let digits = vec!["10".to_string(), "１０".to_string()];
+        let verified = vec![
+            "10マン以上".to_string(),
+            "１０マン以上".to_string(),
+            "10まんいじょう".to_string(),
+        ];
+        let out = rewrite_katakana_unit_prefix(&digits, "まん", "万", &verified);
+        assert_eq!(out, vec!["10万以上".to_string(), "１０万以上".to_string()]);
+    }
+
+    #[test]
+    fn katakana_unit_prefix_leaves_properly_converted_words_alone() {
+        // 「3まんが」は LLM が「3漫画」と変換できている。先頭が「3マン」では
+        // ないので書き換え対象にならない = 「3万が」に壊さない。
+        let digits = vec!["3".to_string()];
+        let verified = vec!["3漫画".to_string(), "3まんが".to_string()];
+        let out = rewrite_katakana_unit_prefix(&digits, "まん", "万", &verified);
+        assert!(out.is_empty(), "誤爆した: {out:?}");
     }
 
     #[test]

@@ -452,6 +452,24 @@ impl RpcEngine {
             surface: surface.into(),
         });
     }
+
+    /// 入力中の予測候補を返す（学習履歴のみ）。失敗時は空。
+    pub fn predict(&self, reading: &str, limit: usize) -> Vec<String> {
+        self.call_strings(Request::Predict {
+            reading: reading.into(),
+            limit: limit as u32,
+        })
+        .unwrap_or_default()
+    }
+
+    /// 学習履歴から候補を削除する。`reading` に前方一致するキーも対象。
+    pub fn forget(&self, reading: &str, surface: &str) -> bool {
+        self.call_bool(Request::Forget {
+            reading: reading.into(),
+            surface: surface.into(),
+        })
+        .unwrap_or(false)
+    }
     pub fn last_error(&self) -> String {
         self.call_string(Request::LastError).unwrap_or_default()
     }

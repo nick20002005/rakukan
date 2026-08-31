@@ -220,7 +220,7 @@ impl super::TextServiceFactory_Impl {
                     && full_text != full_reading
                     && !full_reading.is_empty()
                 {
-                    engine.learn(&full_reading, &full_text);
+                    engine.learn_force(&full_reading, &full_text);
                 }
                 engine.commit(&full_text);
                 engine.reset_preedit();
@@ -276,14 +276,9 @@ impl super::TextServiceFactory_Impl {
                     &selected_text,
                     candidate_source,
                 ) {
-                    if matches!(
-                        candidate_source,
-                        Some(crate::engine::state::CandidateViewSource::Bg)
-                    ) {
-                        engine.learn_force(&reading, &selected_text);
-                    } else {
-                        engine.learn(&reading, &selected_text);
-                    }
+                    // 確定した合成は辞書ガードなしで学習する（Google 日本語入力相当）。
+                    // 誤変換も履歴に載るが、Ctrl+Delete で候補ごと削除できる。
+                    engine.learn_force(&reading, &selected_text);
                 }
                 engine.commit(&full_text);
                 engine.reset_preedit();
@@ -345,15 +340,18 @@ impl super::TextServiceFactory_Impl {
 
         if !hiragana.is_empty() {
             let live_ready = crate::engine::state::start_live_bg_if_ready(engine, &hiragana);
+            let suggestions = crate::tsf::suggestion::fetch(engine, &hiragana);
             drop(guard);
             // [Phase0] ライブ変換実験: コンテキストをキャッシュしてタイマーを起動
             if live_ready {
                 candidate_window::live_input_notify(&ctx, tid);
             }
             update_composition(ctx, tid, sink, preedit)?;
+            crate::tsf::suggestion::show(&hiragana, suggestions);
             return Ok(true);
         }
         drop(guard);
+        crate::tsf::suggestion::clear();
         update_composition(ctx, tid, sink, preedit)?;
         Ok(true)
     }
@@ -420,12 +418,14 @@ impl super::TextServiceFactory_Impl {
                     live_continuation_display(&reading, &preview, &new_reading, &suffix, "");
                 sess.set_live_conv(new_reading.clone(), display.clone());
                 let live_ready = crate::engine::state::start_live_bg_if_ready(engine, &new_reading);
+                let suggestions = crate::tsf::suggestion::fetch(engine, &new_reading);
                 drop(sess);
                 drop(guard);
                 if live_ready {
                     candidate_window::live_input_notify(&ctx, tid);
                 }
                 update_composition(ctx, tid, sink, display_shown)?;
+                crate::tsf::suggestion::show(&new_reading, suggestions);
                 return Ok(true);
             }
         }
@@ -459,14 +459,9 @@ impl super::TextServiceFactory_Impl {
                     &selected_text,
                     candidate_source,
                 ) {
-                    if matches!(
-                        candidate_source,
-                        Some(crate::engine::state::CandidateViewSource::Bg)
-                    ) {
-                        engine.learn_force(&reading, &selected_text);
-                    } else {
-                        engine.learn(&reading, &selected_text);
-                    }
+                    // 確定した合成は辞書ガードなしで学習する（Google 日本語入力相当）。
+                    // 誤変換も履歴に載るが、Ctrl+Delete で候補ごと削除できる。
+                    engine.learn_force(&reading, &selected_text);
                 }
                 engine.commit(&full_text);
                 engine.reset_preedit();
@@ -499,11 +494,14 @@ impl super::TextServiceFactory_Impl {
             sess.sync_preedit_reading(&reading);
         }
         let live_ready = crate::engine::state::start_live_bg_if_ready(engine, &reading);
+        let suggestions = crate::tsf::suggestion::fetch(engine, &reading);
+        let reading_owned = reading.to_string();
         if live_ready {
             candidate_window::live_input_notify(&ctx, tid);
         }
         drop(guard);
         update_composition(ctx, tid, sink, preedit)?;
+        crate::tsf::suggestion::show(&reading_owned, suggestions);
         Ok(true)
     }
 

@@ -33,6 +33,8 @@ pub enum KeyAction {
     CandidatePageDown, // PageDown
     CandidatePageUp,   // PageUp
     CandidateN(u8),    // 数字 1–9
+    /// 選択中の候補を学習履歴から削除（Ctrl+Delete）
+    CandidateForget,
     // IME オン/オフ
     ImeOff,    // 英数キー（IME オン中）
     ImeOn,     // 英数キー以外（IME オフ中）
@@ -69,6 +71,7 @@ impl KeyAction {
             Self::CandidatePageDown => UserAction::CandidatePageDown,
             Self::CandidatePageUp => UserAction::CandidatePageUp,
             Self::CandidateN(n) => UserAction::CandidateSelect(*n),
+            Self::CandidateForget => UserAction::CandidateForget,
             Self::ImeOff => UserAction::ImeOff,
             Self::ImeOn => UserAction::ImeOn,
             Self::ImeToggle => UserAction::ImeToggle,
@@ -601,6 +604,7 @@ fn preset_bindings(preset: KeymapPreset) -> Vec<KeyBinding> {
             bind("Tab", KeyAction::CandidatePageDown),
             bind("Shift+Tab", KeyAction::CandidatePageUp),
             bind("PageDown", KeyAction::CandidatePageDown),
+            bind("Ctrl+Delete", KeyAction::CandidateForget),
             bind("PageUp", KeyAction::CandidatePageUp),
             bind("Left", KeyAction::CursorLeft),
             bind("Right", KeyAction::CursorRight),
@@ -626,6 +630,7 @@ fn preset_bindings(preset: KeymapPreset) -> Vec<KeyBinding> {
             bind("Tab", KeyAction::CandidatePageDown),
             bind("Shift+Tab", KeyAction::CandidatePageUp),
             bind("PageDown", KeyAction::CandidatePageDown),
+            bind("Ctrl+Delete", KeyAction::CandidateForget),
             bind("PageUp", KeyAction::CandidatePageUp),
             bind("Zenkaku", KeyAction::ImeToggle),
             bind("Ctrl+Space", KeyAction::ImeToggle),

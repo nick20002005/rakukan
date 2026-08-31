@@ -8,4 +8,5 @@ pub(crate) mod language_bar;
 pub(crate) mod live_session;
 pub(crate) mod mode_indicator;
 pub(crate) mod settings_launcher;
+pub(crate) mod suggestion;
 pub(crate) mod tray_ipc;

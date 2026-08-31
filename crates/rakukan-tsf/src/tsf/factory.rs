@@ -1099,6 +1099,9 @@ fn key_should_eat(action: &UserAction, has_preedit: bool) -> bool {
         UserAction::SegmentShrink | UserAction::SegmentExtend => has_preedit,
         UserAction::Punctuate(_) => true,
         UserAction::CandidateSelect(_) => has_preedit,
+        // Ctrl+Delete: 候補ウィンドウが出ている時だけ消費する。プリエディットが
+        // 無い場面ではアプリ本来の「単語削除」を通す。
+        UserAction::CandidateForget => has_preedit,
         _ => false,
     }
 }
@@ -1125,6 +1128,7 @@ pub(super) fn action_name(a: &UserAction) -> &'static str {
         UserAction::CandidatePageDown => "CandidatePageDown",
         UserAction::CandidatePageUp => "CandidatePageUp",
         UserAction::CandidateSelect(_) => "CandidateSelect",
+        UserAction::CandidateForget => "CandidateForget",
         UserAction::CursorLeft => "CursorLeft",
         UserAction::CursorRight => "CursorRight",
         UserAction::Punctuate(_) => "Punctuate",

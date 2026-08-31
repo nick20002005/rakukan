@@ -1442,7 +1442,9 @@ impl super::TextServiceFactory_Impl {
                 candidate_window::hide();
                 candidate_window::stop_live_timer();
                 if preview != reading && crate::engine::state::is_auto_learn_enabled() {
-                    engine.learn(&reading, &preview);
+                    // ライブ変換の preview 全体を読み全体に紐づけて学習する。
+                    // これが短文予測（「かんたん」→「簡単な言葉で分析」）の供給源。
+                    engine.learn_force(&reading, &preview);
                 }
                 engine.commit(&preview);
                 engine.reset_preedit();
@@ -1528,7 +1530,7 @@ impl super::TextServiceFactory_Impl {
                         && full_text != full_reading
                         && !full_reading.is_empty()
                     {
-                        engine.learn(&full_reading, &full_text);
+                        engine.learn_force(&full_reading, &full_text);
                     }
                     engine.commit(&full_text);
                     engine.reset_preedit();
@@ -1578,14 +1580,8 @@ impl super::TextServiceFactory_Impl {
                     text.clone()
                 };
                 if crate::engine::state::should_learn_and_log(&reading, &text, candidate_source) {
-                    if matches!(
-                        candidate_source,
-                        Some(crate::engine::state::CandidateViewSource::Bg)
-                    ) {
-                        engine.learn_force(&reading, &text);
-                    } else {
-                        engine.learn(&reading, &text);
-                    }
+                    // 確定した合成は辞書ガードなしで学習する（Google 日本語入力相当）
+                    engine.learn_force(&reading, &text);
                 }
                 candidate_window::hide();
                 candidate_window::stop_live_timer();
@@ -1690,11 +1686,15 @@ impl super::TextServiceFactory_Impl {
                     if let Ok(mut sess2) = session_get() {
                         sess2.sync_preedit_reading(&hira);
                     }
+                    let hira_owned = hira.to_string();
+                    let suggestions = crate::tsf::suggestion::fetch(engine2, &hira_owned);
                     drop(guard);
                     if preedit.is_empty() {
+                        crate::tsf::suggestion::clear();
                         end_composition(ctx, tid, String::new())?;
                     } else {
                         update_composition(ctx, tid, sink, preedit)?;
+                        crate::tsf::suggestion::show(&hira_owned, suggestions);
                     }
                 }
                 return Ok(consumed);
@@ -1758,11 +1758,15 @@ impl super::TextServiceFactory_Impl {
             diag::event(DiagEvent::Backspace {
                 preedit_after: preedit.clone(),
             });
+            let hira_owned = hira.to_string();
+            let suggestions = crate::tsf::suggestion::fetch(engine, &hira_owned);
             drop(guard);
             if preedit.is_empty() {
+                crate::tsf::suggestion::clear();
                 end_composition(ctx, tid, String::new())?;
             } else {
                 update_composition(ctx, tid, sink, preedit)?;
+                crate::tsf::suggestion::show(&hira_owned, suggestions);
             }
         }
         Ok(consumed)
