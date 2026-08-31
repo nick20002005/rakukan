@@ -507,21 +507,58 @@ impl super::TextServiceFactory_Impl {
         {
             let mut guard = engine_try_get_or_create()?;
             if let Some(engine) = guard.as_mut() {
-                // LiveConv 中は preview をコミットしてから IME を切り替える
+                // IME を切り替える前に、**画面に出ている合成文字列** を確定する。
+                //
+                // 🔴 `engine.preedit_display()` だけを見てはいけない。候補選択中や
+                // ブロック分割変換中は、表示中のテキストをセッション側が持っており、
+                // engine の preedit はそれと一致しない。実害（2026-08-31）:
+                // 読点入りの 39 文字を Space → BlockSelecting → Enter で 1 ブロック目
+                // 「また」を確定した直後に半角/全角キーを押したところ、engine の
+                // preedit が「また」のままだったため `end_composition(_, "また")` が
+                // 走り、composition に残っていた 37 文字が丸ごと消えた。
                 let commit_text = {
                     let sess = session_get();
-                    if let Ok(s) = &sess {
-                        if s.is_live_conv() {
+                    let text = match &sess {
+                        Ok(s) if s.is_live_conv() => {
                             s.live_conv_parts().map(|(_, p)| p.to_string())
-                        } else {
-                            None
                         }
-                    } else {
-                        None
-                    }
+                        Ok(s) if s.is_block_selecting() => {
+                            // prefix（確定済みブロック）は既にドキュメントへ
+                            // コミットされているので、composition に載っているのは
+                            // 現在ブロック + 残りブロックだけ。
+                            // （on_commit_raw[BlockSelecting] の advance 経路が
+                            //   `new_cand + new_rem` で composition を張り直すのに合わせる）
+                            s.block_selecting_composition_parts()
+                                .map(|(_, cand, remainder)| format!("{cand}{remainder}"))
+                        }
+                        Ok(s) if s.is_selecting() => {
+                            let cand = s
+                                .current_candidate()
+                                .or_else(|| s.original_preedit())
+                                .unwrap_or("");
+                            Some(format!(
+                                "{}{}{}",
+                                s.selecting_prefix_clone(),
+                                cand,
+                                s.selecting_remainder_clone()
+                            ))
+                        }
+                        Ok(s) if s.is_range_select() => s
+                            .range_select_parts()
+                            .map(|(selected, unselected)| format!("{selected}{unselected}")),
+                        Ok(s) if s.is_waiting() => s.preedit_text().map(|t| t.to_string()),
+                        _ => None,
+                    };
+                    text.filter(|t| !t.is_empty())
                 };
+                let from_session = commit_text.is_some();
                 let preedit = commit_text.unwrap_or_else(|| engine.preedit_display());
                 if !preedit.is_empty() {
+                    tracing::info!(
+                        "on_ime_toggle: commit {:?} (from_session={})",
+                        preedit,
+                        from_session
+                    );
                     engine.bg_reclaim();
                     engine.commit(&preedit.clone());
                     engine.reset_preedit();
@@ -529,6 +566,7 @@ impl super::TextServiceFactory_Impl {
                     if let Ok(mut sess) = session_get() {
                         sess.set_idle();
                     }
+                    candidate_window::hide();
                     candidate_window::stop_live_timer();
                     end_composition(ctx.clone(), tid, preedit)?;
                 }
