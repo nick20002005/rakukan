@@ -913,7 +913,14 @@ impl RakunEngine {
         {
             return None;
         }
-        if self.hiragana_from_romaji_log() != hiragana {
+        // 呼び出し側が渡す読みは経路によって 2 種類ある。
+        //   - ライブ変換 / 学習系: hiragana_buf（pending を含まない）＝「ま」
+        //   - Space 変換 (on_convert): preedit_display()（pending 込み）＝「まc」
+        // どちらでも同じ英数候補を出す。片方としか比べないと、Space で変換した
+        // ときだけ "mac" が出ない（2026-08-31 に実害）。
+        let kana = self.hiragana_from_romaji_log();
+        let kana_with_pending = format!("{kana}{}", self.pending_romaji_buf);
+        if hiragana != kana && hiragana != kana_with_pending {
             return None;
         }
         let full: String = romaji.chars().map(ascii_to_fullwidth).collect();
@@ -1115,7 +1122,15 @@ impl RakunEngine {
         // 6. 短文予測（Google 日本語入力相当）: 読みが前方一致する学習済みの長い
         //    フレーズを、先頭候補の直後に差し込む。先頭を奪わないのは、ライブ変換の
         //    preview が候補 0 番を採用するため（打鍵途中に長文が出続けるのを避ける）。
-        if !prediction_cands.is_empty() {
+        //
+        //    🔴 実候補が 1 件も無いときは予測を入れない。`1.min(merged.len())` は
+        //    merged が空だと 0＝先頭になり、予測フレーズがライブ変換の preview に
+        //    昇格して「打っている途中で過去の長文が勝手に確定される」事故になる
+        //    （2026-08-31 に実害）。TSF は preview 判定に
+        //    `merge_candidates_for_reading(reading, vec![], 40)` を使うので、
+        //    LLM 候補が無く辞書も引けない読みでは merged がここで空になりうる。
+        //    予測はあくまで「実候補の隣に並べる」もので、単独で先頭に立たせない。
+        if !prediction_cands.is_empty() && !merged.is_empty() {
             // 重複した予測は挿入しないので、挿入位置は「実際に入れた数」で進める
             // （enumerate の添字で進めると len を超えて insert が panic する）。
             let mut at = 1.min(merged.len());
@@ -1857,6 +1872,32 @@ priority = "low"
     }
 
     #[test]
+    fn prediction_never_becomes_the_first_candidate() {
+        // 短文予測が候補 0 番に立つと、ライブ変換の preview がその長文になり、
+        // 打鍵の途中で Enter を押した瞬間に過去のフレーズが確定されてしまう。
+        // TSF は preview 判定に llm_candidates 無しで merge を呼ぶため、辞書が
+        // 引けない読みでは実候補が 0 件になりうる。そこで予測を出さない。
+        let dir = tempfile::tempdir().unwrap();
+        let user_path = dir.path().join("user_dict.toml");
+        fs::write(&user_path, "").unwrap();
+        let store = DictStore::load(Some(&user_path), None, None).unwrap();
+
+        let mut engine = RakunEngine::new(EngineConfig::default());
+        engine.set_dict_store(store);
+        engine.learn_force("またつうじょうのこうほ", "また通常の候補");
+
+        // 実候補が 0 件 → 予測は出さず、読みだけを返す
+        let merged = engine.merge_candidates_for_reading("またつうじょう", vec![], 40);
+        assert_eq!(merged, vec!["またつうじょう".to_string()]);
+
+        // 実候補があるときは 2 番目に並べる（従来どおり）
+        let merged =
+            engine.merge_candidates_for_reading("またつうじょう", vec!["また通常".to_string()], 40);
+        assert_eq!(merged.first().map(String::as_str), Some("また通常"));
+        assert_eq!(merged.get(1).map(String::as_str), Some("また通常の候補"));
+    }
+
+    #[test]
     fn merge_candidates_normal_priority_still_outranks_learn_history() {
         let dir = tempfile::tempdir().unwrap();
         let user_path = dir.path().join("user_dict.toml");
@@ -1988,6 +2029,33 @@ mod passthrough_sync_tests {
         let merged = engine.merge_candidates(vec!["cぁうで".to_string()], 40);
         assert_eq!(merged.first().map(String::as_str), Some("ｃｌａｕｄｅ"));
         assert_eq!(merged.get(1).map(String::as_str), Some("claude"));
+    }
+
+    #[test]
+    fn romaji_literal_candidate_uses_preedit_display_as_reading() {
+        // "mac" は 'm','a' が「ま」になり 'c' が pending に残る。Space 変換の
+        // 経路（on_convert）はエンジンへ preedit_display()＝「まc」を読みとして
+        // 渡すので、hiragana_buf「ま」としか比べないと英数候補が落ちる。
+        let mut engine = engine_with_alpha_width(crate::AlphaWidth::Halfwidth);
+        type_romaji(&mut engine, "mac");
+        assert_eq!(engine.hiragana_text(), "ま");
+
+        for reading in ["まc", "ま"] {
+            let merged =
+                engine.merge_candidates_for_reading(reading, vec!["真".to_string()], 40);
+            assert!(
+                merged.iter().any(|c| c == "mac"),
+                "reading={reading:?} merged={merged:?}"
+            );
+            assert!(
+                merged.iter().any(|c| c == "ｍａｃ"),
+                "reading={reading:?} merged={merged:?}"
+            );
+        }
+
+        // 読みに ASCII が残っている「まc」では先頭に出す（普通の語ではない）
+        let merged = engine.merge_candidates_for_reading("まc", vec!["真".to_string()], 40);
+        assert_eq!(merged.first().map(String::as_str), Some("mac"));
     }
 
     #[test]
