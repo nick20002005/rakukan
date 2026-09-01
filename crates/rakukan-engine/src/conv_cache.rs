@@ -49,6 +49,10 @@ struct Request {
     /// こともある。キーと分けているのは、呼び出し側が結果を引くときに使うのは
     /// あくまで打鍵そのままの読みだから。
     conv_reading: String,
+    /// 読みの先頭がユーザー辞書の語に前方一致した場合の (表記, 残りの読み)。
+    /// ワーカーが残りを変換して `語 + 残り` を候補に足す。辞書は engine 側に
+    /// あるので、ここまで持ってきてもらう必要がある。
+    dict_prefix: Option<(String, String)>,
     committed: String,
     converter: KanaKanjiConverter,
     n: usize,
@@ -139,6 +143,7 @@ fn worker_loop(cache: Arc<Cache>) {
 
         let key = req.hiragana.clone();
         let conv_reading = req.conv_reading.clone();
+        let dict_prefix = req.dict_prefix.clone();
         let committed = req.committed.clone();
         let n = req.n;
         let digit_candidates_order = req.digit_candidates_order.clone();
@@ -147,7 +152,7 @@ fn worker_loop(cache: Arc<Cache>) {
         let converter = req.converter;
 
         let t = std::time::Instant::now();
-        let (converter, candidates) =
+        let (converter, mut candidates) =
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 crate::digits::convert_with_digit_protection(
                     &converter,
@@ -178,6 +183,23 @@ fn worker_loop(cache: Arc<Cache>) {
                 }
             };
 
+        // ユーザー辞書語の前方一致候補（`To LOVEる` ＋ `と` → `To LOVEると`）。
+        // 残りの読みをもう一度変換するため LLM 呼び出しが 1 回増えるが、
+        // 走るのは前方一致した時だけで、残りの読みは短いことが多い。
+        if let Some(split) = dict_prefix {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::dict_prefix::insert_candidates(
+                    &converter,
+                    &split,
+                    &committed,
+                    &digit_candidates_order,
+                    alpha_fullwidth_first,
+                    symbol_fullwidth_first,
+                    &mut candidates,
+                );
+            }));
+        }
+
         let mut inner = cache.inner.lock().unwrap();
         if let Some(pending) = inner.pending.as_mut() {
             // 変換中に新しいリクエストが来ていた場合、
@@ -205,9 +227,11 @@ fn worker_loop(cache: Arc<Cache>) {
 /// # 戻り値
 /// - `None`       = ワーカーに渡した（converter の所有権はキャッシュへ）
 /// - `Some(conv)` = 渡せなかった（同一キー実行中 or lock 取得失敗）
+#[allow(clippy::too_many_arguments)]
 pub fn start(
     hiragana: String,
     conv_reading: String,
+    dict_prefix: Option<(String, String)>,
     committed: String,
     converter: KanaKanjiConverter,
     n: usize,
@@ -240,6 +264,7 @@ pub fn start(
     inner.pending = Some(Request {
         hiragana,
         conv_reading,
+        dict_prefix,
         committed,
         converter,
         n,
