@@ -1497,7 +1497,11 @@ impl super::TextServiceFactory_Impl {
                 drop(sess);
                 candidate_window::hide();
                 candidate_window::stop_live_timer();
-                if preview != reading && crate::engine::state::is_auto_learn_enabled() {
+                let (preview, unconverged) = catch_up_live_preview(engine, &reading, preview);
+                if preview != reading
+                    && !unconverged
+                    && crate::engine::state::is_auto_learn_enabled()
+                {
                     // ライブ変換の preview 全体を読み全体に紐づけて学習する。
                     // これが短文予測（「かんたん」→「簡単な言葉で分析」）の供給源。
                     engine.learn_force(&reading, &preview);
@@ -1959,3 +1963,54 @@ impl super::TextServiceFactory_Impl {
         Ok(true)
     }
 }
+
+/// ライブ変換の preview が現在の読みに追いつくのを待つ上限。
+///
+/// Enter の体感を変えないため、待つのは「現在の読みに対する変換結果がまだ
+/// 存在しない」ときだけ。通常はここに入らず即座に確定する。
+const LIVE_COMMIT_CATCHUP_MS: u64 = 400;
+
+/// ライブ変換の preview を、必要なら bg 変換の完了を待って取り直す。
+///
+/// ライブ変換の preview は変換が追いつかない間 `live_continuation_display` が
+/// 「確定済みの前半 ＋ 打ったままのかな」で伸ばしていく。その途中で Enter を
+/// 押すと未変換のかながそのまま確定される（2026-09-01: `seedreamのペースはどう`
+/// と打って `seedreamnoぺーすはどう` が確定した）。
+///
+/// 現在の読みに対する変換結果が既にあるなら何もしない。無い場合だけ短時間
+/// 待って拾い直す。それでも取れなければ preview はそのまま返し、`true`
+/// (=未収束) を返す。未収束の preview を学習に流すと、同じ読みで同じ壊れ方が
+/// 再生産されるため、呼び出し側は学習を見送ること。
+fn catch_up_live_preview(
+    engine: &mut crate::engine::state::DynEngine,
+    reading: &str,
+    preview: String,
+) -> (String, bool) {
+    if engine.bg_peek_top_candidate(reading).is_some() {
+        return (preview, false);
+    }
+    if engine.bg_status() != "running" {
+        return (preview, false);
+    }
+    let completed = engine.bg_wait_ms(LIVE_COMMIT_CATCHUP_MS);
+    let Some(top) = engine.bg_peek_top_candidate(reading) else {
+        tracing::info!(
+            "[Live] commit catch-up: no result for {:?} (completed={})",
+            reading,
+            completed
+        );
+        return (preview, true);
+    };
+    let merged = engine
+        .merge_candidates_for_reading(reading, vec![top], 40)
+        .into_iter()
+        .find(|c| !c.is_empty());
+    match merged {
+        Some(merged) => {
+            tracing::info!("[Live] commit catch-up: {:?} → {:?}", preview, merged);
+            (merged, false)
+        }
+        None => (preview, true),
+    }
+}
+
