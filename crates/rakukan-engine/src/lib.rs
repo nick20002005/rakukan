@@ -702,9 +702,29 @@ impl RakunEngine {
         self.romaji = RomajiConverter::new();
     }
 
+    /// 未確定のローマ字を確定させてから hiragana_buf に積む。
+    ///
+    /// `push_char` を通らない入力（`push_raw` / `push_fullwidth_alpha`）は
+    /// hiragana_buf へ直接書き込むため、未確定のローマ字が残っていると
+    /// **打った順序が入れ替わる**。`ComfyUI` は `Comfy` の `fy` が未確定のまま
+    /// `U` `I` が先に入って `CおmUIfy` になっていた（2026-09-01 に実害）。
+    /// `ControlNet` は未確定の `l` が後続の `e` と結合して `CおんtろNぇt` に
+    /// なり、打った文字が消えたようにも見える。
+    fn flush_pending_romaji(&mut self) {
+        if self.pending_romaji_buf.is_empty() {
+            return;
+        }
+        let flushed = self.romaji.flush();
+        let entry = std::mem::take(&mut self.pending_romaji_buf);
+        self.hiragana_buf.push_str(&flushed);
+        debug!("engine::flush_pending_romaji: {:?} → {:?}", entry, flushed);
+        self.romaji_input_log.push(entry);
+    }
+
     /// ローマ字変換を経由せず hiragana_buf に直接1文字追加する。
     /// テンキー記号など、かなルールに登録されている文字をそのまま入力する場合に使用する。
     pub fn push_raw(&mut self, c: char) {
+        self.flush_pending_romaji();
         self.hiragana_buf.push(c);
         self.romaji_input_log.push(c.to_string());
     }
@@ -717,6 +737,7 @@ impl RakunEngine {
     /// `c` には ASCII 大文字（'A'–'Z'）を渡すこと。
     pub fn push_fullwidth_alpha(&mut self, c: char) {
         debug_assert!(c.is_ascii_uppercase());
+        self.flush_pending_romaji();
         let out = match self.config.alpha_width {
             AlphaWidth::Fullwidth => char::from_u32(c as u32 - 0x41 + 0xFF21).unwrap_or(c),
             AlphaWidth::Halfwidth => c,
@@ -1760,6 +1781,25 @@ mod symbol_input_tests {
         let mut e = RakunEngine::new(config);
         e.push_char('@');
         assert_eq!(e.hiragana_text(), "@");
+    }
+
+    /// Shift+英字が未確定のローマ字を追い越さないこと。
+    /// 追い越すと `ComfyUI` の読みが `CおmUIfy` になり、打った順序が壊れる。
+    #[test]
+    fn fullwidth_alpha_flushes_pending_romaji_first() {
+        let config = crate::EngineConfig {
+            alpha_width: crate::AlphaWidth::Halfwidth,
+            ..Default::default()
+        };
+        let mut e = RakunEngine::new(config);
+        for c in "ComfyUI".chars() {
+            if c.is_ascii_uppercase() {
+                e.push_fullwidth_alpha(c);
+            } else {
+                e.push_char(c);
+            }
+        }
+        assert_eq!(e.hiragana_text(), "CおmfyUI");
     }
 
     #[test]
