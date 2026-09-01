@@ -43,6 +43,14 @@ pub(super) struct LiveConvSession {
     pub fired_once: bool,
     /// 最後の `live_input_notify` 呼出時刻 (ms)。debounce 判定に使う。
     pub last_input_ms: u64,
+    /// 最後に `pass_debounce` を通過した時刻 (ms)。打鍵が途切れないまま preview が
+    /// 古くなり続けるのを防ぐ throttle に使う。
+    pub last_fire_ms: u64,
+    /// ライブタイマー (`LIVE_TIMER_ID`) が現在の hwnd に張られているか。
+    ///
+    /// 🔴 **走っているタイマーに `SetTimer` を重ねると周期が先頭からやり直しになる**
+    /// ので、打鍵ごとに張り直してはいけない。詳細は `live_input_notify` のコメント。
+    pub timer_armed: bool,
 }
 
 thread_local! {
@@ -256,4 +264,29 @@ pub(crate) fn session_nonce_advance() {
 #[inline]
 pub(crate) fn session_nonce_snapshot() -> u64 {
     LIVE_SHARED.session_nonce.load(AO::Acquire)
+}
+
+// ─── last_fire_ms ─────────────────────────────────────────────────────────────
+
+/// `last_fire_ms` を `now_ms` にセット (`pass_debounce` 通過時)。
+pub(super) fn store_last_fire_ms(now_ms: u64) {
+    TL_LIVE_SESSION.with(|s| s.borrow_mut().last_fire_ms = now_ms);
+}
+
+/// `last_fire_ms` を取得 (`pass_debounce` の stale 判定用)。
+pub(super) fn load_last_fire_ms() -> u64 {
+    TL_LIVE_SESSION.with(|s| s.borrow().last_fire_ms)
+}
+
+// ─── timer_armed フラグ ───────────────────────────────────────────────────────
+
+/// ライブタイマーの張り状態を記録する。`SetTimer` / `KillTimer` / hwnd 差し替えの
+/// 直後に呼ぶ。
+pub(super) fn set_timer_armed(armed: bool) {
+    TL_LIVE_SESSION.with(|s| s.borrow_mut().timer_armed = armed);
+}
+
+/// ライブタイマーが張られているか。
+pub(super) fn is_timer_armed() -> bool {
+    TL_LIVE_SESSION.with(|s| s.borrow().timer_armed)
 }

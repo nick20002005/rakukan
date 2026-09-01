@@ -197,6 +197,9 @@ fn get_hwnd() -> HWND {
 
 #[inline]
 fn set_hwnd(hwnd: HWND) {
+    // hwnd が差し替わると、その hwnd に紐づいていたライブタイマーは失われる。
+    // 次の live_input_notify で必ず張り直すためにフラグを落とす。
+    crate::tsf::live_session::set_timer_armed(false);
     TL_HWND.with(|c| c.set(hwnd.0 as isize));
 }
 
@@ -1361,14 +1364,25 @@ pub fn live_input_notify(ctx: &windows::Win32::UI::TextServices::ITfContext, tid
         }
     };
 
-    // ライブタイマーを起動（既存なら上書き）
-    unsafe {
-        SetTimer(hwnd, LIVE_TIMER_ID, LIVE_POLL_MS, None);
+    // ライブタイマーを起動する。
+    //
+    // 🔴 **既に走っているタイマーに `SetTimer` を重ねてはいけない**。同じ (hwnd, id)
+    // への SetTimer は周期を先頭からやり直すので、打鍵ごとに張り直すと WM_TIMER が
+    // いつまでも届かない。USER タイマーの実効分解能は 15.625ms 刻みで、
+    // `LIVE_POLL_MS` = 50ms は実測 62.5ms 周期になる。debounce(80ms) を満たすのは
+    // 2 tick 目 = 125ms なので、**打鍵間隔が 125ms を切ると preview が一度も更新
+    // されないまま生のかなで伸び続ける**（2026-09-01 実測: FIRED の elapsed は
+    // 110-129ms に 7481 件・170-189ms に 910 件で、80-109ms は 32 件しかない）。
+    if !crate::tsf::live_session::is_timer_armed() {
+        unsafe {
+            SetTimer(hwnd, LIVE_TIMER_ID, LIVE_POLL_MS, None);
+        }
+        crate::tsf::live_session::set_timer_armed(true);
+        tracing::info!(
+            "[Live] live_input_notify: timer armed debounce={}ms",
+            debounce_ms
+        );
     }
-    tracing::info!(
-        "[Live] live_input_notify: timer armed debounce={}ms",
-        debounce_ms
-    );
 }
 
 /// ライブタイマーを明示的に停止する（IMEオフ・確定・キャンセル時）。
@@ -1379,6 +1393,7 @@ pub fn stop_live_timer() {
             let _ = KillTimer(hwnd, LIVE_TIMER_ID);
         }
     }
+    crate::tsf::live_session::set_timer_armed(false);
     crate::tsf::live_session::clear_context_snapshot();
     tracing::debug!("[Live] stop_live_timer");
 }
@@ -1450,17 +1465,26 @@ fn is_symbol_only_preview(s: &str) -> bool {
             .all(|c| !c.is_alphanumeric() && !c.is_whitespace())
 }
 
+/// preview がこれ以上古いまま打鍵が続いたら、debounce を待たずに 1 回走らせる上限。
+///
+/// debounce だけだと「打鍵が止まるまで preview を更新しない」ので、速く打ち続けて
+/// いる間は生のかなが伸び続ける。
+const LIVE_MAX_STALE_MS: u64 = 400;
+
 /// debounce 経過時刻を返す。debounce 中なら `None` (caller は早期リターン)。
+///
+/// 最後に通過してから `LIVE_MAX_STALE_MS` 以上経っているときは、debounce 中でも通す。
 fn pass_debounce() -> Option<u64> {
     let debounce_ms = LIVE_DEBOUNCE_CFG_MS.load(AO::Relaxed);
     let now = current_millis();
     let last = crate::tsf::live_session::load_last_input_ms();
     let elapsed = now.saturating_sub(last);
-    if elapsed < debounce_ms {
-        None
-    } else {
-        Some(elapsed)
+    let stale = now.saturating_sub(crate::tsf::live_session::load_last_fire_ms());
+    if elapsed < debounce_ms && stale < LIVE_MAX_STALE_MS {
+        return None;
     }
+    crate::tsf::live_session::store_last_fire_ms(now);
+    Some(elapsed)
 }
 
 /// engine からの probe 結果。
