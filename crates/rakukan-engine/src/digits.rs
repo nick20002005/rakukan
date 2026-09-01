@@ -721,6 +721,16 @@ fn make_run(kind: CharKind, text: String) -> Run {
     }
 }
 
+/// 数字だけで構成された文字列か（算用数字・全角数字・漢数字）。
+///
+/// かな run の候補が数そのものになっていることがある（「じゅう」→「10」）。
+/// こうした候補は、入力側の数字と一致しないかぎり数字保存の検証で落ちる。
+fn is_numeric_text(s: &str) -> bool {
+    !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_digit() || ('０'..='９').contains(&c) || is_kanji_number_char(c))
+}
+
 /// 位取りの単位（十・百・千・万・億・兆・京）だけで構成された漢字 run か。
 ///
 /// 「万」「千万」のように単位だけの run は、それ自体では数を表さない。
@@ -1044,7 +1054,23 @@ pub fn convert_with_digit_protection(
                     cands.retain(|c| c != unit);
                     // promote=false（同音異義語あり）は変換器の第 1 候補を既定のまま
                     // 残し、数詞はその次に置く。候補として存在させることだけを保証する。
-                    let at = if promote { 0 } else { 1.min(cands.len()) };
+                    //
+                    // ただし単純に 1 番目へ入れると、変換器の第 1 候補が数字だけの
+                    // 表記だったときに数詞が先頭へ繰り上がってしまう。「じゅう」は
+                    // 変換器が「10」を第 1 候補に返すが、これは数字保存の検証で
+                    // 落ちるため（入力の数字は「1」だけ）、結果として「1十」が
+                    // 先頭に立つ。落ちると分かっている候補は数えず、実際に残る
+                    // 最初の候補の後ろへ置く。
+                    let at = if promote {
+                        0
+                    } else {
+                        cands
+                            .iter()
+                            .position(|c| !is_numeric_text(c))
+                            .map(|p| p + 1)
+                            .unwrap_or(0)
+                            .min(cands.len())
+                    };
                     cands.insert(at, unit.to_string());
                 }
             }
@@ -1620,6 +1646,58 @@ mod tests {
         // 数詞でない読みは拾わない
         assert_eq!(numeric_unit_kanji("まい"), None);
         assert_eq!(numeric_unit_kanji("まんが"), None);
+    }
+
+    /// 数字直後の数詞を実モデルで確認する診断用プローブ。
+    ///
+    /// `convert_with_digit_protection()` は変換器を通るため純粋なユニットテストでは
+    /// 押さえられない。PR #7 の受入条件にある読みを実際に流し、候補に何が並ぶかを
+    /// 目で見るためのもの。モデルのロードが入るので既定では走らせない。
+    ///
+    /// 実行: `cargo test -p rakukan-engine --lib probe_numeric_unit_candidates -- --ignored --nocapture`
+    #[test]
+    #[ignore = "実モデルのロードが必要"]
+    fn probe_numeric_unit_candidates() {
+        use crate::kanji::Backend;
+
+        let backend =
+            Backend::from_variant_id("jinen-v1-small-q5").expect("Failed to load default model");
+        let converter = KanaKanjiConverter::new(backend).expect("Failed to create converter");
+        let order = default_digit_candidates_order();
+
+        for reading in [
+            "5まん",
+            "5まんえん",
+            "だい5まん",
+            "3.5まん",
+            "3ぜん",
+            "1じゅう",
+            "10まん",
+            "3せん",
+            "4まい",
+        ] {
+            let runs = split_by_digits(reading);
+            let shape: Vec<&str> = runs
+                .iter()
+                .map(|r| match r {
+                    Run::Digit(_) => "Digit",
+                    Run::Alpha(_) => "Alpha",
+                    Run::Symbol(_) => "Symbol",
+                    Run::Kana(_) => "Kana",
+                })
+                .collect();
+            let cands =
+                convert_with_digit_protection(&converter, reading, "", 9, &order, false, false)
+                    .unwrap_or_else(|e| panic!("{reading}: {e:?}"));
+            println!("{reading:>12} {shape:?} -> {cands:?}");
+            // かな run 単体の素の候補（救済を足す前の並び）も出す
+            for run in &runs {
+                if let Run::Kana(k) = run {
+                    let raw = converter.convert(k, "", 9).unwrap_or_default();
+                    println!("             kana({k}) raw -> {raw:?}");
+                }
+            }
+        }
     }
 
     #[test]
