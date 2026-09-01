@@ -1168,13 +1168,16 @@ pub enum SessionState {
         full_reading: String,
         /// Enter で1ブロックずつ確定した際に積算するコミット済みテキスト。
         /// 学習・最終コミット時に全体テキストとして使う。
+        #[allow(dead_code)]
         committed_prefix: String,
         /// Enter で **ドキュメントへ物理コミット済み** のブロック数。
         ///
         /// ← の戻り先の下限。既にアプリへ書き込んだブロックへ戻ると、
         /// composition の prefix として再描画されて二重に入るため。
         committed_blocks: usize,
+        #[allow(dead_code)]
         pos_x: i32,
+        #[allow(dead_code)]
         pos_y: i32,
     },
     /// ライブ変換表示中。
@@ -1490,6 +1493,8 @@ impl SessionState {
     }
 
     /// BlockSelecting: pos_x, pos_y を返す。
+    // NOTE: Enter が全ブロックまとめて確定になったため現在は未使用（文節ごとの部分確定を戻す時のために残す）。
+    #[allow(dead_code)]
     pub fn block_selecting_pos(&self) -> Option<(i32, i32)> {
         if let SessionState::BlockSelecting { pos_x, pos_y, .. } = self {
             Some((*pos_x, *pos_y))
@@ -1634,6 +1639,8 @@ impl SessionState {
         false
     }
 
+    // NOTE: Enter が全ブロックまとめて確定になったため現在は未使用（文節ごとの部分確定を戻す時のために残す）。
+    #[allow(dead_code)]
     pub fn block_selecting_advance(&mut self) -> bool {
         if let SessionState::BlockSelecting {
             blocks,
@@ -1659,6 +1666,8 @@ impl SessionState {
     /// Enter を押すと、飛ばした手前の文節が composition に載ったまま
     /// `committed_prefix` にも入らず、`end_composition` が composition 全体を
     /// 現在ブロックだけで置き換えて**手前の文節が消える**。
+    // NOTE: Enter が全ブロックまとめて確定になったため現在は未使用（文節ごとの部分確定を戻す時のために残す）。
+    #[allow(dead_code)]
     pub fn block_selecting_commit_current(&mut self) -> Option<String> {
         if let SessionState::BlockSelecting {
             blocks,
@@ -1694,6 +1703,8 @@ impl SessionState {
     ///
     /// 最終ブロック確定時に `block_selecting_commit_current()` を呼んだ後に参照すると
     /// 全ブロックのテキストが得られる（学習・engine.commit 用）。
+    // NOTE: Enter が全ブロックまとめて確定になったため現在は未使用（文節ごとの部分確定を戻す時のために残す）。
+    #[allow(dead_code)]
     pub fn block_selecting_accumulated_text(&self) -> Option<String> {
         if let SessionState::BlockSelecting {
             committed_prefix, ..
