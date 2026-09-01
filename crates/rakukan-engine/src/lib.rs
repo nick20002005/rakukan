@@ -803,6 +803,38 @@ impl RakunEngine {
     ///
     /// 誤爆を抑えるため、[`dict_prefix::MIN_PREFIX_CHARS`] 文字以上の**最長**
     /// 一致だけを返す。完全一致は既存の経路が拾うので除外する。
+    /// 読みに対する辞書候補だけを返す（ユーザー辞書・学習履歴の完全一致・
+    /// システム辞書。短文予測も LLM も引かず、内部状態を一切変えない）。
+    ///
+    /// 文節境界の探索（`Shift+←/→`）が「この読みは辞書に載っている語か」を
+    /// 何度も問い合わせるための入口。`merge_candidates_for_reading` は短文予測を
+    /// 差し込むうえ「直近に提示した予測」を覚えてしまうので、探索には使えない。
+    pub fn dict_lookup(&self, reading: &str, limit: usize) -> Vec<String> {
+        if reading.is_empty() || limit == 0 {
+            return vec![];
+        }
+        let Some(store) = self.dict_store.as_ref() else {
+            return vec![];
+        };
+        let mut out: Vec<String> = Vec::new();
+        for c in store
+            .lookup_user(reading)
+            .into_iter()
+            .chain(store.lookup_learn(reading))
+            .chain(store.lookup_user_low(reading))
+            .chain(store.lookup_dict(reading, limit))
+        {
+            if c.is_empty() || c == reading || out.contains(&c) {
+                continue;
+            }
+            out.push(c);
+            if out.len() >= limit {
+                break;
+            }
+        }
+        out
+    }
+
     pub fn dict_prefix_split(&self, reading: &str) -> Option<(String, String)> {
         let store = self.dict_store.as_ref()?;
         let chars: Vec<char> = reading.chars().collect();

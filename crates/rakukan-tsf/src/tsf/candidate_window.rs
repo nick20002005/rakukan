@@ -120,6 +120,18 @@ const COLOR_BG: COLORREF = COLORREF(0x00_FF_FF_FF);
 /// 通常行のテキスト色（黒）
 const COLOR_FG: COLORREF = COLORREF(0x00_00_00_00);
 
+/// 候補ウィンドウをキャレットのどちら側に出すか。
+///
+/// どちらも画面に入りきらない場合は反対側へ反転する
+/// （`calc_window_y` / `calc_window_y_above`）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Placement {
+    /// キャレットの下（変換候補リストの既定）
+    Below,
+    /// キャレットの上（入力中の予測候補）
+    Above,
+}
+
 // ─── スレッドローカル状態 ──────────────────────────────────────────────────────
 
 thread_local! {
@@ -129,6 +141,13 @@ thread_local! {
     static TL_CAND: RefCell<CandData> = RefCell::new(CandData::default());
     /// 最後に `show_inner` で算出したウィンドウ幅。WM_PAINT でも使う。
     static TL_WIN_WIDTH: Cell<i32> = Cell::new(win_width_min());
+    /// 候補ウィンドウをキャレットの上下どちら側に出すか。
+    /// `show_above` / `show_suggestion` が `Above` にし、`hide()` と
+    /// `set_placement_below()` で `Below` に戻る。`show()` は現在値を引き継ぐので、
+    /// 予測から Tab/↓ で開いた候補リストが候補移動のたびに下へ飛んだりしない。
+    static TL_PLACEMENT: Cell<Placement> = Cell::new(Placement::Below);
+    /// `Above` のときに基準にするキャレット上端（スクリーン座標）。
+    static TL_CARET_TOP: Cell<i32> = Cell::new(0);
 
     // ─── [Live] ライブ変換セッション状態は `live_session.rs` の LiveConvSession に集約 (M4 Phase 1)。
     // 旧 TL_LIVE_CTX / TL_LIVE_TID / TL_LIVE_DM_PTR は削除済み。
@@ -569,24 +588,76 @@ pub fn show_with_status(
     y: i32,
     status_line: Option<&str>,
 ) {
-    show_inner(page_candidates, page_selected, page_info, x, y, status_line, true)
+    show_inner(
+        page_candidates,
+        page_selected,
+        page_info,
+        x,
+        y,
+        status_line,
+        true,
+        None,
+    )
+}
+
+/// 予測ウィンドウから Tab/↓ で開いた候補リスト用。予測と同じくキャレットの
+/// 上側に出す（Tab を押した瞬間にウィンドウが下へ飛ぶのを避ける）。
+pub fn show_above(
+    page_candidates: &[String],
+    page_selected: usize,
+    page_info: &str,
+    x: i32,
+    caret_top: i32,
+    caret_bottom: i32,
+) {
+    show_inner(
+        page_candidates,
+        page_selected,
+        page_info,
+        x,
+        caret_bottom,
+        None,
+        true,
+        Some((Placement::Above, caret_top)),
+    )
 }
 
 /// 入力中の予測ウィンドウ用。行頭の選択番号を出さない（数字キーはまだ
 /// 通常の数字入力なので、番号を振ると押せるように見えてしまう）。
-pub fn show_suggestion(page_candidates: &[String], x: i32, y: i32, status_line: Option<&str>) {
+///
+/// 表示位置は**キャレットの上**。打鍵中のこのウィンドウが下に出ると、これから
+/// 打つ行そのものを覆ってしまうため（入りきらないときだけ下へ反転する）。
+pub fn show_suggestion(
+    page_candidates: &[String],
+    x: i32,
+    caret_top: i32,
+    caret_bottom: i32,
+    status_line: Option<&str>,
+) {
     // selected にリスト外の添字を渡してどの行もハイライトしない
     show_inner(
         page_candidates,
         page_candidates.len(),
         "",
         x,
-        y,
+        caret_bottom,
         status_line,
         false,
+        Some((Placement::Above, caret_top)),
     )
 }
 
+/// 候補ウィンドウの表示側をキャレットの下（既定）へ戻す。
+///
+/// 予測ウィンドウを出したまま Space で明示変換に入った場合、そのまま
+/// `show()` を呼ぶと `Above` を引き継いでしまうので、新しい変換を始める
+/// 経路で明示的に呼ぶ。
+pub fn set_placement_below() {
+    TL_PLACEMENT.with(|c| c.set(Placement::Below));
+}
+
+/// `placement`: `Some((側, キャレット上端))` を渡すとその側に固定する。
+/// `None` は「今の側を引き継ぐ」（候補移動・ページ送り・BG 更新の再表示用）。
 #[allow(clippy::too_many_arguments)]
 fn show_inner(
     page_candidates: &[String],
@@ -596,10 +667,16 @@ fn show_inner(
     y: i32,
     status_line: Option<&str>,
     numbered: bool,
+    placement: Option<(Placement, i32)>,
 ) {
     if page_candidates.is_empty() {
         hide();
         return;
+    }
+
+    if let Some((p, caret_top)) = placement {
+        TL_PLACEMENT.with(|c| c.set(p));
+        TL_CARET_TOP.with(|c| c.set(caret_top));
     }
 
     let has_pager = !page_info.is_empty();
@@ -625,8 +702,8 @@ fn show_inner(
     let win_width = unsafe { clamp_width_to_work_area(x, y, win_width) };
     TL_WIN_WIDTH.with(|c| c.set(win_width));
 
-    // ─── 画面端検出：ウィンドウが画面外にはみ出す場合はキャレットの上側に反転 ───
-    let win_y = unsafe { calc_window_y(x, y, win_h) };
+    // ─── 画面端検出：ウィンドウが画面外にはみ出す場合は反対側に反転 ───
+    let win_y = unsafe { calc_window_y_for_placement(x, y, win_h) };
     let win_x = unsafe { calc_window_x(x, y, win_width) };
 
     let hwnd = get_hwnd();
@@ -672,6 +749,48 @@ fn show_inner(
             }
         }
     }
+}
+
+/// 現在の表示側（`TL_PLACEMENT`）に従って候補ウィンドウの表示 Y を計算する。
+unsafe fn calc_window_y_for_placement(x: i32, caret_bottom: i32, win_h: i32) -> i32 {
+    match TL_PLACEMENT.with(|c| c.get()) {
+        Placement::Below => calc_window_y(x, caret_bottom, win_h),
+        Placement::Above => {
+            let caret_top = TL_CARET_TOP.with(|c| c.get());
+            calc_window_y_above(x, caret_top, caret_bottom, win_h)
+        }
+    }
+}
+
+/// キャレットの**上側**に出すときの表示 Y。
+///
+/// 作業領域の上端を超えてしまう場合は下側（`calc_window_y`）へ反転する。
+/// `caret_top` はアプリによっては 0 や下端と同値で返ってくるので、
+/// 高さが取れないときは `CARET_HEIGHT_ESTIMATE` で補う。
+unsafe fn calc_window_y_above(x: i32, caret_top: i32, caret_bottom: i32, win_h: i32) -> i32 {
+    let top = if caret_top > 0 && caret_top < caret_bottom {
+        caret_top
+    } else {
+        caret_bottom - CARET_HEIGHT_ESTIMATE
+    };
+    // 上側：4ドット上
+    let above = top - win_h - 4;
+    let pt = POINT { x, y: caret_bottom };
+    let hmon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+    let mut mi = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if GetMonitorInfoW(hmon, &mut mi).as_bool() && above < mi.rcWork.top {
+        tracing::debug!(
+            "candwin::flip_down: caret_top={} win_h={} work_top={}",
+            top,
+            win_h,
+            mi.rcWork.top
+        );
+        return calc_window_y(x, caret_bottom, win_h);
+    }
+    above
 }
 
 /// キャレット下端 `caret_bottom` から候補ウィンドウの表示 Y を計算する。
@@ -726,7 +845,7 @@ pub fn reposition(x: i32, y: i32) {
     }
     let win_h = window_height(n, has_pager, has_status);
     let win_w = TL_WIN_WIDTH.with(|c| c.get());
-    let win_y = unsafe { calc_window_y(x, y, win_h) };
+    let win_y = unsafe { calc_window_y_for_placement(x, y, win_h) };
     let win_x = unsafe { calc_window_x(x, y, win_w) };
     unsafe {
         let _ = SetWindowPos(hwnd, HWND_TOPMOST, win_x, win_y, win_w, win_h, SWP_NOACTIVATE);
@@ -753,6 +872,8 @@ pub fn hide() {
     // 予測ウィンドウとして出していた状態も同時に捨てる（確定・キャンセル経路は
     // hide() だけを呼ぶので、ここで面倒を見ないと表示状態が残る）。
     crate::tsf::suggestion::forget_shown();
+    // 次に開くウィンドウは既定（キャレットの下）から始める。
+    TL_PLACEMENT.with(|c| c.set(Placement::Below));
     let hwnd = get_hwnd();
     if is_valid(hwnd) {
         unsafe {

@@ -269,6 +269,9 @@ impl super::TextServiceFactory_Impl {
                 if selected.is_empty() {
                     return Ok(true);
                 }
+                // 予測ウィンドウを出したまま Space に入った場合、候補ウィンドウの
+                // 表示側が「上」のまま引き継がれるので既定へ戻す。
+                candidate_window::set_placement_below();
                 // Preedit に遷移して通常変換フローへ
                 // engine の hiragana_buf を選択範囲に設定
                 engine.bg_reclaim();
@@ -739,6 +742,10 @@ impl super::TextServiceFactory_Impl {
                 return Ok(true);
             }
         }
+
+        // ここから先は Preedit からの新しい変換。予測ウィンドウを出したまま
+        // Space を押した場合に「上」が引き継がれないよう、表示側を既定へ戻す。
+        candidate_window::set_placement_below();
 
         // ── 区読点分割変換（BlockSelecting 遷移） ─────────────────────────────
         // preedit が区読点を含む場合、ブロック分割してそれぞれを sync 変換し
