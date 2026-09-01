@@ -14,17 +14,36 @@
 //! `Alpha("seedream")` ＋ `Kana("のぺーすはどう")` に分割し、LLM は日本語部分
 //! だけを見る（→ `seedreamのペースはどう`）。
 //!
-//! # 対象を「先頭」に限る理由
-//! 読みの途中に現れる英単語（`これはseedreamです`）は、どこから英単語が
-//! 始まるのかを読みから決められない。かなは全てローマ字由来なので、左境界を
-//! 示す手掛かりが打鍵ログに存在しないため。誤った位置で切ると日本語側を
-//! 壊すので、境界が自明な「読みの先頭」だけを扱う。
+//! # 扱える形が限られる理由
+//! 素の ASCII は「ローマ字がかなに潰れきらなかった位置」を示すだけで、英単語の
+//! 左右の端そのものは指さない。かなは全てローマ字由来なので、境界の手掛かりは
+//! 打鍵ログにも存在しない。誤った位置で切ると日本語側を壊すため、両端が
+//! 決まる形だけを扱う:
+//!
+//! - 左端は「読みの先頭」に限る。途中に出る英単語（`これはseedreamです`）は
+//!   どこから始まるか決められない
+//! - 右端は「素の ASCII の直後が助詞」の場合に限る。`seedream` は末尾が `m` で
+//!   止まるので `のぺーすはどう` との境目が読める。`claude`（読み `cぁうで`）は
+//!   素の ASCII が先頭の `c` しか無く右端が決まらないので対象外
 //!
 //! # 全体がラテン文字の場合は対象外
 //! `mac` のように読み全体が英単語なら [`crate::Engine::romaji_alnum_candidates`]
 //! が候補を出す。二重に候補を作らないよう、後続にかなが無い場合は `None`。
 
 use crate::romaji::RomajiConverter;
+
+/// 英単語の直後に来る助詞。読みの右端を決める唯一の手掛かりに使う。
+///
+/// 素の ASCII は「ローマ字がかなに潰れきらなかった位置」を示すだけで、英単語が
+/// どこで終わるかまでは決めない。`seedream` は末尾が `m` で止まるので右端が
+/// 分かるが、`google`（読み `ごおgぇ`）は末尾の `ぇ` まで英単語なのに素の
+/// ASCII は途中の `g` が最後になる。そこで切ると `googlれ` に化ける。
+///
+/// 素の ASCII の直後が助詞なら、そこが英単語の切れ目だと言い切ってよい
+/// （`seedream` ＋ `のぺーすはどう`）。助詞でなければ切らない。
+fn is_boundary_particle(c: char) -> bool {
+    matches!(c, 'の' | 'を' | 'は' | 'が' | 'に' | 'で' | 'と' | 'も' | 'や' | 'へ')
+}
 
 /// 打鍵ログを [`crate::Engine::push_char`] と同じ手順で流し直し、
 /// 「ローマ字 n 文字まで ↔ かな m 文字まで」の境界一覧を返す。
@@ -88,6 +107,12 @@ pub fn normalize_leading_latin(romaji: &str, hiragana: &str) -> Option<String> {
         // 後続のかなが無い＝読み全体が英単語。romaji_alnum_candidates の担当。
         return None;
     }
+    // 素の ASCII の直後が助詞のときだけ「ここで英単語が終わった」と判断する。
+    // 助詞以外が続くなら、英単語がまだ続いているのか日本語が始まったのかを
+    // 読みから区別できない（`ごおgぇ` = google / `せえdれあmつかう` = 英単語＋助詞なしの続き）。
+    if !is_boundary_particle(kana[split]) {
+        return None;
+    }
     // F9/F10 の force_preedit 後などログと読みが対応しないケースを弾く。
     if replay(romaji) != hiragana {
         return None;
@@ -138,6 +163,28 @@ mod tests {
     fn ignores_reading_that_is_entirely_latin() {
         // 読み全体が英単語 → romaji_alnum_candidates の担当
         assert_eq!(normalize_leading_latin("seedream", "せえdれあm"), None);
+    }
+
+    /// `google` / `ありがとう` の読みが想定どおりかを先に固定する。
+    /// ここがずれていると下の 2 テストが「復元しない」理由を取り違える。
+    #[test]
+    fn replay_matches_expected_readings() {
+        assert_eq!(replay("google"), "ごおgぇ");
+        assert_eq!(replay("seedreamtsukau"), "せえdれあmつかう");
+        assert_eq!(replay("seedreamnope-suhadou"), "せえdれあmのぺーすはどう");
+    }
+
+    #[test]
+    fn ignores_latin_word_whose_right_edge_is_unknown() {
+        // google は末尾の `ぇ` まで英単語だが、素の ASCII は途中の `g` が最後。
+        // ここで切ると `googlれ` に化けるので切らない。
+        assert_eq!(normalize_leading_latin("google", "ごおgぇ"), None);
+    }
+
+    #[test]
+    fn ignores_latin_word_not_followed_by_a_particle() {
+        // 助詞以外が続くと、英単語が終わったのか続いているのか読みから決まらない
+        assert_eq!(normalize_leading_latin("seedreamtsukau", "せえdれあmつかう"), None);
     }
 
     #[test]
