@@ -25,6 +25,7 @@ pub use romaji::{BackspaceResult, ConversionEvent, RomajiConverter};
 pub mod backend;
 pub mod conv_cache;
 pub mod dict;
+pub mod dict_prefix;
 pub mod digits;
 pub mod ffi;
 pub mod segments;
@@ -794,6 +795,30 @@ impl RakunEngine {
             .unwrap_or_else(|| self.hiragana_buf.clone())
     }
 
+    /// 読みの先頭がユーザー辞書の語に前方一致する場合に (表記, 残りの読み) を返す。
+    ///
+    /// ユーザー辞書は完全一致でしか引かれないので、`とらぶると` のように助詞が
+    /// 付いた瞬間に登録語が候補から消える。ここで切れ目を見つけて
+    /// [`crate::dict_prefix`] が `語 + 残りの変換` を候補に足す。
+    ///
+    /// 誤爆を抑えるため、[`dict_prefix::MIN_PREFIX_CHARS`] 文字以上の**最長**
+    /// 一致だけを返す。完全一致は既存の経路が拾うので除外する。
+    pub fn dict_prefix_split(&self, reading: &str) -> Option<(String, String)> {
+        let store = self.dict_store.as_ref()?;
+        let chars: Vec<char> = reading.chars().collect();
+        if chars.len() <= dict_prefix::MIN_PREFIX_CHARS {
+            return None;
+        }
+        for len in (dict_prefix::MIN_PREFIX_CHARS..chars.len()).rev() {
+            let key: String = chars[..len].iter().collect();
+            if let Some(surface) = store.lookup_user(&key).into_iter().next() {
+                let remainder: String = chars[len..].iter().collect();
+                return Some((surface, remainder));
+            }
+        }
+        None
+    }
+
     pub fn convert(&self, num_candidates: usize) -> Result<Vec<String>, EngineError> {
         if self.hiragana_buf.is_empty() {
             return Ok(vec![]);
@@ -802,16 +827,31 @@ impl RakunEngine {
             .kanji
             .as_ref()
             .ok_or(EngineError::ModelNotInitialized)?;
-        digits::convert_with_digit_protection(
+        let reading = self.conv_reading();
+        let alpha_fullwidth_first = matches!(self.config.alpha_width, AlphaWidth::Fullwidth);
+        let symbol_fullwidth_first = matches!(self.config.symbol_width, SymbolWidth::Fullwidth);
+        let mut cands = digits::convert_with_digit_protection(
             kanji,
-            &self.conv_reading(),
+            &reading,
             &self.committed,
             num_candidates,
             &self.config.digit_candidates_order,
-            matches!(self.config.alpha_width, AlphaWidth::Fullwidth),
-            matches!(self.config.symbol_width, SymbolWidth::Fullwidth),
+            alpha_fullwidth_first,
+            symbol_fullwidth_first,
         )
-        .map_err(|e| EngineError::ConversionFailed(e.to_string()))
+        .map_err(|e| EngineError::ConversionFailed(e.to_string()))?;
+        if let Some(split) = self.dict_prefix_split(&reading) {
+            dict_prefix::insert_candidates(
+                kanji,
+                &split,
+                &self.committed,
+                &self.config.digit_candidates_order,
+                alpha_fullwidth_first,
+                symbol_fullwidth_first,
+                &mut cands,
+            );
+        }
+        Ok(cands)
     }
 
     pub fn convert_default(&self) -> Result<Vec<String>, EngineError> {
@@ -1452,6 +1492,7 @@ impl RakunEngine {
 
         let hiragana = self.hiragana_buf.clone();
         let conv_reading = self.conv_reading();
+        let dict_prefix = self.dict_prefix_split(&conv_reading);
         let committed = self.committed.clone();
         if hiragana.is_empty() {
             return false;
@@ -1464,6 +1505,7 @@ impl RakunEngine {
             match conv_cache::start(
                 hiragana,
                 conv_reading,
+                dict_prefix,
                 committed,
                 conv,
                 n_cands,
@@ -1951,6 +1993,82 @@ mod digit_width_tests {
                 DigitCandidateKind::PerDigit,
                 DigitCandidateKind::Daiji,
             ]
+        );
+    }
+}
+
+#[cfg(test)]
+mod dict_prefix_split_tests {
+    use super::{EngineConfig, RakunEngine};
+    use rakukan_dict::DictStore;
+
+    /// `tempfile::TempDir` は drop でディレクトリごと消える。DictStore は
+    /// ホットリロードでファイルを見に行くので、消すと辞書が空になる。
+    /// テストが終わるまで生かしておく必要があるので一緒に返す。
+    fn engine_with_dict() -> (RakunEngine, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let user_path = dir.path().join("user_dict.toml");
+        std::fs::write(
+            &user_path,
+            r#"
+[[entries]]
+reading = "とらぶる"
+surfaces = ["To LOVEる"]
+
+[[entries]]
+reading = "みき"
+surfaces = ["美樹"]
+
+[[entries]]
+reading = "このすば"
+surfaces = ["この素晴らしい世界に祝福を"]
+"#,
+        )
+        .unwrap();
+        let store = DictStore::load(Some(&user_path), None, None).unwrap();
+        let mut engine = RakunEngine::new(EngineConfig::default());
+        engine.set_dict_store(store);
+        (engine, dir)
+    }
+
+    #[test]
+    fn splits_at_user_dict_word() {
+        let (e, _dir) = engine_with_dict();
+        assert_eq!(
+            e.dict_prefix_split("とらぶると"),
+            Some(("To LOVEる".to_string(), "と".to_string()))
+        );
+    }
+
+    #[test]
+    fn ignores_exact_match() {
+        // 完全一致は merge_candidates_for_reading の担当
+        let (e, _dir) = engine_with_dict();
+        assert_eq!(e.dict_prefix_split("とらぶる"), None);
+    }
+
+    #[test]
+    fn ignores_short_word_to_avoid_false_positives() {
+        // 「みき → 美樹」が 2 文字なので「みきわめる」に噛ませない
+        let (e, _dir) = engine_with_dict();
+        assert_eq!(e.dict_prefix_split("みきわめる"), None);
+    }
+
+    #[test]
+    fn ignores_reading_without_any_match() {
+        let (e, _dir) = engine_with_dict();
+        assert_eq!(e.dict_prefix_split("ひかくすると"), None);
+    }
+
+    #[test]
+    fn prefers_the_longest_match() {
+        let (e, _dir) = engine_with_dict();
+        assert_eq!(
+            e.dict_prefix_split("このすばが"),
+            Some((
+                "この素晴らしい世界に祝福を".to_string(),
+                "が".to_string()
+            ))
         );
     }
 }
