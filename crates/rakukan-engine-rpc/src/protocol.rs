@@ -15,7 +15,7 @@ pub const PIPE_BASE_NAME: &str = "rakukan-engine";
 /// - v2: `InputChar` / `InputCharResult` バッチ RPC を追加（0.4.5）
 /// - v3: `ConvertToSegments` / `ResizeSegment` / `SegmentCandidatesFor` を追加（Phase A）
 /// - v4: `MergeCandidatesForReading` を追加
-pub const PROTOCOL_VERSION: u32 = 6;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// `InputChar` バッチ RPC で指定する入力モード。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -241,6 +241,15 @@ pub enum Request {
     /// 学習履歴だけを引く軽量な予測。打鍵ごとに呼ばれるため LLM も MOZC も触らない。
     /// postcard の discriminant は宣言順なので、この variant も末尾に追加する。
     Predict {
+        reading: String,
+        limit: u32,
+    },
+
+    // ─── 辞書の直接引き (v7) ───────────────────────────────
+    /// 読みに対する辞書候補だけを返す（短文予測も LLM も引かない）。
+    /// 文節境界の探索（`Shift+←/→`）が読みの前方を切り詰めながら問い合わせる。
+    /// postcard の discriminant は宣言順なので、この variant も末尾に追加する。
+    DictLookup {
         reading: String,
         limit: u32,
     },

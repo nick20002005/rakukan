@@ -13,9 +13,77 @@ use crate::tsf::candidate_window;
 use crate::tsf::language_bar;
 
 use super::{
-    CandidateDir, commit_then_start_composition, end_composition, update_composition,
-    update_composition_candidate_parts,
+    CandidateDir, commit_then_start_composition, end_composition, engine_convert_sync_multi,
+    update_composition, update_composition_candidate_parts,
 };
+
+/// 読みが辞書に載っている語かどうか（文節の切れ目として使えるか）。
+///
+/// 短文予測も LLM も引かない `dict_lookup` を使う。`merge_candidates_for_reading`
+/// は予測を差し込むうえ「直近に提示した予測」をエンジン側に覚えさせるので、
+/// 切れ目の探索には使えない。
+fn is_dict_boundary(engine: &crate::engine::state::DynEngine, reading: &str) -> bool {
+    !engine.dict_lookup(reading, 1).is_empty()
+}
+
+/// Selecting 中の読みの切れ目を動かして、前半だけ変換し直す。
+///
+/// LLM は読み全体を一度に変換するので、区切りを間違えると正しい表記が候補の
+/// どこにも現れない。辞書は**読み全体の完全一致**でしか引かれないため、
+/// 「指示文」のような辞書語も文が伸びた瞬間に手が届かなくなる。
+/// 読みを短く切り直せば、その完全一致に届く。
+///
+/// 切れ目は**辞書に載っている読みの長さ**を優先して探す。1 文字ずつしか動かないと
+/// 「しじぶんもそんなにこまかくはなさそうだし」を「しじぶん」まで縮めるのに
+/// 14 回押すことになり、実用にならない。辞書に当たりが無いときだけ 1 文字動かす。
+///
+/// 戻り値: (前半の読み, その候補, 残りの読み)。端まで来ていたら `None`。
+fn resegment_selecting(
+    engine: &mut crate::engine::state::DynEngine,
+    original: &str,
+    remainder_reading: &str,
+    shrink: bool,
+) -> Option<(String, Vec<String>, String)> {
+    let full: Vec<char> = original.chars().chain(remainder_reading.chars()).collect();
+    let n = full.len();
+    let split = original.chars().count();
+    if n == 0 || split == 0 || split > n {
+        return None;
+    }
+    let at = |len: usize| -> String { full[..len].iter().collect() };
+
+    let target = if shrink {
+        (1..split)
+            .rev()
+            .find(|&len| is_dict_boundary(engine, &at(len)))
+            .or_else(|| (split > 1).then(|| split - 1))
+    } else {
+        ((split + 1)..=n)
+            .find(|&len| is_dict_boundary(engine, &at(len)))
+            .or_else(|| (split < n).then(|| split + 1))
+    }?;
+
+    let head = at(target);
+    let tail: String = full[target..].iter().collect();
+    tracing::debug!(
+        "resegment: shrink={} {}→{} head={:?} tail={:?}",
+        shrink,
+        split,
+        target,
+        head,
+        tail
+    );
+
+    engine.bg_reclaim();
+    engine.force_preedit(head.clone());
+    const RESEGMENT_DICT_LIMIT: usize = 40;
+    let llm_limit = crate::engine::state::get_num_candidates();
+    let mut cands = engine_convert_sync_multi(engine, llm_limit, RESEGMENT_DICT_LIMIT, &head);
+    if cands.is_empty() {
+        cands.push(head.clone());
+    }
+    Some((head, cands, tail))
+}
 
 fn is_numeric_digit(c: char) -> bool {
     c.is_ascii_digit() || ('０'..='９').contains(&c)
@@ -225,7 +293,17 @@ impl super::TextServiceFactory_Impl {
             .or_else(|| sess.original_preedit())
             .unwrap_or("")
             .to_string();
-        candidate_window::show(&page_cands, 0, &page_info, caret.left, caret.bottom);
+        // 予測ウィンドウと同じくキャレットの上に出す（Tab を押した瞬間に
+        // ウィンドウが下へ飛ばないため）。以降の候補移動・ページ送りは
+        // `candidate_window::show` がこの表示側を引き継ぐ。
+        candidate_window::show_above(
+            &page_cands,
+            0,
+            &page_info,
+            caret.left,
+            caret.top,
+            caret.bottom,
+        );
         update_composition(ctx, tid, sink, text)?;
         Ok(true)
     }
@@ -1014,6 +1092,49 @@ impl super::TextServiceFactory_Impl {
             return Ok(true);
         }
 
+        // Selecting: 文節の切れ目を縮める（辞書に載っている読みの長さへ飛ぶ）。
+        // 記号 suffix 付き（remainder が読みでない）の場合だけは従来どおり
+        // RangeSelect へ落とす。切り直すと suffix を読みとして食ってしまうため。
+        if sess.is_selecting() {
+            let original = sess.original_preedit().unwrap_or("").to_string();
+            let remainder = sess.selecting_remainder_clone();
+            let remainder_reading = sess.selecting_remainder_reading_clone();
+            if !original.is_empty() && remainder == remainder_reading {
+                let Some((head, cands, tail)) =
+                    resegment_selecting(engine, &original, &remainder_reading, true)
+                else {
+                    // 端まで来ている。状態は変えずにキーだけ食う。
+                    return Ok(true);
+                };
+                let prefix = sess.selecting_prefix_clone();
+                let prefix_reading = sess.selecting_prefix_reading_clone();
+                let caret = caret_rect_get();
+                sess.activate_selecting_with_affixes(
+                    cands,
+                    head,
+                    caret.left,
+                    caret.bottom,
+                    false,
+                    prefix.clone(),
+                    prefix_reading,
+                    tail.clone(),
+                    tail.clone(),
+                );
+                let page_cands = sess.page_candidates().to_vec();
+                let page_info = sess.page_info().to_string();
+                let text = sess
+                    .current_candidate()
+                    .or_else(|| sess.original_preedit())
+                    .unwrap_or("")
+                    .to_string();
+                drop(sess);
+                drop(guard);
+                candidate_window::show(&page_cands, 0, &page_info, caret.left, caret.bottom);
+                update_composition_candidate_parts(ctx, tid, sink, prefix, text, tail)?;
+                return Ok(true);
+            }
+        }
+
         // Selecting → RangeSelect（ひらがなに戻して末尾から範囲指定）
         if sess.is_selecting() {
             let reading = sess.original_preedit().unwrap_or("").to_string();
@@ -1136,6 +1257,49 @@ impl super::TextServiceFactory_Impl {
                 unselected,
             )?;
             return Ok(true);
+        }
+
+        // Selecting: 文節の切れ目を広げる（辞書に載っている読みの長さへ飛ぶ）。
+        // 記号 suffix 付き（remainder が読みでない）の場合だけは従来どおり
+        // RangeSelect へ落とす。切り直すと suffix を読みとして食ってしまうため。
+        if sess.is_selecting() {
+            let original = sess.original_preedit().unwrap_or("").to_string();
+            let remainder = sess.selecting_remainder_clone();
+            let remainder_reading = sess.selecting_remainder_reading_clone();
+            if !original.is_empty() && remainder == remainder_reading {
+                let Some((head, cands, tail)) =
+                    resegment_selecting(engine, &original, &remainder_reading, false)
+                else {
+                    // 端まで来ている。状態は変えずにキーだけ食う。
+                    return Ok(true);
+                };
+                let prefix = sess.selecting_prefix_clone();
+                let prefix_reading = sess.selecting_prefix_reading_clone();
+                let caret = caret_rect_get();
+                sess.activate_selecting_with_affixes(
+                    cands,
+                    head,
+                    caret.left,
+                    caret.bottom,
+                    false,
+                    prefix.clone(),
+                    prefix_reading,
+                    tail.clone(),
+                    tail.clone(),
+                );
+                let page_cands = sess.page_candidates().to_vec();
+                let page_info = sess.page_info().to_string();
+                let text = sess
+                    .current_candidate()
+                    .or_else(|| sess.original_preedit())
+                    .unwrap_or("")
+                    .to_string();
+                drop(sess);
+                drop(guard);
+                candidate_window::show(&page_cands, 0, &page_info, caret.left, caret.bottom);
+                update_composition_candidate_parts(ctx, tid, sink, prefix, text, tail)?;
+                return Ok(true);
+            }
         }
 
         // Selecting → RangeSelect（先頭 1 文字を選択して開始）

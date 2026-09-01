@@ -45,13 +45,22 @@ pub(crate) fn fetch(engine: &DynEngine, reading: &str) -> Vec<String> {
 ///
 /// 選択行は出さない（`page_selected` にリスト外の添字を渡す）。ハイライトが
 /// 無いことで「まだ確定に関与していない」ことを示す。
+///
+/// 表示位置は打鍵中の文字のすぐ**上**（`Placement::Above`）。下に出すと
+/// これから打つ行そのものを覆ってしまうため。
 pub(crate) fn show(reading: &str, items: Vec<String>) {
     if items.is_empty() {
         clear();
         return;
     }
     let caret = caret_rect_get();
-    candidate_window::show_suggestion(&items, caret.left, caret.bottom, Some("Tab/↓ で予測候補"));
+    candidate_window::show_suggestion(
+        &items,
+        caret.left,
+        caret.top,
+        caret.bottom,
+        Some("Tab/↓ で予測候補"),
+    );
     if let Ok(mut g) = SHOWN.lock() {
         *g = Some(Shown {
             reading: reading.to_string(),

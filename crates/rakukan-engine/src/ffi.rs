@@ -12,7 +12,7 @@ use crate::{EngineConfig, RakunEngine};
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::OnceLock;
 
-pub const ENGINE_ABI_VERSION: u32 = 11;
+pub const ENGINE_ABI_VERSION: u32 = 12;
 
 static LOG_INIT: OnceLock<()> = OnceLock::new();
 
@@ -687,6 +687,22 @@ pub extern "C" fn engine_predict(
     let reading = unsafe { from_cstr(reading) };
     let preds = engine.predict(reading, limit as usize);
     let json = serde_json::to_string(&preds).unwrap_or_else(|_| "[]".into());
+    unsafe { to_cstr(json) }
+}
+
+/// 読みに対する辞書候補だけを JSON 配列で返す（短文予測も LLM も引かない）。
+/// 文節境界の探索が使う。`engine_free_string` で解放すること。
+#[unsafe(no_mangle)]
+pub extern "C" fn engine_dict_lookup(
+    handle: *mut c_void,
+    reading: *const c_char,
+    limit: u32,
+) -> *mut c_char {
+    let engine = unsafe { &mut *(handle as *mut RakunEngine) };
+    inject_pending_dict(engine);
+    let reading = unsafe { from_cstr(reading) };
+    let cands = engine.dict_lookup(reading, limit as usize);
+    let json = serde_json::to_string(&cands).unwrap_or_else(|_| "[]".into());
     unsafe { to_cstr(json) }
 }
 

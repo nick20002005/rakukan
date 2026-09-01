@@ -462,6 +462,15 @@ impl RpcEngine {
         .unwrap_or_default()
     }
 
+    /// 読みに対する辞書候補だけを返す（短文予測も LLM も引かない）。失敗時は空。
+    pub fn dict_lookup(&self, reading: &str, limit: usize) -> Vec<String> {
+        self.call_strings(Request::DictLookup {
+            reading: reading.into(),
+            limit: limit as u32,
+        })
+        .unwrap_or_default()
+    }
+
     /// 学習履歴から候補を削除する。`reading` に前方一致するキーも対象。
     pub fn forget(&self, reading: &str, surface: &str) -> bool {
         self.call_bool(Request::Forget {

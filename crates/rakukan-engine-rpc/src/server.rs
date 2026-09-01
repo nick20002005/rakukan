@@ -203,6 +203,7 @@ fn request_label(req: &Request) -> &'static str {
         ShutdownIfConfigDiffers { .. } => "ShutdownIfConfigDiffers",
         Forget { .. } => "Forget",
         Predict { .. } => "Predict",
+        DictLookup { .. } => "DictLookup",
     }
 }
 
@@ -432,6 +433,9 @@ fn dispatch_engine(eng: &mut DynEngine, req: Request) -> Response {
         }
         Forget { reading, surface } => Response::Bool(eng.forget(&reading, &surface)),
         Predict { reading, limit } => Response::Strings(eng.predict(&reading, limit as usize)),
+        DictLookup { reading, limit } => {
+            Response::Strings(eng.dict_lookup(&reading, limit as usize))
+        }
         MergeCandidatesForReading {
             reading,
             llm_cands,

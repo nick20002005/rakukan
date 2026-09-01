@@ -18,7 +18,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use libloading::{Library, Symbol};
 
-const EXPECTED_ENGINE_ABI_VERSION: u32 = 11;
+const EXPECTED_ENGINE_ABI_VERSION: u32 = 12;
 
 // ─── Segments モデル（CONVERTER_REDESIGN Phase A） ────────────────────────────
 
@@ -145,6 +145,7 @@ struct EngineVTable {
     learn_force: unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char),
     forget: unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char) -> bool,
     predict: unsafe extern "C" fn(*mut c_void, *const c_char, u32) -> *mut c_char,
+    dict_lookup: unsafe extern "C" fn(*mut c_void, *const c_char, u32) -> *mut c_char,
 
     // 診断
     last_error: unsafe extern "C" fn() -> *mut c_char,
@@ -231,6 +232,7 @@ impl EngineVTable {
             learn_force: load_sym!(lib, b"engine_learn_force\0"),
             forget: load_sym!(lib, b"engine_forget\0"),
             predict: load_sym!(lib, b"engine_predict\0"),
+            dict_lookup: load_sym!(lib, b"engine_dict_lookup\0"),
             last_error: load_sym!(lib, b"engine_last_error\0"),
             dict_status: load_sym!(lib, b"engine_dict_status\0"),
         })
@@ -605,6 +607,18 @@ impl DynEngine {
         let creading = Self::to_cstring(reading);
         unsafe {
             let ptr = (self.vtable.predict)(self.handle, creading.as_ptr(), limit as u32);
+            match self.take_cstr(ptr) {
+                Some(s) => serde_json::from_str(&s).unwrap_or_default(),
+                None => vec![],
+            }
+        }
+    }
+
+    /// 読みに対する辞書候補だけを返す（短文予測も LLM も引かない）。
+    pub fn dict_lookup(&self, reading: &str, limit: usize) -> Vec<String> {
+        let creading = Self::to_cstring(reading);
+        unsafe {
+            let ptr = (self.vtable.dict_lookup)(self.handle, creading.as_ptr(), limit as u32);
             match self.take_cstr(ptr) {
                 Some(s) => serde_json::from_str(&s).unwrap_or_default(),
                 None => vec![],
