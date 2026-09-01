@@ -42,7 +42,13 @@ use crate::{DigitCandidateKind, default_digit_candidates_order};
 
 /// ワーカーへの変換リクエスト（single-slot 上書き式キュー）
 struct Request {
+    /// キャッシュのキー。TSF 側が持つ読み（`hiragana_buf`）と一致させる。
     hiragana: String,
+    /// 変換器へ実際に渡す読み。`hiragana` と同じこともあれば、先頭の英単語を
+    /// 打鍵どおりに復元した形（`せえdれあmのぺーす` → `seedreamのぺーす`）の
+    /// こともある。キーと分けているのは、呼び出し側が結果を引くときに使うのは
+    /// あくまで打鍵そのままの読みだから。
+    conv_reading: String,
     committed: String,
     converter: KanaKanjiConverter,
     n: usize,
@@ -132,6 +138,7 @@ fn worker_loop(cache: Arc<Cache>) {
         };
 
         let key = req.hiragana.clone();
+        let conv_reading = req.conv_reading.clone();
         let committed = req.committed.clone();
         let n = req.n;
         let digit_candidates_order = req.digit_candidates_order.clone();
@@ -144,7 +151,7 @@ fn worker_loop(cache: Arc<Cache>) {
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 crate::digits::convert_with_digit_protection(
                     &converter,
-                    &key,
+                    &conv_reading,
                     &committed,
                     n,
                     &digit_candidates_order,
@@ -200,6 +207,7 @@ fn worker_loop(cache: Arc<Cache>) {
 /// - `Some(conv)` = 渡せなかった（同一キー実行中 or lock 取得失敗）
 pub fn start(
     hiragana: String,
+    conv_reading: String,
     committed: String,
     converter: KanaKanjiConverter,
     n: usize,
@@ -231,6 +239,7 @@ pub fn start(
 
     inner.pending = Some(Request {
         hiragana,
+        conv_reading,
         committed,
         converter,
         n,
