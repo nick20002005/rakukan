@@ -1283,7 +1283,20 @@ impl SessionState {
         }
     }
 
-    /// BlockSelecting: 現在ブロックの候補一覧（最大 9 件）を返す。
+    /// BlockSelecting: 候補ウィンドウに出す一覧（最大 9 件）を返す。
+    ///
+    /// 🔴 **候補を引く前（`expanded == false`）のブロックでは、その文節ではなく
+    /// composition 全体（`block_selecting_pending_text()`）を 1 件だけ返す。**
+    ///
+    /// 文節分割の直後、各ブロックは「文全体の変換結果を文字種で割った 1 件」しか
+    /// 持たない。ここで文節を出すと、Enter が composition 全体を確定するのに対して
+    /// 候補ウィンドウは先頭文節しか見せないことになり、**表示と確定される中身が
+    /// 食い違う**（実害 2026-09-01: `だいぶいいと思う、今回の男の顔のテイストは` を
+    /// Space で変換すると、窓には `だいぶいいと` の 1 件だけが出るのに Enter は
+    /// 全文を入れる）。選択肢が 1 件しかない以上この窓は「選ぶ場所」ではなく
+    /// 「確定されるものを見せる場所」なので、全文を出す。
+    ///
+    /// Space で展開したあとは本物の文節候補一覧なので、そのまま文節の候補を返す。
     pub fn block_selecting_page_candidates(&self) -> Vec<String> {
         if let SessionState::BlockSelecting {
             blocks,
@@ -1291,6 +1304,12 @@ impl SessionState {
             ..
         } = self
         {
+            if !blocks.get(*current_index).is_some_and(|b| b.expanded) {
+                return match self.block_selecting_pending_text() {
+                    Some(text) if !text.is_empty() => vec![text],
+                    _ => Vec::new(),
+                };
+            }
             blocks
                 .get(*current_index)
                 .map(|b| b.candidates.iter().take(9).cloned().collect())
@@ -2721,5 +2740,73 @@ mod tests {
 
         assert_eq!(state.current_candidate(), Some("更新1"));
         assert_eq!(state.page_selected(), 0);
+    }
+
+    fn block_selecting_sample() -> SessionState {
+        // `だいぶいいとおもう、こんかいのおとこ` を Space で変換し、文全体の
+        // 変換結果を文字種で文節に割った直後の状態（どの文節もまだ未展開）。
+        let mut state = SessionState::Idle;
+        state.set_block_selecting(
+            vec![
+                ConversionBlock {
+                    reading: "だいぶいいと".into(),
+                    trailing_punct: None,
+                    candidates: vec!["だいぶいいと".into()],
+                    selected: 0,
+                    expanded: false,
+                },
+                ConversionBlock {
+                    reading: "おもう".into(),
+                    trailing_punct: Some('、'),
+                    candidates: vec!["思う".into()],
+                    selected: 0,
+                    expanded: false,
+                },
+                ConversionBlock {
+                    reading: "こんかいのおとこ".into(),
+                    trailing_punct: None,
+                    candidates: vec!["今回の男".into()],
+                    selected: 0,
+                    expanded: false,
+                },
+            ],
+            "だいぶいいとおもう、こんかいのおとこ".into(),
+            0,
+            0,
+        );
+        state
+    }
+
+    #[test]
+    fn block_selecting_shows_full_text_before_expansion() {
+        // Enter は composition 全体を確定するので、選択肢が無いうちの候補ウィンドウは
+        // 先頭文節ではなく確定される全文を見せる。
+        let state = block_selecting_sample();
+        assert_eq!(
+            state.block_selecting_page_candidates(),
+            vec!["だいぶいいと思う、今回の男".to_string()]
+        );
+        assert_eq!(state.block_selecting_page_selected(), 0);
+    }
+
+    #[test]
+    fn block_selecting_shows_clause_candidates_after_expansion() {
+        // Space で展開したら本物の文節候補一覧になる。
+        let mut state = block_selecting_sample();
+        state.block_selecting_set_candidates(vec!["だいぶいいと".into(), "大分良いと".into()]);
+        assert_eq!(
+            state.block_selecting_page_candidates(),
+            vec!["だいぶいいと".to_string(), "大分良いと".to_string()]
+        );
+    }
+
+    #[test]
+    fn block_selecting_full_text_stays_untouched_by_display_rule() {
+        // 表示だけの変更であること（確定に使う全文は文節のままであること）の担保。
+        let state = block_selecting_sample();
+        assert_eq!(
+            state.block_selecting_full_text().as_deref(),
+            Some("だいぶいいと思う、今回の男")
+        );
     }
 }
