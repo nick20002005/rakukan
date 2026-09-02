@@ -72,7 +72,7 @@ use crate::{
         },
         user_action::UserAction,
     },
-    globals::{GUID_DISPLAY_ATTRIBUTE, GUID_DISPLAY_ATTRIBUTE_INPUT},
+    globals::{GUID_DISPLAY_ATTRIBUTE, GUID_DISPLAY_ATTRIBUTE_DONE, GUID_DISPLAY_ATTRIBUTE_INPUT},
     tsf::{
         candidate_window, display_attr,
         language_bar::{self, LANGBAR_SINK_COOKIE, get_open_close},
@@ -89,7 +89,8 @@ mod on_convert;
 mod on_input;
 use on_compose::{
     commit_text, commit_then_start_composition, end_composition, get_caret_pos_from_context,
-    update_caret_rect, update_composition, update_composition_candidate_parts,
+    update_caret_rect, update_composition, update_composition_block_parts,
+    update_composition_candidate_parts,
 };
 
 const ID_MENU_MODE_HIRAGANA: u32 = 1;
@@ -539,8 +540,13 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
                     .RegisterGUID(&GUID_DISPLAY_ATTRIBUTE_INPUT)
                     .unwrap_or(0);
                 let atom_conv = catmgr.RegisterGUID(&GUID_DISPLAY_ATTRIBUTE).unwrap_or(0);
-                display_attr::set_atoms(atom_input, atom_conv);
-                tracing::debug!("display attr atoms: input={atom_input} conv={atom_conv}");
+                let atom_done = catmgr
+                    .RegisterGUID(&GUID_DISPLAY_ATTRIBUTE_DONE)
+                    .unwrap_or(0);
+                display_attr::set_atoms(atom_input, atom_conv, atom_done);
+                tracing::debug!(
+                    "display attr atoms: input={atom_input} conv={atom_conv} done={atom_done}"
+                );
             }
         }
 
@@ -1085,7 +1091,10 @@ fn key_should_eat(action: &UserAction, has_preedit: bool) -> bool {
         | UserAction::CandidatePageDown
         | UserAction::CandidatePageUp
         | UserAction::CursorLeft
-        | UserAction::CursorRight => has_preedit,
+        | UserAction::CursorRight
+        | UserAction::CursorHome
+        | UserAction::CursorEnd
+        | UserAction::Delete => has_preedit,
         // Shift+Left/Right: composition がアクティブな間は必ず消費する。
         // 透過させるとアプリが composition テキストを直接編集してしまう。
         // has_preedit=false（composition なし）のときだけ透過。
@@ -1124,6 +1133,9 @@ pub(super) fn action_name(a: &UserAction) -> &'static str {
         UserAction::CandidateForget => "CandidateForget",
         UserAction::CursorLeft => "CursorLeft",
         UserAction::CursorRight => "CursorRight",
+        UserAction::CursorHome => "CursorHome",
+        UserAction::CursorEnd => "CursorEnd",
+        UserAction::Delete => "Delete",
         UserAction::Punctuate(_) => "Punctuate",
         UserAction::SegmentShrink => "SegmentShrink",
         UserAction::SegmentExtend => "SegmentExtend",

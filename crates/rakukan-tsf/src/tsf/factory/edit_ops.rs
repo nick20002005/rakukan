@@ -14,8 +14,80 @@ use crate::tsf::language_bar;
 
 use super::{
     CandidateDir, commit_then_start_composition, end_composition, engine_convert_sync_multi,
-    update_composition, update_composition_candidate_parts,
+    update_composition, update_composition_block_parts, update_composition_candidate_parts,
 };
+use crate::engine::state::{BLOCK_PAGE_SIZE, ConversionBlock};
+
+/// 文節変換で、まだ候補を引いていないブロックの候補を引く（Space と同じ遅延展開）。
+/// session のロックを持ったまま呼ばないこと（変換中にロックを取るため）。
+fn expand_current_block(engine: &mut crate::engine::state::DynEngine) {
+    let (expanded, reading) = {
+        let Ok(sess) = session_get() else {
+            return;
+        };
+        if !sess.is_block_selecting() {
+            return;
+        }
+        (
+            sess.block_selecting_current_expanded(),
+            sess.block_selecting_current_reading().unwrap_or_default(),
+        )
+    };
+    if expanded || reading.is_empty() {
+        return;
+    }
+    let llm_limit = crate::engine::state::get_num_candidates();
+    engine.force_preedit(reading.clone());
+    let cands = engine_convert_sync_multi(engine, llm_limit, BLOCK_PAGE_SIZE, &reading, &reading);
+    if let Ok(mut sess) = session_get() {
+        sess.block_selecting_set_candidates(cands);
+    }
+}
+
+/// 読み `tail` を変換して文節ブロック列にする（`on_convert` の分割と同じ手順）。
+/// 区読点 `punct` は最後のブロックに付ける。
+fn convert_tail_blocks(
+    engine: &mut crate::engine::state::DynEngine,
+    tail: &str,
+    punct: Option<char>,
+) -> Vec<ConversionBlock> {
+    if tail.is_empty() {
+        return Vec::new();
+    }
+    let llm_limit = crate::engine::state::get_num_candidates();
+    engine.force_preedit(tail.to_string());
+    let candidates = engine_convert_sync_multi(engine, llm_limit, BLOCK_PAGE_SIZE, tail, tail);
+    let split = candidates
+        .first()
+        .and_then(|top| crate::engine::clause::split_into_clauses(tail, top));
+    match split {
+        Some(clauses) => {
+            let last = clauses.len() - 1;
+            clauses
+                .into_iter()
+                .enumerate()
+                .map(|(i, c)| ConversionBlock {
+                    reading: c.reading,
+                    trailing_punct: if i == last { punct } else { None },
+                    candidates: vec![c.surface],
+                    selected: 0,
+                    expanded: false,
+                })
+                .collect()
+        }
+        None => vec![ConversionBlock {
+            reading: tail.to_string(),
+            trailing_punct: punct,
+            candidates: if candidates.is_empty() {
+                vec![tail.to_string()]
+            } else {
+                candidates
+            },
+            selected: 0,
+            expanded: true,
+        }],
+    }
+}
 
 /// 読みが辞書に載っている語かどうか（文節の切れ目として使えるか）。
 ///
@@ -316,10 +388,16 @@ impl super::TextServiceFactory_Impl {
         guard: crate::engine::state::EngineGuard,
         dir: CandidateDir,
     ) -> Result<bool> {
+        let mut guard = guard;
         let has_pre = guard
             .as_ref()
             .map(|e| !e.preedit_is_empty())
             .unwrap_or(false);
+        if let Some(engine) = guard.as_mut() {
+            // 文節分割で作ったブロックは候補 1 件しか持たない。↓ / Tab /
+            // PageDown で初めて候補を引く（Space と同じ遅延展開）。
+            expand_current_block(engine);
+        }
         drop(guard);
         let mut sess = session_get()?;
         if !sess.is_candidate_list_active() {
@@ -337,18 +415,8 @@ impl super::TextServiceFactory_Impl {
                 CandidateDir::Next => sess.block_selecting_next(),
                 CandidateDir::Prev => sess.block_selecting_prev(),
             }
-            let page_cands = sess.block_selecting_page_candidates();
-            let page_sel = sess.block_selecting_page_selected();
-            let (prefix, cand_text, remainder) =
-                sess.block_selecting_composition_parts().unwrap_or_default();
-            // caret_rect_get() は commit_then_start_composition セッション内で
-            // 更新されるため、Enter 確定後も現在ブロックの正確な位置を返す。
-            let caret = caret_rect_get();
             drop(sess);
-            candidate_window::update_selection(page_sel, "");
-            candidate_window::show(&page_cands, page_sel, "", caret.left, caret.bottom);
-            update_composition_candidate_parts(ctx, tid, sink, prefix, cand_text, remainder)?;
-            return Ok(true);
+            return self.redraw_block_selecting(ctx, tid, sink);
         }
         // 通常 Selecting
         match dir {
@@ -386,10 +454,16 @@ impl super::TextServiceFactory_Impl {
         guard: crate::engine::state::EngineGuard,
         dir: CandidateDir,
     ) -> Result<bool> {
+        let mut guard = guard;
         let has_pre = guard
             .as_ref()
             .map(|e| !e.preedit_is_empty())
             .unwrap_or(false);
+        if let Some(engine) = guard.as_mut() {
+            // 文節分割で作ったブロックは候補 1 件しか持たない。↓ / Tab /
+            // PageDown で初めて候補を引く（Space と同じ遅延展開）。
+            expand_current_block(engine);
+        }
         drop(guard);
         let mut sess = session_get()?;
         if !sess.is_candidate_list_active() {
@@ -403,20 +477,9 @@ impl super::TextServiceFactory_Impl {
         }
         // BlockSelecting: ページ切り替えは候補サイクルと同じ扱い（1ページのみ）
         if sess.is_block_selecting() {
-            match dir {
-                CandidateDir::Next => sess.block_selecting_next(),
-                CandidateDir::Prev => sess.block_selecting_prev(),
-            }
-            let page_cands = sess.block_selecting_page_candidates();
-            let page_sel = sess.block_selecting_page_selected();
-            let (prefix, cand_text, remainder) =
-                sess.block_selecting_composition_parts().unwrap_or_default();
-            let caret = caret_rect_get();
+            sess.block_selecting_page_move(matches!(dir, CandidateDir::Next));
             drop(sess);
-            candidate_window::update_selection(page_sel, "");
-            candidate_window::show(&page_cands, page_sel, "", caret.left, caret.bottom);
-            update_composition_candidate_parts(ctx, tid, sink, prefix, cand_text, remainder)?;
-            return Ok(true);
+            return self.redraw_block_selecting(ctx, tid, sink);
         }
         match dir {
             CandidateDir::Next => sess.next_page(),
@@ -520,6 +583,23 @@ impl super::TextServiceFactory_Impl {
             None => return Ok(false),
         };
         let has_pre = !engine.preedit_is_empty();
+        if session_get()?.is_block_selecting() {
+            // 文節変換中の数字キー: 現在の文節の候補を選び、次の文節へ進む
+            // （Google 日本語入力と同じ。確定は Enter）。
+            expand_current_block(engine);
+            let mut sess = session_get()?;
+            if !sess.block_selecting_select_nth(n as usize) {
+                return Ok(true);
+            }
+            sess.block_selecting_move(true);
+            let reading = sess.block_selecting_current_reading().unwrap_or_default();
+            drop(sess);
+            if !reading.is_empty() {
+                engine.force_preedit(reading);
+            }
+            drop(guard);
+            return self.redraw_block_selecting(ctx, tid, sink);
+        }
         let mut sess = session_get()?;
         if !sess.is_candidate_list_active() {
             return Ok(has_pre);
@@ -1021,11 +1101,6 @@ impl super::TextServiceFactory_Impl {
                 return Ok(true);
             }
             let reading = sess.block_selecting_current_reading().unwrap_or_default();
-            let page_cands = sess.block_selecting_page_candidates();
-            let page_sel = sess.block_selecting_page_selected();
-            let (prefix, cand_text, remainder) =
-                sess.block_selecting_composition_parts().unwrap_or_default();
-            let caret = caret_rect_get();
             drop(sess);
             // 移動先ブロックの読みへエンジンを揃える（set_block_selecting の初期化と同じ）
             if !reading.is_empty() {
@@ -1034,10 +1109,7 @@ impl super::TextServiceFactory_Impl {
                 }
             }
             drop(guard);
-            candidate_window::update_selection(page_sel, "");
-            candidate_window::show(&page_cands, page_sel, "", caret.left, caret.bottom);
-            update_composition_candidate_parts(ctx, tid, sink, prefix, cand_text, remainder)?;
-            return Ok(true);
+            return self.redraw_block_selecting(ctx, tid, sink);
         }
         drop(sess);
         let engine = match guard.as_mut() {
@@ -1045,6 +1117,120 @@ impl super::TextServiceFactory_Impl {
             None => return Ok(false),
         };
         Ok(!engine.preedit_is_empty())
+    }
+
+    /// 文節変換中の候補ウィンドウと composition を現在の状態で描き直す。
+    /// engine のロックは持たずに呼ぶこと。
+    pub(super) fn redraw_block_selecting(
+        &self,
+        ctx: ITfContext,
+        tid: u32,
+        sink: ITfCompositionSink,
+    ) -> Result<bool> {
+        let sess = session_get()?;
+        let page_cands = sess.block_selecting_page_candidates();
+        let page_sel = sess.block_selecting_page_selected();
+        let page_info = sess.block_selecting_page_info();
+        let (prefix, cand_text, remainder) =
+            sess.block_selecting_composition_parts().unwrap_or_default();
+        // caret_rect_get() は commit_then_start_composition セッション内で
+        // 更新されるため、Enter 確定後も現在ブロックの正確な位置を返す。
+        let caret = caret_rect_get();
+        drop(sess);
+        candidate_window::update_selection(page_sel, &page_info);
+        candidate_window::show(&page_cands, page_sel, &page_info, caret.left, caret.bottom);
+        update_composition_block_parts(ctx, tid, sink, prefix, cand_text, remainder)?;
+        Ok(true)
+    }
+
+    /// Home / End: 文節変換中は先頭（末尾）の文節へ。それ以外の未確定状態では
+    /// キーを消費するだけ（アプリへ流すと composition の外へキャレットが飛ぶ）。
+    pub(super) fn on_cursor_edge(
+        &self,
+        ctx: ITfContext,
+        tid: u32,
+        sink: ITfCompositionSink,
+        mut guard: crate::engine::state::EngineGuard,
+        last: bool,
+    ) -> Result<bool> {
+        let mut sess = session_get()?;
+        if sess.is_block_selecting() {
+            if !sess.block_selecting_move_to_edge(last) {
+                return Ok(true);
+            }
+            let reading = sess.block_selecting_current_reading().unwrap_or_default();
+            drop(sess);
+            if !reading.is_empty() {
+                if let Some(engine) = guard.as_mut() {
+                    engine.force_preedit(reading);
+                }
+            }
+            drop(guard);
+            return self.redraw_block_selecting(ctx, tid, sink);
+        }
+        drop(sess);
+        let has_pre = guard
+            .as_ref()
+            .map(|e| !e.preedit_is_empty())
+            .unwrap_or(false);
+        Ok(has_pre)
+    }
+
+    /// Delete: 変換中は Backspace と同じく読みに戻す。プリエディット中は
+    /// キャレットが末尾にあるので消す文字がなく、キーを消費するだけ。
+    pub(super) fn on_delete(
+        &self,
+        ctx: ITfContext,
+        tid: u32,
+        sink: ITfCompositionSink,
+        guard: crate::engine::state::EngineGuard,
+    ) -> Result<bool> {
+        let in_conversion = {
+            let sess = session_get()?;
+            sess.is_candidate_list_active() || sess.is_range_select()
+        };
+        if in_conversion {
+            return self.on_backspace(ctx, tid, sink, guard);
+        }
+        let has_pre = guard
+            .as_ref()
+            .map(|e| !e.preedit_is_empty())
+            .unwrap_or(false);
+        Ok(has_pre)
+    }
+
+    /// Shift+←/→ の文節変換中の処理: 選択中の文節の右端を 1 文字動かし、
+    /// その文節と後続を再変換する。
+    fn resize_block_selecting(
+        &self,
+        ctx: ITfContext,
+        tid: u32,
+        sink: ITfCompositionSink,
+        mut guard: crate::engine::state::EngineGuard,
+        grow: bool,
+    ) -> Result<bool> {
+        let Some((cur, tail, punct)) = session_get()?.block_selecting_resize(grow) else {
+            return Ok(true);
+        };
+        let Some(engine) = guard.as_mut() else {
+            return Ok(true);
+        };
+        tracing::debug!(
+            "resize_block_selecting: grow={} cur={:?} tail={:?} punct={:?}",
+            grow,
+            cur,
+            tail,
+            punct
+        );
+        engine.bg_reclaim();
+        let llm_limit = crate::engine::state::get_num_candidates();
+        engine.force_preedit(cur.clone());
+        let cur_cands = engine_convert_sync_multi(engine, llm_limit, BLOCK_PAGE_SIZE, &cur, &cur);
+        let tail_blocks = convert_tail_blocks(engine, &tail, punct);
+        session_get()?.block_selecting_apply_resize(cur_cands, tail_blocks);
+        engine.force_preedit(cur);
+        drop(guard);
+        self.redraw_block_selecting(ctx, tid, sink)
     }
 
     /// Shift+Left: 選択範囲を左側から縮めるのではなく、右端を左へ戻す。
@@ -1062,6 +1248,12 @@ impl super::TextServiceFactory_Impl {
         let mut sess = session_get()?;
 
         tracing::debug!("on_segment_shrink: state={:?}", &*sess);
+
+        // 文節変換中: 選択中の文節を 1 文字縮める
+        if sess.is_block_selecting() {
+            drop(sess);
+            return self.resize_block_selecting(ctx, tid, sink, guard, false);
+        }
 
         // LiveConv → RangeSelect（全文ひらがなに戻して先頭から範囲指定）
         if sess.is_live_conv() {
@@ -1232,6 +1424,11 @@ impl super::TextServiceFactory_Impl {
         };
         let mut sess = session_get()?;
 
+        // 文節変換中: 選択中の文節を 1 文字伸ばす
+        if sess.is_block_selecting() {
+            drop(sess);
+            return self.resize_block_selecting(ctx, tid, sink, guard, true);
+        }
         // LiveConv → RangeSelect（先頭 1 文字を選択して開始）
         if sess.is_live_conv() {
             let (reading, preview) = sess

@@ -21,8 +21,8 @@ use windows::{
 };
 
 use crate::globals::{
-    DISPLAY_ATTRIBUTE_CONVERTED, DISPLAY_ATTRIBUTE_INPUT, GUID_DISPLAY_ATTRIBUTE,
-    GUID_DISPLAY_ATTRIBUTE_INPUT,
+    DISPLAY_ATTRIBUTE_CONVERTED, DISPLAY_ATTRIBUTE_DONE, DISPLAY_ATTRIBUTE_INPUT,
+    GUID_DISPLAY_ATTRIBUTE, GUID_DISPLAY_ATTRIBUTE_DONE, GUID_DISPLAY_ATTRIBUTE_INPUT,
 };
 
 // ─── GuidAtom キャッシュ ──────────────────────────────────────────────────────
@@ -30,10 +30,17 @@ use crate::globals::{
 /// 0 = 未登録（TF_INVALID_GUIDATOM）
 static ATOM_INPUT: AtomicU32 = AtomicU32::new(0);
 static ATOM_CONVERTED: AtomicU32 = AtomicU32::new(0);
+static ATOM_DONE: AtomicU32 = AtomicU32::new(0);
 
-pub fn set_atoms(input: u32, converted: u32) {
+pub fn set_atoms(input: u32, converted: u32, done: u32) {
     ATOM_INPUT.store(input, Ordering::Relaxed);
     ATOM_CONVERTED.store(converted, Ordering::Relaxed);
+    ATOM_DONE.store(done, Ordering::Relaxed);
+}
+
+/// 変換済み・非選択の文節（細実線）
+pub fn atom_done() -> u32 {
+    ATOM_DONE.load(Ordering::Relaxed)
 }
 
 /// 未変換プリエディット用の atom（点線）
@@ -172,6 +179,11 @@ pub fn make_all() -> Vec<ITfDisplayAttributeInfo> {
             DISPLAY_ATTRIBUTE_CONVERTED,
             "Rakukan Converted",
         ),
+        DisplayAttrInfo::new(
+            GUID_DISPLAY_ATTRIBUTE_DONE,
+            DISPLAY_ATTRIBUTE_DONE,
+            "Rakukan Converted (other clause)",
+        ),
     ]
 }
 
@@ -190,6 +202,13 @@ pub fn get_by_guid(guid: &GUID) -> windows::core::Result<ITfDisplayAttributeInfo
             GUID_DISPLAY_ATTRIBUTE,
             DISPLAY_ATTRIBUTE_CONVERTED,
             "Rakukan Converted",
+        ));
+    }
+    if *guid == GUID_DISPLAY_ATTRIBUTE_DONE {
+        return Ok(DisplayAttrInfo::new(
+            GUID_DISPLAY_ATTRIBUTE_DONE,
+            DISPLAY_ATTRIBUTE_DONE,
+            "Rakukan Converted (other clause)",
         ));
     }
     Err(windows::core::Error::from(E_INVALIDARG))

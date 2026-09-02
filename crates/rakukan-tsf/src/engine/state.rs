@@ -1032,6 +1032,9 @@ pub struct ConversionBlock {
     pub expanded: bool,
 }
 
+/// 文節変換の候補ウィンドウ 1 ページの件数
+pub const BLOCK_PAGE_SIZE: usize = 9;
+
 impl ConversionBlock {
     /// 選択中の候補テキストを返す（候補が空なら reading を返す）。
     pub fn current_candidate(&self) -> &str {
@@ -1312,10 +1315,172 @@ impl SessionState {
             }
             blocks
                 .get(*current_index)
-                .map(|b| b.candidates.iter().take(9).cloned().collect())
+                .map(|b| {
+                    let start = (b.selected / BLOCK_PAGE_SIZE) * BLOCK_PAGE_SIZE;
+                    b.candidates
+                        .iter()
+                        .skip(start)
+                        .take(BLOCK_PAGE_SIZE)
+                        .cloned()
+                        .collect()
+                })
                 .unwrap_or_default()
         } else {
             Vec::new()
+        }
+    }
+
+    /// 文節変換の候補ウィンドウ用ページ表示（`2/3`）。1 ページに収まるなら空。
+    pub fn block_selecting_page_info(&self) -> String {
+        if let SessionState::BlockSelecting {
+            blocks,
+            current_index,
+            ..
+        } = self
+        {
+            let Some(b) = blocks.get(*current_index) else {
+                return String::new();
+            };
+            let total = b.candidates.len().div_ceil(BLOCK_PAGE_SIZE);
+            if !b.expanded || total <= 1 {
+                return String::new();
+            }
+            format!("{}/{}", b.selected / BLOCK_PAGE_SIZE + 1, total)
+        } else {
+            String::new()
+        }
+    }
+
+    /// PageDown / PageUp: 次（前）のページの先頭へ。端では反対側へ回る。
+    pub fn block_selecting_page_move(&mut self, forward: bool) {
+        if let SessionState::BlockSelecting {
+            blocks,
+            current_index,
+            ..
+        } = self
+        {
+            let Some(b) = blocks.get_mut(*current_index) else {
+                return;
+            };
+            let len = b.candidates.len();
+            if len <= BLOCK_PAGE_SIZE {
+                return;
+            }
+            let pages = len.div_ceil(BLOCK_PAGE_SIZE);
+            let page = b.selected / BLOCK_PAGE_SIZE;
+            let next = if forward {
+                (page + 1) % pages
+            } else {
+                (page + pages - 1) % pages
+            };
+            b.selected = next * BLOCK_PAGE_SIZE;
+        }
+    }
+
+    /// Home / End: 未確定の先頭（末尾）の文節へ移動する。動いたら true。
+    pub fn block_selecting_move_to_edge(&mut self, last: bool) -> bool {
+        if let SessionState::BlockSelecting {
+            blocks,
+            current_index,
+            committed_blocks,
+            ..
+        } = self
+        {
+            let target = if last {
+                blocks.iter().rposition(|b| !b.reading.is_empty())
+            } else {
+                blocks
+                    .iter()
+                    .enumerate()
+                    .skip(*committed_blocks)
+                    .find(|(_, b)| !b.reading.is_empty())
+                    .map(|(i, _)| i)
+            };
+            if let Some(t) = target {
+                if t != *current_index && t >= *committed_blocks {
+                    *current_index = t;
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Shift+← / Shift+→: 選択中の文節の右端を 1 文字動かす。
+    ///
+    /// 選択中の文節から「区読点を持つ最初のブロック」までを 1 つの組として
+    /// 扱い、組の後続ブロックは呼び出し側が再変換して差し直す
+    /// ([`Self::block_selecting_apply_resize`])。戻り値は
+    /// `(新しい文節の読み, 後続の読み, 組の末尾の区読点)`。動かせなければ `None`。
+    pub fn block_selecting_resize(&mut self, grow: bool) -> Option<(String, String, Option<char>)> {
+        if let SessionState::BlockSelecting {
+            blocks,
+            current_index,
+            ..
+        } = self
+        {
+            let idx = *current_index;
+            if idx >= blocks.len() {
+                return None;
+            }
+            let mut end = idx;
+            while end + 1 < blocks.len() && blocks[end].trailing_punct.is_none() {
+                end += 1;
+            }
+            let group_punct = blocks[end].trailing_punct;
+            let mut cur: Vec<char> = blocks[idx].reading.chars().collect();
+            let mut tail: Vec<char> = blocks[idx + 1..=end]
+                .iter()
+                .flat_map(|b| b.reading.chars())
+                .collect();
+            if grow {
+                if tail.is_empty() {
+                    return None;
+                }
+                cur.push(tail.remove(0));
+            } else {
+                if cur.len() <= 1 {
+                    return None;
+                }
+                tail.insert(0, cur.pop()?);
+            }
+            blocks.drain(idx + 1..=end);
+            let b = &mut blocks[idx];
+            b.reading = cur.iter().collect();
+            let tail_reading: String = tail.iter().collect();
+            b.trailing_punct = if tail.is_empty() { group_punct } else { None };
+            let tail_punct = if tail.is_empty() { None } else { group_punct };
+            return Some((b.reading.clone(), tail_reading, tail_punct));
+        }
+        None
+    }
+
+    /// [`Self::block_selecting_resize`] の後、再変換した候補と後続ブロックを差し直す。
+    pub fn block_selecting_apply_resize(
+        &mut self,
+        cur_candidates: Vec<String>,
+        tail_blocks: Vec<ConversionBlock>,
+    ) {
+        if let SessionState::BlockSelecting {
+            blocks,
+            current_index,
+            ..
+        } = self
+        {
+            let idx = *current_index;
+            if let Some(b) = blocks.get_mut(idx) {
+                b.candidates = if cur_candidates.is_empty() {
+                    vec![b.reading.clone()]
+                } else {
+                    cur_candidates
+                };
+                b.selected = 0;
+                b.expanded = true;
+            }
+            let at = (idx + 1).min(blocks.len());
+            for (i, tb) in tail_blocks.into_iter().enumerate() {
+                blocks.insert(at + i, tb);
+            }
         }
     }
 
@@ -1329,7 +1494,7 @@ impl SessionState {
         {
             blocks
                 .get(*current_index)
-                .map(|b| b.selected.min(8))
+                .map(|b| b.selected % BLOCK_PAGE_SIZE)
                 .unwrap_or(0)
         } else {
             0
@@ -1544,7 +1709,7 @@ impl SessionState {
         } = self
         {
             if let Some(block) = blocks.get_mut(*current_index) {
-                let idx = n - 1;
+                let idx = (block.selected / BLOCK_PAGE_SIZE) * BLOCK_PAGE_SIZE + (n - 1);
                 if idx < block.candidates.len() {
                     block.selected = idx;
                     return true;
@@ -2627,6 +2792,127 @@ fn is_terminal_hwnd(hwnd_val: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn block(reading: &str, surface: &str, punct: Option<char>) -> ConversionBlock {
+        ConversionBlock {
+            reading: reading.to_string(),
+            trailing_punct: punct,
+            candidates: vec![surface.to_string()],
+            selected: 0,
+            expanded: false,
+        }
+    }
+
+    fn block_session(blocks: Vec<ConversionBlock>) -> SessionState {
+        let reading: String = blocks
+            .iter()
+            .map(|b| {
+                let mut r = b.reading.clone();
+                if let Some(p) = b.trailing_punct {
+                    r.push(p);
+                }
+                r
+            })
+            .collect();
+        let mut s = SessionState::Idle;
+        s.set_block_selecting(blocks, reading, 0, 0);
+        s
+    }
+
+    #[test]
+    fn block_resize_shrink_moves_char_to_tail_and_keeps_group_punct() {
+        // 今日は / 晴れ。 / 明日
+        let mut s = block_session(vec![
+            block("きょうは", "今日は", None),
+            block("はれ", "晴れ", Some('。')),
+            block("あした", "明日", None),
+        ]);
+        let (cur, tail, punct) = s.block_selecting_resize(false).unwrap();
+        assert_eq!(cur, "きょう");
+        assert_eq!(tail, "ははれ");
+        assert_eq!(punct, Some('。'));
+        // 後続の組（はれ。）は取り除かれ、あした は残る
+        if let SessionState::BlockSelecting { blocks, .. } = &s {
+            assert_eq!(blocks.len(), 2);
+            assert_eq!(blocks[0].reading, "きょう");
+            assert_eq!(blocks[0].trailing_punct, None);
+            assert_eq!(blocks[1].reading, "あした");
+        } else {
+            panic!("not block selecting");
+        }
+        s.block_selecting_apply_resize(
+            vec!["今日".into(), "京".into()],
+            vec![block("は", "は", None), block("はれ", "晴れ", Some('。'))],
+        );
+        assert_eq!(s.block_selecting_full_text().unwrap(), "今日は晴れ。明日");
+        assert_eq!(s.block_selecting_current_candidate(), Some("今日"));
+        assert!(s.block_selecting_current_expanded());
+    }
+
+    #[test]
+    fn block_resize_grow_takes_char_from_next_and_absorbs_punct_when_tail_empty() {
+        let mut s = block_session(vec![
+            block("きょう", "今日", None),
+            block("は", "は", Some('、')),
+            block("あした", "明日", None),
+        ]);
+        let (cur, tail, punct) = s.block_selecting_resize(true).unwrap();
+        assert_eq!(cur, "きょうは");
+        assert_eq!(tail, "");
+        assert_eq!(punct, None);
+        if let SessionState::BlockSelecting { blocks, .. } = &s {
+            // 区読点は現在の文節に移る
+            assert_eq!(blocks[0].trailing_punct, Some('、'));
+            assert_eq!(blocks.len(), 2);
+        }
+        // 端では動かない
+        let mut last = block_session(vec![block("あ", "あ", None)]);
+        assert!(last.block_selecting_resize(true).is_none());
+        assert!(last.block_selecting_resize(false).is_none());
+    }
+
+    #[test]
+    fn block_candidate_paging_and_nth_select() {
+        let mut s = block_session(vec![block("あ", "亜", None)]);
+        let cands: Vec<String> = (0..20).map(|i| format!("c{i}")).collect();
+        s.block_selecting_set_candidates(cands);
+        // 表示中の「亜」が先頭に残り、以降 c0.. が続く（21 件 = 3 ページ）
+        assert_eq!(s.block_selecting_page_candidates().len(), BLOCK_PAGE_SIZE);
+        assert_eq!(s.block_selecting_page_info(), "1/3");
+        s.block_selecting_page_move(true);
+        assert_eq!(s.block_selecting_page_info(), "2/3");
+        assert_eq!(s.block_selecting_page_selected(), 0);
+        assert_eq!(s.block_selecting_page_candidates()[0], "c8");
+        assert!(s.block_selecting_select_nth(3));
+        assert_eq!(s.block_selecting_current_candidate(), Some("c10"));
+        assert_eq!(s.block_selecting_page_selected(), 2);
+        s.block_selecting_page_move(true);
+        s.block_selecting_page_move(true);
+        assert_eq!(s.block_selecting_page_info(), "1/3");
+        s.block_selecting_page_move(false);
+        assert_eq!(s.block_selecting_page_info(), "3/3");
+        assert_eq!(s.block_selecting_page_candidates().len(), 3);
+        assert!(!s.block_selecting_select_nth(5));
+    }
+
+    #[test]
+    fn block_move_to_edge_respects_committed_blocks() {
+        let mut s = block_session(vec![
+            block("あ", "亜", None),
+            block("い", "以", None),
+            block("う", "宇", None),
+        ]);
+        assert!(s.block_selecting_move_to_edge(true));
+        assert_eq!(s.block_selecting_current_reading().as_deref(), Some("う"));
+        assert!(s.block_selecting_move_to_edge(false));
+        assert_eq!(s.block_selecting_current_reading().as_deref(), Some("あ"));
+        assert!(!s.block_selecting_move_to_edge(false));
+        // 先頭を確定した後は Home で確定済みブロックへ戻らない
+        s.block_selecting_commit_current();
+        s.block_selecting_move_to_edge(true);
+        assert!(s.block_selecting_move_to_edge(false));
+        assert_eq!(s.block_selecting_current_reading().as_deref(), Some("い"));
+    }
 
     #[test]
     fn live_conversion_reading_ready_starts_at_min_chars() {

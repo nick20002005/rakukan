@@ -45,6 +45,9 @@ pub enum KeyAction {
     ModeAlphanumeric, // 英数キー
     CursorLeft,
     CursorRight,
+    CursorHome, // Home
+    CursorEnd,  // End
+    Delete,     // Delete
     /// 文節縮小（Shift+Left）
     SegmentShrink,
     /// 文節拡大（Shift+Right）
@@ -80,6 +83,9 @@ impl KeyAction {
             Self::ModeAlphanumeric => UserAction::ModeAlphanumeric,
             Self::CursorLeft => UserAction::CursorLeft,
             Self::CursorRight => UserAction::CursorRight,
+            Self::CursorHome => UserAction::CursorHome,
+            Self::CursorEnd => UserAction::CursorEnd,
+            Self::Delete => UserAction::Delete,
             Self::SegmentShrink => UserAction::SegmentShrink,
             Self::SegmentExtend => UserAction::SegmentExtend,
         }
@@ -605,6 +611,9 @@ fn preset_bindings(preset: KeymapPreset) -> Vec<KeyBinding> {
             bind("PageUp", KeyAction::CandidatePageUp),
             bind("Left", KeyAction::CursorLeft),
             bind("Right", KeyAction::CursorRight),
+            bind("Home", KeyAction::CursorHome),
+            bind("End", KeyAction::CursorEnd),
+            bind("Delete", KeyAction::Delete),
             bind("Shift+Left", KeyAction::SegmentShrink),
             bind("Shift+Right", KeyAction::SegmentExtend),
         ],
@@ -638,6 +647,9 @@ fn preset_bindings(preset: KeymapPreset) -> Vec<KeyBinding> {
             bind("Eisuu", KeyAction::ModeAlphanumeric),
             bind("Left", KeyAction::CursorLeft),
             bind("Right", KeyAction::CursorRight),
+            bind("Home", KeyAction::CursorHome),
+            bind("End", KeyAction::CursorEnd),
+            bind("Delete", KeyAction::Delete),
             bind("Shift+Left", KeyAction::SegmentShrink),
             bind("Shift+Right", KeyAction::SegmentExtend),
         ],

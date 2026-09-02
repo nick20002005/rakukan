@@ -15,7 +15,8 @@ use crate::tsf::candidate_window;
 
 use super::{
     commit_text, commit_then_start_composition, end_composition, engine_convert_sync_multi,
-    update_caret_rect, update_composition, update_composition_candidate_parts,
+    update_caret_rect, update_composition, update_composition_block_parts,
+    update_composition_candidate_parts,
 };
 
 #[inline]
@@ -727,19 +728,9 @@ impl super::TextServiceFactory_Impl {
                     sess = session_get()?;
                 }
                 sess.block_selecting_next();
-                let page_cands = sess.block_selecting_page_candidates();
-                let page_sel = sess.block_selecting_page_selected();
-                let (prefix, cand_text, remainder) =
-                    sess.block_selecting_composition_parts().unwrap_or_default();
-                // caret_rect_get() は commit_then_start_composition セッション内で
-                // 更新されるため、Enter 確定後も現在ブロックの正確な位置を返す。
-                let caret = caret_rect_get();
                 drop(sess);
                 drop(guard);
-                candidate_window::update_selection(page_sel, "");
-                candidate_window::show(&page_cands, page_sel, "", caret.left, caret.bottom);
-                update_composition_candidate_parts(ctx, tid, sink, prefix, cand_text, remainder)?;
-                return Ok(true);
+                return self.redraw_block_selecting(ctx, tid, sink);
             }
         }
 
@@ -896,7 +887,7 @@ impl super::TextServiceFactory_Impl {
             candidate_window::stop_waiting_timer();
             candidate_window::show(&page_cands, page_sel, "", caret.left, caret.bottom);
             let (prefix, cand_text, remainder) = comp_parts;
-            update_composition_candidate_parts(ctx, tid, sink, prefix, cand_text, remainder)?;
+            update_composition_block_parts(ctx, tid, sink, prefix, cand_text, remainder)?;
             return Ok(true);
         }
 

@@ -429,6 +429,49 @@ pub(super) fn update_composition_candidate_parts(
     converted: String,
     suffix: String,
 ) -> Result<()> {
+    update_composition_parts_impl(
+        ctx,
+        tid,
+        sink,
+        prefix,
+        converted,
+        suffix,
+        display_attr::atom_input(),
+    )
+}
+
+/// 文節変換（BlockSelecting）用。`suffix` は後続の変換済み文節なので、
+/// 未変換の点線ではなく変換済みの細実線で表示する。
+pub(super) fn update_composition_block_parts(
+    ctx: ITfContext,
+    tid: u32,
+    sink: ITfCompositionSink,
+    prefix: String,
+    converted: String,
+    suffix: String,
+) -> Result<()> {
+    update_composition_parts_impl(
+        ctx,
+        tid,
+        sink,
+        prefix,
+        converted,
+        suffix,
+        display_attr::atom_done(),
+    )
+}
+
+/// 属性の塗り分け: prefix（変換済み）= 細実線、converted（選択中）= 太実線、
+/// suffix = `suffix_atom`（未変換なら点線、変換済み文節なら細実線）。
+fn update_composition_parts_impl(
+    ctx: ITfContext,
+    tid: u32,
+    sink: ITfCompositionSink,
+    prefix: String,
+    converted: String,
+    suffix: String,
+    suffix_atom: u32,
+) -> Result<()> {
     use windows::Win32::Foundation::E_FAIL;
 
     if prefix.is_empty() && suffix.is_empty() {
@@ -441,6 +484,8 @@ pub(super) fn update_composition_candidate_parts(
     let ctx_req = ctx.clone();
     let full = format!("{prefix}{converted}{suffix}");
     let prefix_utf16: i32 = prefix.encode_utf16().count() as i32;
+    let converted_utf16: i32 = converted.encode_utf16().count() as i32;
+    let suffix_utf16_all: i32 = suffix.encode_utf16().count() as i32;
 
     let session = EditSession::new(move |ec| unsafe {
         use windows::Win32::UI::TextServices::{
@@ -505,7 +550,21 @@ pub(super) fn update_composition_candidate_parts(
 
         // ── Step2: 属性セット ──
         // 全体を atom_input（点線）で塗り、選択中ブロックのみ atom_converted（太実線）で上書きする
-        set_display_attr_prop(&ctx, ec, &range, display_attr::atom_input());
+        // prefix（変換済み文節）は細実線。suffix は呼び出し側の指定
+        // （未変換の読みなら点線、後続の変換済み文節なら細実線）。
+        set_display_attr_prop(&ctx, ec, &range, display_attr::atom_done());
+        if suffix_utf16_all > 0 && suffix_atom != display_attr::atom_done() {
+            if let Ok(suf_range) = range.Clone() {
+                let mut actual = 0i32;
+                let _ = suf_range.ShiftStart(
+                    ec,
+                    prefix_utf16 + converted_utf16,
+                    &mut actual,
+                    std::ptr::null::<windows::Win32::UI::TextServices::TF_HALTCOND>(),
+                );
+                set_display_attr_prop(&ctx, ec, &suf_range, suffix_atom);
+            }
+        }
         if let Ok(sel_range) = range.Clone() {
             let mut actual = 0i32;
             let suffix_utf16: i32 = suffix.encode_utf16().count() as i32;
