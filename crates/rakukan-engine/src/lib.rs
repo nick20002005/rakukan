@@ -786,6 +786,9 @@ impl RakunEngine {
         self.flush_pending_romaji();
         self.hiragana_buf.push(c);
         self.romaji_input_log.push(c.to_string());
+        // TSF は `.` `,` `/` を `direct_input_symbol` で和文記号に変えてから
+        // この経路で積む（`push_char` を通らない）ので、ここでも畳む。
+        self.collapse_symbol_repeat();
     }
 
     /// Shift+アルファベット用: alpha_width 設定に従って全角 or 半角の大文字を hiragana_buf に追加。
@@ -1881,6 +1884,22 @@ mod symbol_input_tests {
             e.push_char('.');
         }
         assert_eq!(e.hiragana_text(), "⋯⋯");
+    }
+
+    #[test]
+    fn push_raw_repeat_collapses_and_backspaces_as_one() {
+        // TSF の on_punctuate 経路（ローマ字変換を通らない）
+        let mut e = RakunEngine::new(crate::EngineConfig::default());
+        for c in "sou".chars() {
+            e.push_char(c);
+        }
+        for _ in 0..3 {
+            e.push_raw('。');
+        }
+        assert_eq!(e.hiragana_text(), "そう⋯");
+        assert!(e.backspace());
+        assert_eq!(e.hiragana_text(), "そう");
+        assert_eq!(e.hiragana_from_romaji_log(), "そう");
     }
 
     #[test]

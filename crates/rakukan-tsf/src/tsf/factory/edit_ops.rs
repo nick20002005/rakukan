@@ -884,13 +884,18 @@ impl super::TextServiceFactory_Impl {
         }
 
         if sess.is_live_conv() {
-            let (reading, preview) = sess
+            let (mut reading, mut display) = sess
                 .live_conv_parts()
                 .map(|(r, p)| (r.to_string(), p.to_string()))
                 .unwrap_or_default();
+            // engine が末尾を畳む（`。。。` → `⋯`）ことがあるので、記号を
+            // そのまま足さず engine の読みの差分を表示側にも当てる。
+            let before = engine.hiragana_text().to_string();
             engine.push_raw(symbol);
-            let display = format!("{preview}{symbol}");
-            sess.set_live_conv(format!("{reading}{symbol}"), display.clone());
+            let (removed, added) = text_util::tail_delta(&before, &engine.hiragana_text());
+            text_util::apply_tail_delta(&mut reading, removed, &added);
+            text_util::apply_tail_delta(&mut display, removed, &added);
+            sess.set_live_conv(reading, display.clone());
             drop(sess);
             drop(guard);
             update_composition(ctx, tid, sink, display)?;
@@ -901,12 +906,15 @@ impl super::TextServiceFactory_Impl {
             // composition に載っている（＝まだアプリへ書いていない）範囲だけを
             // 引き継ぐ。全ブロックを display にすると Enter で確定済みの
             // ブロックがもう一度書かれて二重に入る。
-            let pending_text = sess.block_selecting_pending_text().unwrap_or_default();
-            let pending_reading = sess.block_selecting_pending_reading().unwrap_or_default();
+            let mut display = sess.block_selecting_pending_text().unwrap_or_default();
+            let mut pending_reading = sess.block_selecting_pending_reading().unwrap_or_default();
             engine.force_preedit(pending_reading.clone());
             engine.push_raw(symbol);
-            let display = format!("{pending_text}{symbol}");
-            sess.set_live_conv(format!("{pending_reading}{symbol}"), display.clone());
+            let (removed, added) =
+                text_util::tail_delta(&pending_reading, &engine.hiragana_text());
+            text_util::apply_tail_delta(&mut display, removed, &added);
+            text_util::apply_tail_delta(&mut pending_reading, removed, &added);
+            sess.set_live_conv(pending_reading, display.clone());
             drop(sess);
             drop(guard);
             update_composition(ctx, tid, sink, display)?;
@@ -928,8 +936,17 @@ impl super::TextServiceFactory_Impl {
             if remainder_reading.is_empty() {
                 remainder_reading = remainder.clone();
             }
-            let display = format!("{prefix}{text}{symbol}{remainder}");
-            let next_reading = format!("{prefix_reading}{reading}{symbol}{remainder_reading}");
+            // 記号は engine に積んで畳み込み（`。。。` → `⋯`）を通し、その差分を
+            // 表示側にも当てる。remainder は畳み込みの対象外なので後から足す。
+            let mut head_reading = format!("{prefix_reading}{reading}");
+            let mut head_display = format!("{prefix}{text}");
+            engine.force_preedit(head_reading.clone());
+            engine.push_raw(symbol);
+            let (removed, added) = text_util::tail_delta(&head_reading, &engine.hiragana_text());
+            text_util::apply_tail_delta(&mut head_reading, removed, &added);
+            text_util::apply_tail_delta(&mut head_display, removed, &added);
+            let display = format!("{head_display}{remainder}");
+            let next_reading = format!("{head_reading}{remainder_reading}");
             engine.force_preedit(next_reading.clone());
             sess.set_live_conv(next_reading, display.clone());
             drop(sess);
@@ -939,9 +956,11 @@ impl super::TextServiceFactory_Impl {
         }
 
         if sess.is_waiting() {
-            let text = sess.preedit_text().unwrap_or("").to_string();
+            let mut display = sess.preedit_text().unwrap_or("").to_string();
+            let before = engine.hiragana_text().to_string();
             engine.push_raw(symbol);
-            let display = format!("{text}{symbol}");
+            let (removed, added) = text_util::tail_delta(&before, &engine.hiragana_text());
+            text_util::apply_tail_delta(&mut display, removed, &added);
             sess.set_preedit(display.clone());
             drop(sess);
             drop(guard);
