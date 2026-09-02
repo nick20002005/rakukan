@@ -745,11 +745,15 @@ pub fn should_learn_and_log(
     reading: &str,
     text: &str,
     source: Option<CandidateViewSource>,
+    explicit_choice: bool,
 ) -> bool {
     if !is_auto_learn_enabled() {
         return false;
     }
-    if text == reading {
+    // 表記＝読み（ひらがなのまま）は普通は学習しない。ただし候補から
+    // **明示的に選んだ**場合は別で、「やった → ヤッタ」が先頭に出続けるのを
+    // ひらがなを選び直して覚えさせられないと、毎回同じ操作を強いられる。
+    if text == reading && !explicit_choice {
         return false;
     }
     let learnable = source.map(is_candidate_learning_target).unwrap_or(true);
@@ -2420,6 +2424,11 @@ impl SessionState {
                 source,
             );
         }
+    }
+
+    /// 候補選択中に、先頭以外の候補を選んでいるか（＝ユーザーの明示的な選択）。
+    pub fn selecting_is_explicit_choice(&self) -> bool {
+        matches!(self, SessionState::Selecting { selected, .. } if *selected != 0)
     }
 
     pub fn page_selected(&self) -> usize {

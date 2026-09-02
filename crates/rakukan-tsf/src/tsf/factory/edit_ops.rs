@@ -632,6 +632,8 @@ impl super::TextServiceFactory_Impl {
         let remainder = sess.take_selecting_remainder();
         let remainder_reading = sess.selecting_remainder_reading_clone();
         let candidate_source = sess.current_candidate_view().map(|v| v.source);
+        // 数字キーでの選択は常に明示的
+        let explicit_choice = true;
         sess.set_idle();
         drop(sess);
         let commit_text = if let Some(p) = punct {
@@ -639,7 +641,7 @@ impl super::TextServiceFactory_Impl {
         } else {
             text.clone()
         };
-        if crate::engine::state::should_learn_and_log(&reading, &text, candidate_source) {
+        if crate::engine::state::should_learn_and_log(&reading, &text, candidate_source, explicit_choice) {
             // 確定した合成は辞書ガードなしで学習する（Google 日本語入力相当）
             engine.learn_force(&reading, &text);
         }

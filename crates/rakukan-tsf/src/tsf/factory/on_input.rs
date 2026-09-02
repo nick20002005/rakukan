@@ -264,6 +264,7 @@ impl super::TextServiceFactory_Impl {
                 let punct = sess.take_punct_pending();
                 let remainder = sess.take_selecting_remainder();
                 let candidate_source = sess.current_candidate_view().map(|v| v.source);
+                let explicit_choice = sess.selecting_is_explicit_choice();
                 sess.set_idle();
                 drop(sess);
                 candidate_window::hide();
@@ -278,6 +279,7 @@ impl super::TextServiceFactory_Impl {
                     &reading,
                     &selected_text,
                     candidate_source,
+                    explicit_choice,
                 ) {
                     // 確定した合成は辞書ガードなしで学習する（Google 日本語入力相当）。
                     // 誤変換も履歴に載るが、Ctrl+Delete で候補ごと削除できる。
@@ -457,6 +459,7 @@ impl super::TextServiceFactory_Impl {
                 let punct = sess.take_punct_pending();
                 let remainder = sess.take_selecting_remainder();
                 let candidate_source = sess.current_candidate_view().map(|v| v.source);
+                let explicit_choice = sess.selecting_is_explicit_choice();
                 sess.set_idle();
                 drop(sess);
                 candidate_window::hide();
@@ -471,6 +474,7 @@ impl super::TextServiceFactory_Impl {
                     &reading,
                     &selected_text,
                     candidate_source,
+                    explicit_choice,
                 ) {
                     // 確定した合成は辞書ガードなしで学習する（Google 日本語入力相当）。
                     // 誤変換も履歴に載るが、Ctrl+Delete で候補ごと削除できる。
