@@ -2682,6 +2682,11 @@ struct ModeStore {
     /// 「文字入力欄」として扱う（Photoshop の文字ツールは編集開始で DM を作り、
     /// 終了で破棄する）。
     base_dm: usize,
+    /// `input.text_field_mode` で「文字入力欄」と判定した DM。Photoshop は同じ
+    /// 文字レイヤーを編集し直すとき DM を使い回すので、一度 Alphanumeric に
+    /// 切り替えた（サイドボタンの IME OFF 等）モードを覚えたままにせず、
+    /// フォーカスが来るたびに設定のモードで始める。
+    text_field_dms: std::collections::HashSet<usize>,
 }
 
 /// このプロセスの exe 名（小文字）。`input.text_field_mode` のキー照合用。
@@ -2717,9 +2722,13 @@ fn text_field_mode_for(
     next_dm: usize,
     base_dm: usize,
     known: bool,
+    flagged: bool,
     configured: Option<InputMode>,
 ) -> Option<InputMode> {
-    if known || next_dm == base_dm {
+    if next_dm == base_dm {
+        return None;
+    }
+    if known && !flagged {
         return None;
     }
     configured
@@ -2731,6 +2740,7 @@ static DOC_MODE_STORE: LazyLock<Mutex<ModeStore>> = LazyLock::new(|| {
         hwnd_modes: HashMap::new(),
         dm_to_hwnd: HashMap::new(),
         base_dm: 0,
+        text_field_dms: std::collections::HashSet::new(),
     })
 });
 
@@ -2798,6 +2808,7 @@ pub fn doc_mode_on_focus_change(
         next_dm_ptr,
         store.base_dm,
         store.dm_modes.contains_key(&next_dm_ptr),
+        store.text_field_dms.contains(&next_dm_ptr),
         app_text_field_mode(&cfg),
     ) {
         tracing::info!(
@@ -2805,6 +2816,7 @@ pub fn doc_mode_on_focus_change(
             store.base_dm
         );
         store.dm_modes.insert(next_dm_ptr, m);
+        store.text_field_dms.insert(next_dm_ptr);
         return Some(m);
     }
 
@@ -2899,6 +2911,7 @@ pub fn doc_mode_remove(dm_ptr: usize) {
             );
         }
         store.dm_modes.remove(&dm_ptr);
+        store.text_field_dms.remove(&dm_ptr);
         store.dm_to_hwnd.remove(&dm_ptr);
         tracing::trace!("doc_mode: removed dm={dm_ptr:#x}");
     }
@@ -2983,13 +2996,20 @@ mod tests {
     fn text_field_mode_only_for_new_non_base_dm() {
         let h = Some(InputMode::Hiragana);
         // 基準 DM 自身には効かない
-        assert_eq!(text_field_mode_for(0x10, 0x10, false, h), None);
+        assert_eq!(text_field_mode_for(0x10, 0x10, false, false, h), None);
         // 初見の別 DM → 設定モード
-        assert_eq!(text_field_mode_for(0x20, 0x10, false, h), Some(InputMode::Hiragana));
-        // 既知の DM は覚えているモードに任せる
-        assert_eq!(text_field_mode_for(0x20, 0x10, true, h), None);
+        assert_eq!(
+            text_field_mode_for(0x20, 0x10, false, false, h),
+            Some(InputMode::Hiragana)
+        );
+        // 既知の DM は覚えているモードに任せる（文字入力欄と判定済みなら毎回設定モード）
+        assert_eq!(text_field_mode_for(0x20, 0x10, true, false, h), None);
+        assert_eq!(
+            text_field_mode_for(0x20, 0x10, true, true, h),
+            Some(InputMode::Hiragana)
+        );
         // 設定が無ければ何もしない
-        assert_eq!(text_field_mode_for(0x20, 0x10, false, None), None);
+        assert_eq!(text_field_mode_for(0x20, 0x10, false, false, None), None);
     }
 
     #[test]
