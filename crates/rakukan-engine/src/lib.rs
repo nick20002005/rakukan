@@ -810,7 +810,7 @@ impl RakunEngine {
 
     pub fn backspace(&mut self) -> bool {
         use romaji::BackspaceResult;
-        match self.romaji.backspace() {
+        let consumed = match self.romaji.backspace() {
             BackspaceResult::RemovedBuffer(_) => {
                 self.pending_romaji_buf.pop();
                 // pending_romaji_buf はまだ未確定 → romaji_input_log には記録されていない
@@ -832,7 +832,56 @@ impl RakunEngine {
                     true
                 }
             }
+        };
+        if consumed {
+            self.reclaim_pending_consonant();
         }
+        consumed
+    }
+
+    /// Backspace 後、末尾に残った「単独で素通しされた子音」を未確定ローマ字へ戻す。
+    ///
+    /// `kt` は `k` が素通しで出力側へ移り `t` だけが未確定に残る。ここで
+    /// Backspace → `a` と打つと `kあ` になっていた（Google 日本語入力は `か`）。
+    /// 同様に `tt` → `っ`+`t`、`nt` → `ん`+`t` も、Backspace 後は打った
+    /// `t` / `n` が未確定に戻るべき。
+    ///
+    /// 対象は「打鍵ログの最後の要素が子音 1 文字で、その出力が素通しの同じ
+    /// 文字・促音・撥音のいずれか」に限る。`nn` の `ん`（ログ要素 2 文字）や
+    /// `xtu` の `っ` は意図した確定なので戻さない。
+    fn reclaim_pending_consonant(&mut self) {
+        if !self.pending_romaji_buf.is_empty() {
+            return;
+        }
+        let Some(entry) = self.romaji_input_log.last() else {
+            return;
+        };
+        let mut it = entry.chars();
+        let (Some(key), None) = (it.next(), it.next()) else {
+            return;
+        };
+        if !key.is_ascii_lowercase()
+            || matches!(key, 'a' | 'i' | 'u' | 'e' | 'o')
+            || !self.romaji.can_start(key)
+        {
+            return;
+        }
+        let Some(tail) = self.hiragana_buf.chars().last() else {
+            return;
+        };
+        let reclaim = tail == key || (tail == 'っ' && key != 'n') || (tail == 'ん' && key == 'n');
+        if !reclaim {
+            return;
+        }
+        self.hiragana_buf.pop();
+        self.romaji_input_log.pop();
+        self.romaji.replace_output_tail(&tail.to_string(), "");
+        let _ = self.romaji.push(key);
+        self.pending_romaji_buf.push(key);
+        debug!(
+            "engine::backspace: reclaimed {:?} (was {:?}) into pending romaji",
+            key, tail
+        );
     }
 
     /// 変換器へ渡す読み。
@@ -1884,6 +1933,79 @@ mod symbol_input_tests {
             e.push_char('.');
         }
         assert_eq!(e.hiragana_text(), "⋯⋯");
+    }
+
+    #[test]
+    fn backspace_reclaims_passthrough_consonant() {
+        // kt → BS → a = か（kあ ではない）
+        let mut e = RakunEngine::new(crate::EngineConfig::default());
+        e.push_char('k');
+        e.push_char('t');
+        assert_eq!(e.current_preedit().display(), "kt");
+        assert!(e.backspace());
+        assert_eq!(e.current_preedit().display(), "k");
+        e.push_char('a');
+        assert_eq!(e.current_preedit().display(), "か");
+        assert_eq!(e.hiragana_text(), "か");
+    }
+
+    #[test]
+    fn backspace_reclaims_sokuon_and_hatsuon() {
+        // tt → BS → a = た
+        let mut e = RakunEngine::new(crate::EngineConfig::default());
+        e.push_char('t');
+        e.push_char('t');
+        assert_eq!(e.current_preedit().display(), "っt");
+        assert!(e.backspace());
+        e.push_char('a');
+        assert_eq!(e.current_preedit().display(), "た");
+        // nt → BS → a = な
+        let mut e = RakunEngine::new(crate::EngineConfig::default());
+        e.push_char('n');
+        e.push_char('t');
+        assert_eq!(e.current_preedit().display(), "んt");
+        assert!(e.backspace());
+        e.push_char('a');
+        assert_eq!(e.current_preedit().display(), "な");
+    }
+
+    #[test]
+    fn backspace_keeps_deliberate_nn_and_plain_kana() {
+        // nn は意図した ん なので戻さない
+        let mut e = RakunEngine::new(crate::EngineConfig::default());
+        for c in "nnk".chars() {
+            e.push_char(c);
+        }
+        assert!(e.backspace());
+        assert_eq!(e.current_preedit().display(), "ん");
+        e.push_char('a');
+        assert_eq!(e.current_preedit().display(), "んあ");
+        // kanakq → BS = かなk（従来どおり）
+        let mut e = RakunEngine::new(crate::EngineConfig::default());
+        for c in "kanakq".chars() {
+            e.push_char(c);
+        }
+        assert!(e.backspace());
+        assert_eq!(e.current_preedit().display(), "かなk");
+        e.push_char('a');
+        assert_eq!(e.current_preedit().display(), "かなか");
+    }
+
+    #[test]
+    fn backspace_reclaims_consonant_left_after_output_removal() {
+        // seedream → せえdれあm。れ あ m を消すと d が未確定に戻り、a で だ
+        let mut e = RakunEngine::new(crate::EngineConfig::default());
+        for c in "seedream".chars() {
+            e.push_char(c);
+        }
+        assert_eq!(e.current_preedit().display(), "せえdれあm");
+        assert!(e.backspace()); // m
+        assert!(e.backspace()); // あ
+        assert!(e.backspace()); // れ → d が未確定へ
+        assert_eq!(e.current_preedit().display(), "せえd");
+        assert_eq!(e.hiragana_text(), "せえ");
+        e.push_char('a');
+        assert_eq!(e.current_preedit().display(), "せえだ");
     }
 
     #[test]

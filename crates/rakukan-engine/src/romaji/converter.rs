@@ -260,6 +260,11 @@ impl RomajiConverter {
         hiragana_to_katakana(&self.output)
     }
 
+    /// `ch` から始まるローマ字規則があるか（`k` → true、`q` → false）。
+    pub fn can_start(&self, ch: char) -> bool {
+        self.trie.children.contains_key(&ch)
+    }
+
     /// Get the current buffer (unconverted input)
     pub fn buffer(&self) -> &str {
         &self.buffer
