@@ -1856,11 +1856,13 @@ fn fetch_preview() -> Option<LivePreview> {
                 .next()
                 .filter(|s| !s.is_empty())
         } else {
+            // 先頭が読みそのものなら、それは学習履歴／ユーザー辞書の「ひらがなの
+            // まま」の意思（辞書由来の読み一致候補は engine 側で落としてある）。
+            // 飛ばさずに preview にする。
             dict_like_candidates
                 .iter()
                 .cloned()
-                .into_iter()
-                .find(|s| !s.is_empty() && s != &reading)
+                .find(|s| !s.is_empty())
         };
         let keep_short_preview = preview
             .as_ref()

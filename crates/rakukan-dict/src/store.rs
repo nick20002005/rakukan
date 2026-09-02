@@ -531,12 +531,20 @@ impl DictStore {
             return vec![];
         };
         let now = now_unix_secs();
-        let mut scored: Vec<(f64, String)> = entries
+        // 同じ読みの候補順は「最後に確定した表記が先頭」（MS-IME / Google 日本語
+        // 入力と同じ）。頻度は同時刻のタイブレークにだけ使う。頻度優先だと、
+        // ライブ変換の preview を Enter で流すたびに望まない表記が積み上がり、
+        // 候補から選び直しても何回も繰り返さないと先頭に来ない（実害:
+        // 「やった」→「ヤッタ」が freq 3 で居座り、ひらがなを選んでも覆らなかった）。
+        let mut scored: Vec<(u64, f64, String)> = entries
             .iter()
-            .map(|e| (e.score(now), e.surface.clone()))
+            .map(|e| (e.last_access_time, e.score(now), e.surface.clone()))
             .collect();
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        scored.into_iter().map(|(_, s)| s).collect()
+        scored.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        scored.into_iter().map(|(_, _, s)| s).collect()
     }
 
     /// 学習履歴から `prefix` で**始まる（かつ prefix より長い）**読みのエントリを
@@ -1111,6 +1119,27 @@ priority = "low"
         assert_eq!(learned.len(), 2);
         assert!(learned.contains(&"表記A".to_string()));
         assert!(learned.contains(&"表記B".to_string()));
+    }
+
+    #[test]
+    fn test_learn_history_recent_choice_wins_over_freq() {
+        // 頻度が高い表記より、後から確定した表記が先頭（最後に選んだものが勝つ）。
+        let store = make_store(&[("よみ", vec!["表記A", "表記B"])]);
+        store.learn("よみ", "表記A");
+        store.learn("よみ", "表記A");
+        store.learn("よみ", "表記A"); // freq = 3
+        store.learn("よみ", "表記B"); // freq = 1、ただし後で確定
+        {
+            let mut hist = store.inner.learn_history.write().unwrap();
+            let entries = hist.get_mut("よみ").unwrap();
+            let now = now_unix_secs();
+            for e in entries.iter_mut() {
+                e.last_access_time = if e.surface == "表記B" { now } else { now - 60 };
+            }
+        }
+        let learned = store.lookup_learn("よみ");
+        assert_eq!(learned[0], "表記B", "最後に確定した表記が先頭");
+        assert_eq!(learned[1], "表記A");
     }
 
     #[test]

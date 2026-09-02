@@ -1421,9 +1421,16 @@ impl RakunEngine {
         }
 
         // 4. 残りの辞書候補（学習で上昇済みのものは既に merged に含まれる）
+        //    読みそのもの（MOZC はひらがな表記を候補として返す）は情報が無いので
+        //    入れない。これで「先頭が読みと同じ」＝ユーザー辞書か学習履歴の
+        //    明示的な「ひらがなのまま」の意思、と読める（ライブ変換の preview が
+        //    それを尊重する）。
         for c in &dict_cands {
             if merged.len() >= limit {
                 break;
+            }
+            if c == hiragana {
+                continue;
             }
             if !merged.contains(c) {
                 merged.push(c.clone());

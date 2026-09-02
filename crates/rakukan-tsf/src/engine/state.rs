@@ -2800,7 +2800,7 @@ pub fn doc_mode_on_focus_change(
         store.dm_modes.contains_key(&next_dm_ptr),
         app_text_field_mode(&cfg),
     ) {
-        tracing::debug!(
+        tracing::info!(
             "doc_mode: text field dm={next_dm_ptr:#x} (base={:#x}) → {m:?} (input.text_field_mode)",
             store.base_dm
         );
