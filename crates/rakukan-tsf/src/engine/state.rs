@@ -1209,6 +1209,84 @@ pub static SESSION_STATE: LazyLock<Mutex<SessionState>> =
 pub static SESSION_SELECTING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+// ─── 未確定中のキャレット編集 ────────────────────────────────────────────
+//
+// ← で読みの途中へ戻ると、キャレットより右側の読みを engine から外して
+// ここへ退避する（engine の hiragana_buf には挿入点の概念が無く、末尾にしか
+// 積めないため）。engine が持つのはキャレットより左側だけで、表示は
+// `engine.preedit_display() + CARET_TAIL`、キャレット位置は前者の長さ。
+// 退避が非空なのは `Preedit` 状態のときだけで、他の状態へ遷移する `set_*` は
+// 必ず `caret_tail_clear()` する。キャレットを意識しないアクション（Space /
+// Enter / F6〜F10 / IME 切替…）は dispatch が `caret_merge_into_engine` で
+// 退避分を engine の末尾へ戻してから処理する。
+static CARET_TAIL: Mutex<String> = Mutex::new(String::new());
+static CARET_TAIL_NONEMPTY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// キャレットより右側に退避している読みが無い（＝キャレットは末尾）。
+#[inline]
+pub fn caret_tail_is_empty() -> bool {
+    !CARET_TAIL_NONEMPTY.load(std::sync::atomic::Ordering::Acquire)
+}
+
+pub fn caret_tail_get() -> String {
+    CARET_TAIL
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_else(|p| p.into_inner().clone())
+}
+
+pub fn caret_tail_set(tail: String) {
+    CARET_TAIL_NONEMPTY.store(!tail.is_empty(), std::sync::atomic::Ordering::Release);
+    match CARET_TAIL.lock() {
+        Ok(mut g) => *g = tail,
+        Err(p) => *p.into_inner() = tail,
+    }
+}
+
+pub fn caret_tail_take() -> String {
+    let tail = caret_tail_get();
+    caret_tail_set(String::new());
+    tail
+}
+
+pub fn caret_tail_clear() {
+    if !caret_tail_is_empty() {
+        caret_tail_set(String::new());
+    }
+}
+
+/// 退避している右側の読みを engine の末尾へ戻す（キャレットを末尾へ）。
+/// 未確定のローマ字はそのまま文字として確定する（`k` は `k` のまま）。
+pub fn caret_merge_into_engine(engine: &mut DynEngine) {
+    if caret_tail_is_empty() {
+        return;
+    }
+    let tail = caret_tail_take();
+    let head = engine.preedit_display();
+    tracing::debug!("caret: merge head={:?} tail={:?}", head, tail);
+    engine.force_preedit(format!("{head}{tail}"));
+}
+
+/// composition に出す文字列と、キャレット位置（UTF-16 単位。末尾なら `None`）。
+pub fn caret_display(engine: &DynEngine) -> (String, Option<i32>) {
+    let head = engine.preedit_display();
+    if caret_tail_is_empty() {
+        return (head, None);
+    }
+    let caret = head.encode_utf16().count() as i32;
+    (format!("{head}{}", caret_tail_get()), Some(caret))
+}
+
+/// 読み全体（engine の読み＋退避分）。`Preedit` 状態のテキストに使う。
+pub fn caret_full_reading(engine: &DynEngine) -> String {
+    let mut reading = engine.hiragana_text();
+    if !caret_tail_is_empty() {
+        reading.push_str(&caret_tail_get());
+    }
+    reading
+}
+
 // ─── Phase 1B キュー / SUPPRESS / LIVE_CONV_GEN / session_nonce ───────────────
 //
 // v0.7.7 で `tsf::live_session::LiveShared` に集約 (M4 Phase 2 + M2 §5.3)。
@@ -1255,6 +1333,7 @@ impl SessionState {
         pos_x: i32,
         pos_y: i32,
     ) {
+        caret_tail_clear();
         *self = SessionState::BlockSelecting {
             blocks,
             current_index: 0,
@@ -1903,6 +1982,7 @@ impl SessionState {
     // ── 共通 ────────────────────────────────────────────────────────────────
 
     pub fn set_idle(&mut self) {
+        caret_tail_clear();
         *self = SessionState::Idle;
         SESSION_SELECTING.store(false, std::sync::atomic::Ordering::Release);
     }
@@ -1932,6 +2012,7 @@ impl SessionState {
     /// ライブ変換表示状態へ遷移。
     /// `reading` = hiragana_buf（変換キー）、`preview` = BG トップ候補。
     pub fn set_live_conv(&mut self, reading: String, preview: String) {
+        caret_tail_clear();
         *self = SessionState::LiveConv { reading, preview };
         SESSION_SELECTING.store(false, std::sync::atomic::Ordering::Release);
     }
@@ -1955,6 +2036,7 @@ impl SessionState {
         select_end: usize,
         original_preview: String,
     ) {
+        caret_tail_clear();
         *self = SessionState::RangeSelect {
             full_reading,
             select_end,
@@ -2041,6 +2123,7 @@ impl SessionState {
         remainder: String,
         remainder_reading: String,
     ) {
+        caret_tail_clear();
         *self = SessionState::Waiting {
             text,
             pos_x,
@@ -2090,6 +2173,7 @@ impl SessionState {
             &remainder,
             CandidateViewSource::Bg,
         );
+        caret_tail_clear();
         *self = SessionState::Selecting {
             original_preedit,
             candidates,

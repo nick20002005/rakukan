@@ -14,8 +14,22 @@ use crate::tsf::language_bar;
 
 use super::{
     CandidateDir, commit_then_start_composition, end_composition, engine_convert_sync_multi,
-    update_composition, update_composition_block_parts, update_composition_candidate_parts,
+    update_composition, update_composition_at, update_composition_block_parts,
+    update_composition_candidate_parts,
 };
+use crate::engine::state::{
+    caret_display, caret_full_reading, caret_tail_get, caret_tail_is_empty, caret_tail_set,
+    caret_tail_take,
+};
+
+/// 未確定中のキャレット移動の向き。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CaretMove {
+    Left,
+    Right,
+    Home,
+    End,
+}
 use crate::engine::state::{BLOCK_PAGE_SIZE, ConversionBlock};
 
 /// 文節変換で、まだ候補を引いていないブロックの候補を引く（Space と同じ遅延展開）。
@@ -639,6 +653,7 @@ impl super::TextServiceFactory_Impl {
                 engine.push_raw(c);
             }
             let _ = crate::engine::state::start_live_bg_if_ready(engine, &remainder_reading);
+            crate::engine::state::caret_merge_into_engine(engine);
             let preedit = engine.preedit_display();
             {
                 let mut sess = session_get()?;
@@ -674,6 +689,8 @@ impl super::TextServiceFactory_Impl {
                 // 「また」を確定した直後に半角/全角キーを押したところ、engine の
                 // preedit が「また」のままだったため `end_composition(_, "また")` が
                 // 走り、composition に残っていた 37 文字が丸ごと消えた。
+                // キャレット編集中なら右側の読みを engine に戻してから確定する
+                crate::engine::state::caret_merge_into_engine(engine);
                 let commit_text = {
                     let sess = session_get();
                     let text = match &sess {
@@ -778,6 +795,8 @@ impl super::TextServiceFactory_Impl {
             let mut guard = engine_try_get_or_create()?;
             if let Some(engine) = guard.as_mut() {
                 // LiveConv 中は preview をコミットしてから IME をオフにする
+                // キャレット編集中なら右側の読みを engine に戻してから確定する
+                crate::engine::state::caret_merge_into_engine(engine);
                 let commit_text = {
                     let sess = session_get();
                     if let Ok(s) = &sess {
@@ -864,6 +883,7 @@ impl super::TextServiceFactory_Impl {
         mut guard: crate::engine::state::EngineGuard,
     ) -> Result<bool> {
         if let Some(engine) = guard.as_mut() {
+            crate::engine::state::caret_merge_into_engine(engine);
             let preedit = engine.preedit_display();
             if !preedit.is_empty() {
                 let t = preedit.clone();
@@ -898,6 +918,7 @@ impl super::TextServiceFactory_Impl {
         mut guard: crate::engine::state::EngineGuard,
     ) -> Result<bool> {
         if let Some(engine) = guard.as_mut() {
+            crate::engine::state::caret_merge_into_engine(engine);
             let preedit = engine.preedit_display();
             if !preedit.is_empty() {
                 let t = text_util::to_katakana(&preedit);
@@ -955,11 +976,11 @@ impl super::TextServiceFactory_Impl {
         let mut sess = session_get()?;
         if engine.preedit_is_empty() {
             engine.push_raw(symbol);
-            let display = engine.preedit_display();
-            sess.set_preedit(display.clone());
+            let (display, caret) = caret_display(engine);
+            sess.set_preedit(caret_full_reading(engine));
             drop(sess);
             drop(guard);
-            update_composition(ctx, tid, sink, display)?;
+            update_composition_at(ctx, tid, sink, display, caret)?;
             return Ok(true);
         }
 
@@ -1049,11 +1070,11 @@ impl super::TextServiceFactory_Impl {
         }
 
         engine.push_raw(symbol);
-        let display = engine.preedit_display();
-        sess.set_preedit(display.clone());
+        let (display, caret) = caret_display(engine);
+        sess.set_preedit(caret_full_reading(engine));
         drop(sess);
         drop(guard);
-        update_composition(ctx, tid, sink, display)?;
+        update_composition_at(ctx, tid, sink, display, caret)?;
         Ok(true)
     }
 
@@ -1111,12 +1132,119 @@ impl super::TextServiceFactory_Impl {
             drop(guard);
             return self.redraw_block_selecting(ctx, tid, sink);
         }
+        // 未確定（読み）中はキャレットを 1 文字動かす。ライブ変換の preview が
+        // 出ている間は読みに戻してから動かす（変換結果の途中には割り込めない）。
+        let is_reading = sess.is_live_conv() || matches!(&*sess, SessionState::Preedit { .. });
         drop(sess);
-        let engine = match guard.as_mut() {
-            Some(e) => e,
-            None => return Ok(false),
+        let has_pre = guard
+            .as_ref()
+            .map(|e| !e.preedit_is_empty())
+            .unwrap_or(false)
+            || !caret_tail_is_empty();
+        if is_reading && has_pre {
+            let dir = if forward {
+                CaretMove::Right
+            } else {
+                CaretMove::Left
+            };
+            return self.move_caret(ctx, tid, sink, guard, dir);
+        }
+        Ok(has_pre)
+    }
+
+    /// 未確定（読み）中のキャレット移動。engine にはキャレットより左側だけを
+    /// 残し、右側は `caret_tail` へ退避する（[`crate::engine::state::caret_tail_set`]）。
+    /// 未確定のローマ字は移動時に文字として確定する（Google 日本語入力と同じ）。
+    pub(super) fn move_caret(
+        &self,
+        ctx: ITfContext,
+        tid: u32,
+        sink: ITfCompositionSink,
+        mut guard: crate::engine::state::EngineGuard,
+        dir: CaretMove,
+    ) -> Result<bool> {
+        let Some(engine) = guard.as_mut() else {
+            return Ok(false);
         };
-        Ok(!engine.preedit_is_empty())
+        {
+            let mut sess = session_get()?;
+            if sess.is_live_conv() {
+                // preview を捨てて読みに戻す
+                let reading = sess
+                    .live_conv_parts()
+                    .map(|(r, _)| r.to_string())
+                    .unwrap_or_default();
+                sess.set_preedit(reading.clone());
+                drop(sess);
+                candidate_window::hide();
+                candidate_window::stop_live_timer();
+                crate::tsf::live_session::queue_preview_clear();
+                engine.bg_reclaim();
+                engine.force_preedit(reading);
+            }
+        }
+        let head = engine.preedit_display();
+        let tail = caret_tail_get();
+        let mut head_chars: Vec<char> = head.chars().collect();
+        let mut tail_chars: Vec<char> = tail.chars().collect();
+        let moved = match dir {
+            CaretMove::Left => match head_chars.pop() {
+                Some(c) => {
+                    tail_chars.insert(0, c);
+                    true
+                }
+                None => false,
+            },
+            CaretMove::Right => {
+                if tail_chars.is_empty() {
+                    false
+                } else {
+                    head_chars.push(tail_chars.remove(0));
+                    true
+                }
+            }
+            CaretMove::Home => {
+                if head_chars.is_empty() {
+                    false
+                } else {
+                    let mut all = std::mem::take(&mut head_chars);
+                    all.append(&mut tail_chars);
+                    tail_chars = all;
+                    true
+                }
+            }
+            CaretMove::End => {
+                if tail_chars.is_empty() {
+                    false
+                } else {
+                    head_chars.append(&mut tail_chars);
+                    true
+                }
+            }
+        };
+        if !moved {
+            return Ok(true);
+        }
+        let new_head: String = head_chars.into_iter().collect();
+        let new_tail: String = tail_chars.into_iter().collect();
+        tracing::debug!(
+            "caret: {:?} head={:?} tail={:?}",
+            dir,
+            new_head,
+            new_tail
+        );
+        engine.force_preedit(new_head);
+        caret_tail_set(new_tail);
+        let full = caret_full_reading(engine);
+        if let Ok(mut sess) = session_get() {
+            sess.set_preedit(full);
+        }
+        let (display, caret) = caret_display(engine);
+        drop(guard);
+        candidate_window::hide();
+        crate::tsf::suggestion::clear();
+        update_composition_at(ctx, tid, sink, display, caret)?;
+        Ok(true)
     }
 
     /// 文節変換中の候補ウィンドウと composition を現在の状態で描き直す。
@@ -1168,11 +1296,21 @@ impl super::TextServiceFactory_Impl {
             drop(guard);
             return self.redraw_block_selecting(ctx, tid, sink);
         }
+        let is_reading = sess.is_live_conv() || matches!(&*sess, SessionState::Preedit { .. });
         drop(sess);
         let has_pre = guard
             .as_ref()
             .map(|e| !e.preedit_is_empty())
-            .unwrap_or(false);
+            .unwrap_or(false)
+            || !caret_tail_is_empty();
+        if is_reading && has_pre {
+            let dir = if last {
+                CaretMove::End
+            } else {
+                CaretMove::Home
+            };
+            return self.move_caret(ctx, tid, sink, guard, dir);
+        }
         Ok(has_pre)
     }
 
@@ -1183,7 +1321,7 @@ impl super::TextServiceFactory_Impl {
         ctx: ITfContext,
         tid: u32,
         sink: ITfCompositionSink,
-        guard: crate::engine::state::EngineGuard,
+        mut guard: crate::engine::state::EngineGuard,
     ) -> Result<bool> {
         let in_conversion = {
             let sess = session_get()?;
@@ -1191,6 +1329,34 @@ impl super::TextServiceFactory_Impl {
         };
         if in_conversion {
             return self.on_backspace(ctx, tid, sink, guard);
+        }
+        if !caret_tail_is_empty() {
+            // キャレット編集中: 右側の先頭 1 文字を消す
+            let mut tail = caret_tail_take();
+            let mut it = tail.chars();
+            it.next();
+            tail = it.collect();
+            caret_tail_set(tail);
+            let Some(engine) = guard.as_mut() else {
+                return Ok(true);
+            };
+            let full = caret_full_reading(engine);
+            if full.is_empty() {
+                if let Ok(mut sess) = session_get() {
+                    sess.set_idle();
+                }
+                engine.reset_preedit();
+                drop(guard);
+                end_composition(ctx, tid, String::new())?;
+                return Ok(true);
+            }
+            if let Ok(mut sess) = session_get() {
+                sess.set_preedit(full);
+            }
+            let (display, caret) = caret_display(engine);
+            drop(guard);
+            update_composition_at(ctx, tid, sink, display, caret)?;
+            return Ok(true);
         }
         let has_pre = guard
             .as_ref()

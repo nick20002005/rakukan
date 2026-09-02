@@ -2077,6 +2077,12 @@ fn queue_phase1b(snapshot: &LiveSnapshot) {
 ///   5. `build_apply_snapshot` — display_shown 組み立て
 ///   6. `try_apply_phase1a` (RequestEditSession) / `queue_phase1b` (LIVE_PREVIEW_QUEUE)
 pub fn on_live_timer() {
+    // キャレット編集中は engine が読みの左側しか持っていないので、preview を
+    // 出すと右側が消える。編集が終わる（Space / 末尾へ戻る）まで止める。
+    if !crate::engine::state::caret_tail_is_empty() {
+        stop_live_timer();
+        return;
+    }
     let Some(elapsed) = pass_debounce() else {
         return;
     };

@@ -129,6 +129,7 @@ impl super::TextServiceFactory_Impl {
                     let preview = entry.preview;
                     let apply = if let Ok(sess) = session_get() {
                         matches!(*sess, SessionState::Preedit { .. })
+                            && crate::engine::state::caret_tail_is_empty()
                     } else {
                         false
                     };
@@ -364,6 +365,28 @@ impl super::TextServiceFactory_Impl {
                 }
             }
         } // if !is_cancel
+
+        // キャレット編集中（← で読みの途中にいる）に、キャレットを意識しない
+        // アクションが来たら、退避している右側の読みを engine の末尾へ戻してから
+        // 処理する。Space / Enter / F6〜F10 / IME 切替 / Shift+← などは
+        // 読み全体を対象にするのが Google 日本語入力と同じ挙動。
+        let caret_aware = matches!(
+            action,
+            UserAction::Input(_)
+                | UserAction::InputRaw(_)
+                | UserAction::Backspace
+                | UserAction::Delete
+                | UserAction::CursorLeft
+                | UserAction::CursorRight
+                | UserAction::CursorHome
+                | UserAction::CursorEnd
+        );
+        if !caret_aware && !crate::engine::state::caret_tail_is_empty() {
+            crate::engine::state::caret_merge_into_engine(engine);
+            if let Ok(mut sess) = session_get() {
+                sess.sync_preedit_reading(&engine.hiragana_text());
+            }
+        }
 
         match action {
             UserAction::Input(c) => {

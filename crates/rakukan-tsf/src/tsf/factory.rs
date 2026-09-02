@@ -89,8 +89,8 @@ mod on_convert;
 mod on_input;
 use on_compose::{
     commit_text, commit_then_start_composition, end_composition, get_caret_pos_from_context,
-    update_caret_rect, update_composition, update_composition_block_parts,
-    update_composition_candidate_parts,
+    update_caret_rect, update_composition, update_composition_at,
+    update_composition_block_parts, update_composition_candidate_parts,
 };
 
 const ID_MENU_MODE_HIRAGANA: u32 = 1;
@@ -732,7 +732,9 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
         let has_preedit = engine_try_get_or_create()
             .ok()
             .and_then(|g| g.as_ref().map(|e| !e.preedit_is_empty()))
-            .unwrap_or(false);
+            .unwrap_or(false)
+            // キャレット編集中は engine が空でも右側に読みが退避している
+            || !crate::engine::state::caret_tail_is_empty();
 
         // 選択モード中はプリエディットありと同じ扱い（候補操作キーを消費するため）
         // AtomicBool でロックなし高速チェック

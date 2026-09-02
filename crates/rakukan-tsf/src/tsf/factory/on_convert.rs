@@ -15,8 +15,8 @@ use crate::tsf::candidate_window;
 
 use super::{
     commit_text, commit_then_start_composition, end_composition, engine_convert_sync_multi,
-    update_caret_rect, update_composition, update_composition_block_parts,
-    update_composition_candidate_parts,
+    update_caret_rect, update_composition, update_composition_at,
+    update_composition_block_parts, update_composition_candidate_parts,
 };
 
 #[inline]
@@ -1836,7 +1836,13 @@ impl super::TextServiceFactory_Impl {
                 candidate_window::hide();
             }
         }
+        let caret_editing = !crate::engine::state::caret_tail_is_empty();
         let consumed = engine.backspace();
+        if !consumed && caret_editing {
+            // キャレットが先頭（engine 側が空）: 消す文字は無いがキーは食う。
+            // 透過させるとアプリが composition の手前の文字を消してしまう。
+            return Ok(true);
+        }
         if consumed {
             engine.bg_reclaim();
             let preedit = engine.preedit_display();
@@ -1844,8 +1850,16 @@ impl super::TextServiceFactory_Impl {
             // 古いまま残る（実ログ: Preedit("いまわのきわ") のまま hira="いまは"）。
             // 削除後の読みに追随させ、空になったら Idle へ戻す。
             let hira = engine.hiragana_text();
+            let full_reading = crate::engine::state::caret_full_reading(engine);
             if let Ok(mut sess) = session_get() {
-                sess.sync_preedit_reading(&hira);
+                sess.sync_preedit_reading(&full_reading);
+            }
+            if caret_editing {
+                let (display, caret) = crate::engine::state::caret_display(engine);
+                drop(guard);
+                crate::tsf::suggestion::clear();
+                update_composition_at(ctx, tid, sink, display, caret)?;
+                return Ok(true);
             }
             diag::event(DiagEvent::Backspace {
                 preedit_after: preedit.clone(),

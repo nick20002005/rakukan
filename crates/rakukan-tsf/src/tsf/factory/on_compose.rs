@@ -119,6 +119,19 @@ pub(super) fn update_composition(
     sink: ITfCompositionSink,
     preedit: String,
 ) -> Result<()> {
+    update_composition_at(ctx, tid, sink, preedit, None)
+}
+
+/// [`update_composition`] のキャレット位置指定版。`caret` は composition 先頭からの
+/// UTF-16 単位のオフセットで、`None` なら末尾（従来どおり）。未確定中の
+/// キャレット編集（← で読みの途中へ戻る）で使う。
+pub(super) fn update_composition_at(
+    ctx: ITfContext,
+    tid: u32,
+    sink: ITfCompositionSink,
+    preedit: String,
+    caret: Option<i32>,
+) -> Result<()> {
     use windows::Win32::Foundation::E_FAIL;
 
     let existing = composition_clone()?;
@@ -205,9 +218,27 @@ pub(super) fn update_composition(
         let atom = display_attr::atom_input();
         set_display_attr_prop(&ctx, ec, &range, atom);
 
-        // プリエディット中もカーソルを末尾に置く（アプリのキャレット表示を正しくする）
+        // プリエディット中はカーソルを末尾に置く（アプリのキャレット表示を正しくする）。
+        // キャレット編集中は指定位置（読みの途中）に置く。
         if let Ok(cursor) = range.Clone() {
-            let _ = cursor.Collapse(ec, TF_ANCHOR_END);
+            match caret {
+                Some(off) => {
+                    let mut actual = 0i32;
+                    let _ = cursor.ShiftStart(
+                        ec,
+                        off,
+                        &mut actual,
+                        std::ptr::null::<windows::Win32::UI::TextServices::TF_HALTCOND>(),
+                    );
+                    let _ = cursor.Collapse(
+                        ec,
+                        windows::Win32::UI::TextServices::TF_ANCHOR_START,
+                    );
+                }
+                None => {
+                    let _ = cursor.Collapse(ec, TF_ANCHOR_END);
+                }
+            }
             let sel = TF_SELECTION {
                 range: std::mem::ManuallyDrop::new(Some(cursor)),
                 style: TF_SELECTIONSTYLE {
