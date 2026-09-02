@@ -2677,6 +2677,52 @@ struct ModeStore {
     dm_modes: HashMap<usize, InputMode>,   // DM ptr → mode
     hwnd_modes: HashMap<usize, InputMode>, // HWND → mode（DM 再作成時フォールバック）
     dm_to_hwnd: HashMap<usize, usize>,     // DM ptr → HWND（保存時の HWND 特定用）
+    /// このプロセスで最初にフォーカスを得た DM（アプリ本体の文書とみなす）。
+    /// `input.text_field_mode` の対象アプリでは、これ以外の新しい DM を
+    /// 「文字入力欄」として扱う（Photoshop の文字ツールは編集開始で DM を作り、
+    /// 終了で破棄する）。
+    base_dm: usize,
+}
+
+/// このプロセスの exe 名（小文字）。`input.text_field_mode` のキー照合用。
+fn current_exe_name_lower() -> &'static str {
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase()))
+            .unwrap_or_default()
+    })
+}
+
+/// `input.text_field_mode` にこのプロセスの exe が載っていれば、そのモード。
+fn app_text_field_mode(cfg: &super::config::AppConfig) -> Option<InputMode> {
+    use super::config::DefaultInputMode;
+    if cfg.input.text_field_mode.is_empty() {
+        return None;
+    }
+    let exe = current_exe_name_lower();
+    cfg.input
+        .text_field_mode
+        .iter()
+        .find(|(k, _)| k.to_lowercase() == exe)
+        .map(|(_, m)| match m {
+            DefaultInputMode::Hiragana => InputMode::Hiragana,
+            DefaultInputMode::Alphanumeric => InputMode::Alphanumeric,
+        })
+}
+
+/// 「文字入力欄が開いた」判定（純粋関数）。基準 DM 以外の**初見の** DM だけが対象。
+fn text_field_mode_for(
+    next_dm: usize,
+    base_dm: usize,
+    known: bool,
+    configured: Option<InputMode>,
+) -> Option<InputMode> {
+    if known || next_dm == base_dm {
+        return None;
+    }
+    configured
 }
 
 static DOC_MODE_STORE: LazyLock<Mutex<ModeStore>> = LazyLock::new(|| {
@@ -2684,6 +2730,7 @@ static DOC_MODE_STORE: LazyLock<Mutex<ModeStore>> = LazyLock::new(|| {
         dm_modes: HashMap::new(),
         hwnd_modes: HashMap::new(),
         dm_to_hwnd: HashMap::new(),
+        base_dm: 0,
     })
 });
 
@@ -2739,6 +2786,26 @@ pub fn doc_mode_on_focus_change(
     // DM→HWND マッピングを更新（フォーカスが来るたびに記録）
     if next_hwnd != 0 {
         store.dm_to_hwnd.insert(next_dm_ptr, next_hwnd);
+    }
+    // 最初に見た DM をアプリ本体の文書とみなす
+    if store.base_dm == 0 {
+        store.base_dm = next_dm_ptr;
+    }
+    // 対象アプリの「文字入力欄」（基準 DM 以外の初見の DM）は設定のモードで始める。
+    // HWND 経由の復元より先に判定する（文字入力欄は本体と同じ HWND を持つことが
+    // 多く、そちらを引くと本体の直接入力が復元されてしまう）。
+    if let Some(m) = text_field_mode_for(
+        next_dm_ptr,
+        store.base_dm,
+        store.dm_modes.contains_key(&next_dm_ptr),
+        app_text_field_mode(&cfg),
+    ) {
+        tracing::debug!(
+            "doc_mode: text field dm={next_dm_ptr:#x} (base={:#x}) → {m:?} (input.text_field_mode)",
+            store.base_dm
+        );
+        store.dm_modes.insert(next_dm_ptr, m);
+        return Some(m);
     }
 
     // 初回フォーカス時のデフォルトモードを決定
@@ -2910,6 +2977,19 @@ mod tests {
         let mut s = SessionState::Idle;
         s.set_block_selecting(blocks, reading, 0, 0);
         s
+    }
+
+    #[test]
+    fn text_field_mode_only_for_new_non_base_dm() {
+        let h = Some(InputMode::Hiragana);
+        // 基準 DM 自身には効かない
+        assert_eq!(text_field_mode_for(0x10, 0x10, false, h), None);
+        // 初見の別 DM → 設定モード
+        assert_eq!(text_field_mode_for(0x20, 0x10, false, h), Some(InputMode::Hiragana));
+        // 既知の DM は覚えているモードに任せる
+        assert_eq!(text_field_mode_for(0x20, 0x10, true, h), None);
+        // 設定が無ければ何もしない
+        assert_eq!(text_field_mode_for(0x20, 0x10, false, None), None);
     }
 
     #[test]

@@ -249,6 +249,18 @@ pub struct InputConfig {
     /// Phase 2 以降: 独立した learn_history に記録され user_dict.toml には書かない。
     #[serde(default = "default_auto_learn")]
     pub auto_learn: bool,
+    /// アプリごとの「文字入力欄が開いたときの入力モード」。キーは exe 名
+    /// （大文字小文字は区別しない）。Photoshop のように文字ツールでクリック
+    /// すると入力用の文書（DocumentManager）が新しく作られるアプリで、その
+    /// 文書に初めてフォーカスが来たときのモードを決める。抜けてキャンバス側の
+    /// 文書へ戻ると、そちらが覚えているモード（通常は直接入力）に戻る。
+    ///
+    /// ```toml
+    /// [input.text_field_mode]
+    /// "Photoshop.exe" = "hiragana"
+    /// ```
+    #[serde(default)]
+    pub text_field_mode: std::collections::HashMap<String, DefaultInputMode>,
 }
 
 fn default_auto_learn() -> bool {
@@ -266,6 +278,7 @@ impl Default for InputConfig {
             digit_separator_auto: default_digit_separator_auto(),
             digit_candidates_order: default_digit_candidates_order(),
             auto_learn: default_auto_learn(),
+            text_field_mode: std::collections::HashMap::new(),
         }
     }
 }
@@ -619,6 +632,11 @@ symbol_width = "fullwidth"
 digit_separator_auto = true
 # 数字だけの reading に対して提示する候補種別と順序
 digit_candidates_order = ["arabic", "fullwidth", "positional", "per_digit", "daiji"]
+# アプリごとの「文字入力欄が開いたときのモード」（exe 名 → hiragana / alphanumeric）。
+# Photoshop の文字ツールのように入力用の文書が新しく作られるアプリで、
+# その文書に入ったら日本語、抜けたら元のモードに戻す。
+# [input.text_field_mode]
+# "Photoshop.exe" = "hiragana"
 # 確定時に学習するか (デフォルト: true)。
 # false にすると学習を完全に抑止する。
 auto_learn = true
