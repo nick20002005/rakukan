@@ -249,6 +249,32 @@ pub(super) fn update_composition_at(
             let _ = ctx.SetSelection(ec, &[sel]);
         }
 
+        // 打鍵のたびにキャレット矩形を更新する。
+        // 予測ウィンドウ（`suggestion::show`）は `caret_rect_get()` を見るが、
+        // 従来は Space 押下 / commit 経路でしか更新していなかったため、
+        // そのプロセスで最初の入力では初期値 (0,0,0,0) のままになり、
+        // ウィンドウがプライマリモニタの左上に飛んでいた。
+        if let Ok(view) = ctx.GetActiveView() {
+            use windows::Win32::Foundation::RECT;
+            let mut rect = RECT::default();
+            let mut clipped = windows::Win32::Foundation::BOOL(0);
+            match view.GetTextExt(ec, &range, &mut rect, &mut clipped) {
+                Ok(()) => {
+                    // 全ゼロは「取れなかった」と同義（成功を返しつつ空矩形を
+                    // 寄こすアプリがある）。古い正しい値を壊さないよう捨てる。
+                    if rect.bottom != 0 || rect.left != 0 {
+                        caret_rect_set(rect);
+                        crate::tsf::candidate_window::reposition(rect.left, rect.bottom);
+                    } else {
+                        tracing::debug!("update_composition: GetTextExt returned empty rect");
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("update_composition: GetTextExt failed: {e}");
+                }
+            }
+        }
+
         Ok(())
     });
     unsafe {
