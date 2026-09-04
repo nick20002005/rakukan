@@ -1,9 +1,11 @@
 using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Input;
 using System.Collections.ObjectModel;
 using System.IO;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Threading;
 using Windows.Graphics;
 
@@ -25,8 +27,9 @@ public sealed partial class MainWindow : Window
     {
         InitializeComponent();
         SetWindowIcon();
-        AppWindow.Resize(new SizeInt32(1080, 760));
+        ResizeToDefaultSize();
         AppWindow.Closing += AppWindow_Closing;
+        EnableWheelScrollOverInputControls();
 
         var ver = Assembly.GetEntryAssembly()?.GetName().Version;
         VersionText.Text = ver is { } v ? $"rakukan v{v.Major}.{v.Minor}.{v.Build}" : "rakukan";
@@ -728,4 +731,56 @@ public sealed partial class MainWindow : Window
         }
     }
 
+
+    // 設定ページはカード外の余白が広く、ScrollViewer の Background が未設定だと
+    // その余白がヒットテストされずホイールがどこにも届かない (XAML 側で Transparent を指定済み)。
+    // さらに ComboBox / NumberBox はポインタが上にあるとホイールを自分で消費してしまうため、
+    // Handled を解除して親の ScrollViewer までバブルさせる。
+    private void EnableWheelScrollOverInputControls()
+    {
+        Control[] wheelConsumingControls =
+        {
+            LogLevelCombo, GpuBackendCombo, ModelVariantCombo,
+            NGpuLayersBox, MainGpuBox, NumCandidatesBox, ConversionBeamSizeBox,
+            KeyboardLayoutCombo, DefaultModeCombo, DigitWidthCombo,
+            AlphaWidthCombo, SymbolWidthCombo, KeymapPresetCombo,
+            DebounceMsBox, BeamSizeBox, MinCharsBox,
+        };
+
+        foreach (var control in wheelConsumingControls)
+        {
+            control.AddHandler(
+                UIElement.PointerWheelChangedEvent,
+                new PointerEventHandler(OnInputControlPointerWheelChanged),
+                handledEventsToo: true);
+        }
+    }
+
+    private static void OnInputControlPointerWheelChanged(object sender, PointerRoutedEventArgs e)
+    {
+        // ドロップダウンを開いている間は候補リスト側のスクロールを優先する。
+        if (sender is ComboBox { IsDropDownOpen: true })
+        {
+            return;
+        }
+
+        e.Handled = false;
+    }
+
+    [DllImport("user32.dll")]
+    private static extern uint GetDpiForWindow(IntPtr hwnd);
+
+    // AppWindow.Resize は物理ピクセル指定。app.manifest で PerMonitorV2 を宣言したため、
+    // 表示先のスケーリングに合わせて拡大しないと高 DPI 環境で中身が収まらなくなる。
+    private void ResizeToDefaultSize()
+    {
+        const int baseWidth = 1080;
+        const int baseHeight = 760;
+
+        var hwnd = WinRT.Interop.WindowNative.GetWindowHandle(this);
+        var dpi = GetDpiForWindow(hwnd);
+        var scale = dpi == 0 ? 1.0 : dpi / 96.0;
+
+        AppWindow.Resize(new SizeInt32((int)(baseWidth * scale), (int)(baseHeight * scale)));
+    }
 }

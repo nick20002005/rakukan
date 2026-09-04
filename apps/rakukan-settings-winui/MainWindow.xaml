@@ -69,7 +69,7 @@
             </NavigationView.MenuItems>
 
             <Grid>
-                <ScrollViewer x:Name="GeneralPage">
+                <ScrollViewer x:Name="GeneralPage" Background="Transparent">
                     <StackPanel Margin="32,24,32,32" Spacing="20">
                         <StackPanel Spacing="4">
                             <TextBlock Style="{ThemeResource TitleTextBlockStyle}" Text="基本設定" />
@@ -171,7 +171,7 @@
                     </StackPanel>
                 </ScrollViewer>
 
-                <ScrollViewer x:Name="InputPage" Visibility="Collapsed">
+                <ScrollViewer x:Name="InputPage" Background="Transparent" Visibility="Collapsed">
                     <StackPanel Margin="32,24,32,32" Spacing="20">
                         <StackPanel Spacing="4">
                             <TextBlock Style="{ThemeResource TitleTextBlockStyle}" Text="入力設定" />
@@ -250,7 +250,7 @@
                     </StackPanel>
                 </ScrollViewer>
 
-                <ScrollViewer x:Name="KeysPage" Visibility="Collapsed">
+                <ScrollViewer x:Name="KeysPage" Background="Transparent" Visibility="Collapsed">
                     <StackPanel Margin="32,24,32,32" Spacing="20">
                         <StackPanel Spacing="4">
                             <TextBlock Style="{ThemeResource TitleTextBlockStyle}" Text="キー設定" />
@@ -341,7 +341,7 @@
                     </StackPanel>
                 </ScrollViewer>
 
-                <ScrollViewer x:Name="LivePage" Visibility="Collapsed">
+                <ScrollViewer x:Name="LivePage" Background="Transparent" Visibility="Collapsed">
                     <StackPanel Margin="32,24,32,32" Spacing="20">
                         <StackPanel Spacing="4">
                             <TextBlock Style="{ThemeResource TitleTextBlockStyle}" Text="ライブ変換" />
@@ -377,7 +377,7 @@
                     </StackPanel>
                 </ScrollViewer>
 
-                <ScrollViewer x:Name="UserDictPage" Visibility="Collapsed">
+                <ScrollViewer x:Name="UserDictPage" Background="Transparent" Visibility="Collapsed">
                     <StackPanel Margin="32,24,32,32" Spacing="20">
                         <StackPanel Spacing="4">
                             <TextBlock Style="{ThemeResource TitleTextBlockStyle}" Text="ユーザー辞書" />
@@ -424,7 +424,7 @@
                     </StackPanel>
                 </ScrollViewer>
 
-                <ScrollViewer x:Name="AdvancedPage" Visibility="Collapsed">
+                <ScrollViewer x:Name="AdvancedPage" Background="Transparent" Visibility="Collapsed">
                     <StackPanel Margin="32,24,32,32" Spacing="20">
                         <StackPanel Spacing="4">
                             <TextBlock Style="{ThemeResource TitleTextBlockStyle}" Text="補足" />
