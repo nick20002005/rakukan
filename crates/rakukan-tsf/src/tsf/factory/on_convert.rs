@@ -2064,57 +2064,67 @@ const LIVE_COMMIT_RESTART_CATCHUP_MS: u64 = 1_000;
 /// 押すと未変換のかながそのまま確定される（2026-09-01: `seedreamのペースはどう`
 /// と打って `seedreamnoぺーすはどう` が確定した）。
 ///
-/// 現在の読みに対する変換結果が既にあるなら何もしない。無い場合は、bg が走って
-/// いればその完了を待ち、走っていなければその読みで bg を起動してから待つ
-/// （打鍵が速いと on_live_timer が FIRED しないまま Enter が来るため、bg=done の
-/// まま「一度も変換されていない読み」が確定していた）。それでも取れなければ
-/// preview はそのまま返し、`true`
-/// (=未収束) を返す。未収束の preview を学習に流すと、同じ読みで同じ壊れ方が
-/// 再生産されるため、呼び出し側は学習を見送ること。
+/// 現在の読みに対する変換結果が無い場合だけ短時間待って拾い直し、結果が既に
+/// ある場合も含めて、必ず `merge_candidates_for_reading` を通した値を返す。
+/// 「結果があるなら preview はそれを反映済み」とは限らないためで、ライブ
+/// タイマーは `pass_debounce()` で最終打鍵から `debounce_ms` 経過するまで
+/// 発火せず、その猶予の内に Enter が来ると伸ばしたままの preview が残る
+/// （`RequestEditSession` に失敗して `LIVE_PREVIEW_QUEUE` へ積んだ場合も同じ）。
+/// 待つ相手は、bg が走っていればその完了、走っていなければその読みで起動した
+/// bg（打鍵が速いと on_live_timer が FIRED しないまま Enter が来るため、bg=done の
+/// まま「一度も変換されていない読み」が確定していた）。
+///
+/// 待っても取れなければ preview はそのまま返し、`true` (=未収束) を返す。
+/// 未収束の preview を学習に流すと、同じ読みで同じ壊れ方が再生産されるため、
+/// 呼び出し側は学習を見送ること。
 fn catch_up_live_preview(
     engine: &mut crate::engine::state::DynEngine,
     reading: &str,
     preview: String,
 ) -> (String, bool) {
-    if engine.bg_peek_top_candidate(reading).is_some() {
-        return (preview, false);
-    }
-    // bg が running でない ＝ 現在の読みは一度も変換に渡されていない。打鍵が速いと
-    // on_live_timer が FIRED しないまま Enter が来るため（2026-09-01: 1.2 秒間
-    // preview が更新されず「これ、漫画ではコマを分けてひょうげんしているけど」が
-    // 確定した）、ここで自分から bg を起動して待つ。
-    let restarted = if engine.bg_status() == "running" {
-        false
-    } else {
-        let Some(n_cands) = crate::engine::state::live_bg_start_n_cands(reading) else {
-            tracing::info!("[Live] commit catch-up: bg not startable for {:?}", reading);
-            return (preview, true);
-        };
-        if !engine.bg_start(n_cands) {
-            tracing::info!(
-                "[Live] commit catch-up: bg_start refused for {:?} (status={})",
-                reading,
-                engine.bg_status()
-            );
-            return (preview, true);
+    let top = match engine.bg_peek_top_candidate(reading) {
+        Some(top) => top,
+        None => {
+            // bg が running でない ＝ 現在の読みは一度も変換に渡されていない。打鍵が
+            // 速いと on_live_timer が FIRED しないまま Enter が来るため（2026-09-01:
+            // 1.2 秒間 preview が更新されず「これ、漫画ではコマを分けてひょうげんして
+            // いるけど」が確定した）、ここで自分から bg を起動して待つ。
+            let restarted = if engine.bg_status() == "running" {
+                false
+            } else {
+                let Some(n_cands) = crate::engine::state::live_bg_start_n_cands(reading) else {
+                    tracing::info!("[Live] commit catch-up: bg not startable for {:?}", reading);
+                    return (preview, true);
+                };
+                if !engine.bg_start(n_cands) {
+                    tracing::info!(
+                        "[Live] commit catch-up: bg_start refused for {:?} (status={})",
+                        reading,
+                        engine.bg_status()
+                    );
+                    return (preview, true);
+                }
+                tracing::info!("[Live] commit catch-up: started bg for {:?}", reading);
+                true
+            };
+            // 起動し直した場合は先頭から変換するので待ち上限を伸ばす。
+            let budget = if restarted {
+                LIVE_COMMIT_RESTART_CATCHUP_MS
+            } else {
+                LIVE_COMMIT_CATCHUP_MS
+            };
+            let completed = engine.bg_wait_ms(budget);
+            let Some(top) = engine.bg_peek_top_candidate(reading) else {
+                tracing::info!(
+                    "[Live] commit catch-up: no result for {:?} (completed={} budget={}ms)",
+                    reading,
+                    completed,
+                    budget
+                );
+                return (preview, true);
+            };
+            top
         }
-        tracing::info!("[Live] commit catch-up: started bg for {:?}", reading);
-        true
-    };
-    let budget = if restarted {
-        LIVE_COMMIT_RESTART_CATCHUP_MS
-    } else {
-        LIVE_COMMIT_CATCHUP_MS
-    };
-    let completed = engine.bg_wait_ms(budget);
-    let Some(top) = engine.bg_peek_top_candidate(reading) else {
-        tracing::info!(
-            "[Live] commit catch-up: no result for {:?} (completed={} budget={}ms)",
-            reading,
-            completed,
-            budget
-        );
-        return (preview, true);
     };
     let merged = engine
         .merge_candidates_for_reading(reading, vec![top], 40)
@@ -2122,7 +2132,9 @@ fn catch_up_live_preview(
         .find(|c| !c.is_empty());
     match merged {
         Some(merged) => {
-            tracing::info!("[Live] commit catch-up: {:?} → {:?}", preview, merged);
+            if merged != preview {
+                tracing::info!("[Live] commit catch-up: {:?} → {:?}", preview, merged);
+            }
             (merged, false)
         }
         None => (preview, true),
