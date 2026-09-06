@@ -15,8 +15,9 @@
 //!
 //! - 一致する語は **[`MIN_PREFIX_CHARS`] 文字以上**に限る
 //! - 一致は**最長のものだけ**を使う
-//! - 候補は先頭に置かない（[`INSERT_AT`]）。先頭候補はライブ変換の preview に
-//!   そのまま出るため、打鍵途中に誤爆した表記が見え続けることになる
+//! - 候補は原則先頭に置かない（[`INSERT_AT`]）。先頭候補はライブ変換の preview に
+//!   そのまま出るため、打鍵途中に誤爆した表記が見え続けることになる。
+//!   残りが助詞・接尾辞のとき（[`TOP_INSERT_REMAINDERS`]）だけは先頭に置く
 //! - 完全一致は既存の経路（`merge_candidates_for_reading`）の担当なので除く
 
 use crate::kanji::KanaKanjiConverter;
@@ -33,8 +34,36 @@ pub const MIN_PREFIX_CHARS: usize = 3;
 /// 0 にするとライブ変換の preview を奪う。末尾だと 1 ページ目に出ないことがある。
 const INSERT_AT: usize = 2;
 
+/// この「残りの読み」なら候補を**先頭**に置く。
+///
+/// [`INSERT_AT`] は打鍵途中の誤爆が preview に居座るのを避けるための位置だが、
+/// 副作用として「登録語＋助詞」が常に 3 番目に沈む。`なかたにいく → 中谷育` を
+/// 登録していても `なかたにいくが` の preview は LLM の `な方にいくが` のままで、
+/// 一度手で選んで学習させるまで直らない（2026-09-06 に実害）。
+///
+/// 登録語の直後が助詞・接尾辞なら「登録語＋それ」以外の読み方はまず無いので、
+/// preview を渡してよい。ここに載っていない残りは従来どおり [`INSERT_AT`] に置く
+/// ——`はんぷ → 頒布` を登録した状態の `はんぷく`（反復）の `く` のように、
+/// 残りを足すと語の途中でしかない例があるため。
+const TOP_INSERT_REMAINDERS: &[&str] = &[
+    // 助詞
+    "が", "を", "は", "に", "へ", "と", "も", "の", "や", "か", "ね", "よ", "で", "から", "まで",
+    "より", "では", "には", "とは", "にも", "でも", "との", "への", "なら", "って",
+    // 接尾辞（人名の後ろに付きやすいもの）
+    "さん", "くん", "ちゃん", "さま", "たち",
+];
+
 /// 残りの読みから何件まで組み合わせるか。
 const MAX_REMAINDER_CANDIDATES: usize = 2;
+
+/// 差し込み位置を決める。残りが助詞・接尾辞なら先頭、それ以外は [`INSERT_AT`]。
+fn insert_position(remainder: &str, out_len: usize) -> usize {
+    if TOP_INSERT_REMAINDERS.contains(&remainder) {
+        0
+    } else {
+        INSERT_AT.min(out_len)
+    }
+}
 
 /// `語 + 残りの変換` を作って `out` に差し込む。
 ///
@@ -89,7 +118,7 @@ pub fn insert_candidates(
         remainder,
         built
     );
-    let at = INSERT_AT.min(out.len());
+    let at = insert_position(remainder, out.len());
     for (i, c) in built.into_iter().enumerate() {
         out.insert(at + i, c);
     }
@@ -103,9 +132,31 @@ mod tests {
     fn insert_at_keeps_top_candidate() {
         let mut out = vec!["トラブルと".to_string(), "とらぶると".to_string()];
         // convert を通さず差し込み位置だけを確かめる
-        let at = INSERT_AT.min(out.len());
-        out.insert(at, "To LOVEると".to_string());
+        let at = insert_position("わめる", out.len());
+        out.insert(at, "美樹わめる".to_string());
         assert_eq!(out[0], "トラブルと");
-        assert_eq!(out[2], "To LOVEると");
+        assert_eq!(out[2], "美樹わめる");
+    }
+
+    #[test]
+    fn particle_remainder_takes_the_top_slot() {
+        // 「なかたにいくが」の preview が LLM の誤変換のままにならないこと
+        let mut out = vec!["な方にいくが".to_string(), "な方に行くが".to_string()];
+        let at = insert_position("が", out.len());
+        out.insert(at, "中谷育が".to_string());
+        assert_eq!(out[0], "中谷育が");
+    }
+
+    #[test]
+    fn non_particle_remainder_stays_below_the_top() {
+        // 「はんぷ → 頒布」を登録した状態の「はんぷく」（反復）で preview を奪わない
+        assert_eq!(insert_position("く", 5), INSERT_AT);
+        assert_eq!(insert_position("なかで", 5), INSERT_AT);
+    }
+
+    #[test]
+    fn insert_position_clamps_to_short_lists() {
+        assert_eq!(insert_position("わめる", 1), 1);
+        assert_eq!(insert_position("わめる", 0), 0);
     }
 }
