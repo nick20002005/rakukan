@@ -804,8 +804,27 @@ impl super::TextServiceFactory_Impl {
             }
             const BLOCK_DICT_LIMIT: usize = 9; // 1ブロックあたり最大候補数
             let llm_limit_b = crate::engine::state::get_num_candidates();
+
+            // ライブ変換の preview があれば、ブロック単独の再変換より優先する。
+            //
+            // 🔴 ブロックごとに読みだけで引き直すと **文全体の文脈が消える**。
+            //    `いや、なになになに` は preview では `いや、なになになに` と
+            //    正しく出ているのに、`いや` を 2 文字だけで引くと辞書順の
+            //    `嫌` が第 1 候補になり、そのまま Enter すると学習まで載って
+            //    以後ずっと `嫌、` になる（2026-09-07 に実害）。
+            //    preview は画面に出ている文字列そのものなので、Space は
+            //    「見えているものを固定して文節選択に入る」動きになる。
+            let preview_blocks = space_live_candidate.as_ref().and_then(|candidate| {
+                crate::engine::text_util::split_preview_by_punctuation(&preedit, &candidate.text)
+            });
+            tracing::debug!(
+                "on_convert[block]: live preview seed={:?} preedit={:?}",
+                preview_blocks,
+                preedit
+            );
+
             let mut blocks: Vec<ConversionBlock> = Vec::new();
-            for (reading, trailing_punct) in blocks_raw {
+            for (block_index, (reading, trailing_punct)) in blocks_raw.into_iter().enumerate() {
                 if reading.is_empty() {
                     // 区読点のみのブロック（文頭の区読点など）は候補なしで残す
                     blocks.push(ConversionBlock {
@@ -817,15 +836,27 @@ impl super::TextServiceFactory_Impl {
                     });
                     continue;
                 }
-                // engine のプリエディットをこのブロックの読みに差し替えて sync 変換
-                engine.force_preedit(reading.clone());
-                let candidates = engine_convert_sync_multi(
-                    engine,
-                    llm_limit_b,
-                    BLOCK_DICT_LIMIT,
-                    &reading,
-                    &reading,
-                );
+                // preview があればそれを第 1 候補にし、無い時だけ engine の
+                // プリエディットをこのブロックの読みに差し替えて sync 変換する。
+                let preview_top = preview_blocks
+                    .as_ref()
+                    .and_then(|v| v.get(block_index))
+                    .filter(|s| !s.is_empty())
+                    .cloned();
+                let seeded_from_preview = preview_top.is_some();
+                let candidates = match preview_top {
+                    Some(top) => vec![top],
+                    None => {
+                        engine.force_preedit(reading.clone());
+                        engine_convert_sync_multi(
+                            engine,
+                            llm_limit_b,
+                            BLOCK_DICT_LIMIT,
+                            &reading,
+                            &reading,
+                        )
+                    }
+                };
 
                 // 文節分割: 変換結果（第 1 候補）を文字種で区切り、読みを逆算する。
                 //
@@ -863,7 +894,10 @@ impl super::TextServiceFactory_Impl {
                         trailing_punct,
                         candidates,
                         selected: 0,
-                        expanded: true,
+                        // preview 由来のときは候補が 1 件しか無いので、Space で
+                        // 遅延展開させる（expanded=true にすると Space が
+                        // 1 件の中を回るだけになり、候補が出せなくなる）。
+                        expanded: !seeded_from_preview,
                     }),
                 }
             }
