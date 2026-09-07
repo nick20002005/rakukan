@@ -1749,6 +1749,47 @@ fn is_dict_like_preview_candidate(candidates: &[String], reading: &str, preview:
     preview != reading && candidates.iter().any(|candidate| candidate == preview)
 }
 
+/// bg の結果が現在の読みに追いついていないので、この tick は preview を
+/// 更新せず見送るべきかを判定する。
+///
+/// 🔴 `bg_status == "done"` は「**何かの** 変換が終わった」としか言っていない。
+///    bg 変換は 1 本しか走らないので、打鍵が速いと done の中身は数文字前の
+///    読みの結果になる。`bg_peek_top_candidate(現在の読み)` はキー不一致で
+///    `None` を返し、そのまま辞書だけのフォールバックに落ちる。
+///    `もうこうれいだよ` のような助動詞込みの読みは辞書に無いので空振りし、
+///    **読みそのものが preview になる**（＝変換が消えたように見える）。
+///
+/// 🔴 さらに悪いことに、この経路は現在の読みでの変換を仕掛け直さない。次の
+///    tick でも `bg_status` は古いキーのまま `done` なので同じ判断を繰り返し、
+///    打鍵を止めても復帰しない。Backspace で読みが縮むと走っている変換と必ず
+///    キーがズレるため、「typo を消して打ち直すと以後ずっと生かな」になる
+///    （2026-09-08 のログ実測: 読み 8 文字以上で preview が生かなになった 74 回は
+///    74 回とも直前が `bg=done`。`running` 由来は 0 件）。
+///
+/// 判定は「辞書マージが読み以外を 1 件も出せなかった」＝実候補ゼロ。
+/// `has_immediate_live_preview_candidate` と同じ述語を、取得済みの候補列に
+/// 対して適用している。ユーザー辞書や学習履歴が「ひらがなのまま」を指示して
+/// いる場合は文字種候補（カタカナ）が並ぶので実候補ありと判定され、ここには
+/// 落ちてこない。
+fn should_defer_stale_bg_preview(
+    used_bg_candidate: bool,
+    bg_status: &str,
+    dict_like_candidates: &[String],
+    reading: &str,
+) -> bool {
+    if used_bg_candidate {
+        return false;
+    }
+    // running は既存の待機経路（`ensure_bg_running`）が面倒を見る。
+    // ここで拾うのは「done なのに中身が古い読み」だけ。
+    if bg_status != "done" {
+        return false;
+    }
+    !dict_like_candidates
+        .iter()
+        .any(|candidate| !candidate.is_empty() && candidate != reading)
+}
+
 /// bg ワーカーが done で結果取得可能なら `true`、そうでなければ caller は return。
 ///
 /// - bg=done: そのまま続行
@@ -1864,6 +1905,24 @@ fn fetch_preview() -> Option<LivePreview> {
                 .cloned()
                 .find(|s| !s.is_empty())
         };
+        if should_defer_stale_bg_preview(
+            used_bg_candidate,
+            bg_status,
+            &dict_like_candidates,
+            &reading,
+        ) {
+            // 今の読みで変換を仕掛け直す。`bg_start` は先頭で古い `Done` を
+            // 回収するので、これが唯一の復帰経路になる。preview は更新せず
+            // 前回のものを残し、タイマーは回したまま次の発火に委ねる。
+            let restarted = crate::engine::state::start_live_bg_if_ready(eng, &reading);
+            tracing::info!(
+                "[Live] on_live_timer: stale bg result reading={:?} → 再変換を要求 restarted={}",
+                reading,
+                restarted
+            );
+            return None;
+        }
+
         let keep_short_preview = preview
             .as_ref()
             .is_some_and(|p| is_dict_like_preview_candidate(&dict_like_candidates, &reading, p));
@@ -2166,6 +2225,68 @@ pub fn on_live_timer() {
 #[cfg(test)]
 mod tests {
     use super::guard_preview_shrink;
+    use super::should_defer_stale_bg_preview;
+
+    #[test]
+    fn defer_when_bg_done_but_stale_and_no_real_candidate() {
+        // done なのにキーが古い → 辞書は読みしか返せない。ここで preview を
+        // 更新すると生かなに落ちて二度と戻らない。
+        assert!(should_defer_stale_bg_preview(
+            false,
+            "done",
+            &["もうこうれいだよ".to_string()],
+            "もうこうれいだよ",
+        ));
+    }
+
+    #[test]
+    fn no_defer_when_bg_candidate_matched_current_reading() {
+        assert!(!should_defer_stale_bg_preview(
+            true,
+            "done",
+            &["もうこうれいだよ".to_string()],
+            "もうこうれいだよ",
+        ));
+    }
+
+    #[test]
+    fn no_defer_while_bg_still_running() {
+        // running は ensure_bg_running の待機経路が担当する
+        assert!(!should_defer_stale_bg_preview(
+            false,
+            "running",
+            &["もうこうれいだよ".to_string()],
+            "もうこうれいだよ",
+        ));
+        assert!(!should_defer_stale_bg_preview(
+            false,
+            "idle",
+            &["もうこうれいだよ".to_string()],
+            "もうこうれいだよ",
+        ));
+    }
+
+    #[test]
+    fn no_defer_when_dict_has_a_real_candidate() {
+        assert!(!should_defer_stale_bg_preview(
+            false,
+            "done",
+            &["恒例".to_string(), "こうれい".to_string()],
+            "こうれい",
+        ));
+    }
+
+    #[test]
+    fn no_defer_when_user_wants_kana_and_char_type_candidates_follow() {
+        // ユーザー辞書／学習履歴が「ひらがなのまま」を指示している場合は
+        // 文字種候補が並ぶので実候補ありと判定される。
+        assert!(!should_defer_stale_bg_preview(
+            false,
+            "done",
+            &["なんか".to_string(), "ナンカ".to_string()],
+            "なんか",
+        ));
+    }
 
     #[test]
     fn guard_preview_shrink_keeps_short_symbol_candidate() {
