@@ -303,6 +303,26 @@ const N_INSERTION_MAX_READINGS: usize = 4;
 /// 代替読みから拾う候補の上限。
 const N_INSERTION_MAX_CANDIDATES: usize = 3;
 
+/// 短文予測を**変換候補リストへ差し込む**ときに要求する、打った読みの被覆率。
+///
+/// 予測ウィンドウ（[`RakunEngine::predict`]）とは別枠の、もっと厳しい条件。
+/// `lookup_learn_prefix_keyed` は「前方一致するより長いキー」を全部拾うので、
+/// 打った読みが 2 文字でも 12 文字のフレーズが引ける。それが merge の §6 で
+/// 実候補の直後に固定挿入されると、上位 2 枠が読みと無関係な過去の長文で
+/// 埋まる（実害 2026-09-08: `はじ` → `["恥ぢ", "初めてお邪魔するもの",
+/// "初めて見る場合は全画面で生成結果を", "恥じ", …]` で「端」が 8 番目まで
+/// 沈んだ。`がめ` → `["ガメ", "画面に天井が入り", "画面いっぱいのあるかな
+/// シャドウ", …]` も同じ）。
+///
+/// 予測が「補完」として意味を持つのは読みの大半を打ち終えてからなので、
+/// キーの一定割合を打っていない予測は変換リストへは入れない。予測ウィンドウ
+/// 側は従来どおり全部出す（あそこは前方一致で長文を出すための場所）。
+const PREDICTION_MIN_READING_COVERAGE: f64 = 1.0 / 3.0;
+
+/// 被覆率で絞る前に引いておく倍率。スコア上位が偶然すべて長文でも、条件を
+/// 満たす予測が下位にあれば拾えるようにする。
+const PREDICTION_OVERFETCH: usize = 4;
+
 /// な行かなを「ん + 母音」に開いた代替読みを列挙する。
 ///
 /// ローマ字入力では `n` + 母音 が な行になるので、「げんいん」を出すには
@@ -1352,13 +1372,30 @@ impl RakunEngine {
         // 短文予測（Google 日本語入力の「予測候補」相当）。
         // 読みが前方一致する学習済みフレーズを引く。読みが短いうちは候補が
         // 発散するので `prediction_min_reading_chars` 未満では引かない。
+        //
+        // さらに `PREDICTION_MIN_READING_COVERAGE` で「打った読みがキーの何割か」
+        // を見る。スコア上位が全部長文だと絞った後に 0 件になるので、上限より
+        // 多めに引いてから絞り、最後に `prediction_max_candidates` へ丸める。
         let prediction_cands: Vec<(String, String)> = if self.config.prediction_enabled
             && hiragana.chars().count() >= self.config.prediction_min_reading_chars
         {
+            let typed_chars = hiragana.chars().count();
             self.dict_store
                 .as_ref()
                 .map(|d| {
-                    d.lookup_learn_prefix_keyed(hiragana, self.config.prediction_max_candidates)
+                    d.lookup_learn_prefix_keyed(
+                        hiragana,
+                        self.config.prediction_max_candidates * PREDICTION_OVERFETCH,
+                    )
+                    .into_iter()
+                    .filter(|(key, _)| {
+                        let key_chars = key.chars().count();
+                        key_chars > 0
+                            && (typed_chars as f64) / (key_chars as f64)
+                                >= PREDICTION_MIN_READING_COVERAGE
+                    })
+                    .take(self.config.prediction_max_candidates)
+                    .collect()
                 })
                 .unwrap_or_default()
         } else {
@@ -2666,6 +2703,53 @@ priority = "low"
                 .map(String::as_str),
             Some("また通常"),
             "ライブ変換の preview が予測を拾ってはいけない: {merged:?}"
+        );
+    }
+
+    #[test]
+    fn short_reading_does_not_pull_long_predictions_into_conversion() {
+        // 2 文字の読みから 12 文字のフレーズを引いて実候補の直後に差し込むと、
+        // 上位 2 枠が読みと無関係な過去の長文で埋まる（2026-09-08 の実害:
+        // `はじ` の候補列で「端」が 8 番目まで沈んだ）。
+        let dir = tempfile::tempdir().unwrap();
+        let user_path = dir.path().join("user_dict.toml");
+        fs::write(&user_path, "").unwrap();
+        let store = DictStore::load(Some(&user_path), None, None).unwrap();
+
+        let mut engine = RakunEngine::new(EngineConfig::default());
+        engine.set_dict_store(store);
+        engine.learn_force("はじめておじゃまするもの", "初めてお邪魔するもの");
+
+        // 被覆率 2/12 → 変換候補リストには入れない
+        let merged = engine.merge_candidates_for_reading(
+            "はじ",
+            vec!["恥".to_string(), "端".to_string()],
+            40,
+        );
+        assert_eq!(merged.first().map(String::as_str), Some("恥"));
+        assert_eq!(
+            merged.get(1).map(String::as_str),
+            Some("端"),
+            "短い読みの予測が実候補を押し下げてはいけない: {merged:?}"
+        );
+
+        // 読みの大半を打ち終えれば従来どおり実候補の直後に並ぶ（被覆率 7/12）
+        let merged = engine.merge_candidates_for_reading(
+            "はじめておじゃ",
+            vec!["初めてお邪".to_string()],
+            40,
+        );
+        assert!(
+            merged.iter().any(|c| c == "初めてお邪魔するもの"),
+            "補完として意味がある長さの予測は残すこと: {merged:?}"
+        );
+
+        // 予測ウィンドウ側は短い読みでも従来どおり出す
+        assert!(
+            engine
+                .predict("はじ", 4)
+                .contains(&"初めてお邪魔するもの".to_string()),
+            "予測ウィンドウの挙動は変えない"
         );
     }
 
