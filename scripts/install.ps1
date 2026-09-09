@@ -208,8 +208,11 @@ function Copy-FileOverLocked {
     # 前回以前の退避ファイルを掃除（まだ掴まれていれば失敗するので黙って飛ばす）
     $dir  = Split-Path -Parent $Destination
     $name = Split-Path -Leaf $Destination
-    Get-ChildItem -LiteralPath $dir -Filter "$name.locked-*" -ErrorAction SilentlyContinue |
-        ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+    # `.new` は退避リネーム方式に移る前の版が失敗時に残した残骸。
+    @("$name.locked-*", "$name.new") | ForEach-Object {
+        Get-ChildItem -LiteralPath $dir -Filter $_ -ErrorAction SilentlyContinue |
+            ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+    }
 
     try {
         Copy-Item -LiteralPath $Source -Destination $Destination -Force
@@ -292,7 +295,7 @@ if (Test-Path -LiteralPath $srcHost) {
 # dict-builder.exe
 if (Test-Path -LiteralPath $srcBuilder) {
     $builderDest = Join-Path $installDir "rakukan-dict-builder.exe"
-    Copy-Item -LiteralPath $srcBuilder -Destination $builderDest -Force
+    Copy-FileOverLocked -Source $srcBuilder -Destination $builderDest
     Write-Host "  -> $builderDest"
 }
 
