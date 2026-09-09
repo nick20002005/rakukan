@@ -193,13 +193,16 @@ if ($engineDlls.Count -eq 0) {
 # [1/5] Copy to LocalAppData
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ロック済みの DLL を、退避リネームを挟んで差し替える。
+# ロック済みのファイル（DLL / exe）を、退避リネームを挟んで差し替える。
 #
-# 上書きコピーが IOException になるのは、旧 DLL を掴んだプロセスが残っている時。
-# リネームはマップ済みでも通るので、`<name>.locked-<timestamp>` へ逃がしてから
-# コピーする。退避したファイルは掴んでいるプロセスが終わるまで消せないので、
-# 次回以降の実行でまとめて best-effort に削除する。
-function Copy-DllOverLocked {
+# 上書きコピーが失敗するのは、旧ファイルを掴んだプロセスが残っている時。
+# リネームはマップ済み・実行中でも通るので、`<name>.locked-<timestamp>` へ
+# 逃がしてからコピーする。退避したファイルは掴んでいるプロセスが終わるまで
+# 消せないので、次回以降の実行でまとめて best-effort に削除する。
+#
+# 失敗時の例外型はファイル種別で変わる（DLL は IOException、実行中 exe は
+# UnauthorizedAccessException で飛んでくる）ので catch は型で絞らない。
+function Copy-FileOverLocked {
     param([string]$Source, [string]$Destination)
 
     # 前回以前の退避ファイルを掃除（まだ掴まれていれば失敗するので黙って飛ばす）
@@ -211,7 +214,7 @@ function Copy-DllOverLocked {
     try {
         Copy-Item -LiteralPath $Source -Destination $Destination -Force
         return
-    } catch [System.IO.IOException] {
+    } catch {
         if (-not (Test-Path -LiteralPath $Destination)) { throw }
     }
 
@@ -246,7 +249,7 @@ Start-Sleep -Milliseconds 1200
 # 差し替えられる。旧 DLL を掴んでいるアプリは再起動するまで旧 DLL のまま動く
 # （新しく起動したプロセスは新 DLL を読む）。
 $dst = Join-Path $installDir "rakukan_tsf.dll"
-Copy-DllOverLocked -Source $srcDll -Destination $dst
+Copy-FileOverLocked -Source $srcDll -Destination $dst
 Write-Host "  -> $dst"
 
 # 古いタイムスタンプ付き DLL を削除
@@ -267,32 +270,22 @@ foreach ($engineDll in $engineDlls) {
     $engineDst = Join-Path $installDir $dllName
     # engine host は kill しても次の入力で即 respawn して DLL を掴み直すため、
     # TSF DLL と同じ退避を通す。
-    Copy-DllOverLocked -Source $engineDll -Destination $engineDst
+    Copy-FileOverLocked -Source $engineDll -Destination $engineDst
     Write-Host "  -> $engineDst"
 }
 
 # tray.exe
 if (Test-Path -LiteralPath $srcTray) {
-    try {
-        Copy-Item -LiteralPath $srcTray -Destination $trayExe -Force
-    } catch {
-        $tmp = "$trayExe.new"
-        Copy-Item -LiteralPath $srcTray -Destination $tmp -Force
-        Move-Item -LiteralPath $tmp -Destination $trayExe -Force
-    }
+    Copy-FileOverLocked -Source $srcTray -Destination $trayExe
     Write-Host "  -> $trayExe"
 }
 
 # engine-host.exe
 if (Test-Path -LiteralPath $srcHost) {
     $hostExe = Join-Path $installDir "rakukan-engine-host.exe"
-    try {
-        Copy-Item -LiteralPath $srcHost -Destination $hostExe -Force
-    } catch {
-        $tmp = "$hostExe.new"
-        Copy-Item -LiteralPath $srcHost -Destination $tmp -Force
-        Move-Item -LiteralPath $tmp -Destination $hostExe -Force
-    }
+    # kill しても TSF DLL が次の入力で即 respawn して掴み直すため、上書きは
+    # 原理的に取りこぼす。DLL と同じ退避リネームを通す。
+    Copy-FileOverLocked -Source $srcHost -Destination $hostExe
     Write-Host "  -> $hostExe"
 }
 
