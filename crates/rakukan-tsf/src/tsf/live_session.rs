@@ -38,6 +38,17 @@ pub(super) struct LiveConvSession {
     /// Explorer 等で DM が再生成されたら stale 判定に使う。
     pub composition_dm_ptr: usize,
 
+    /// 最後に打鍵があった時点の (ctx, tid, dm_ptr)。
+    ///
+    /// 🔴 上の `ctx` / `tid` はライブ変換専用で、**`stop_live_timer` →
+    /// `clear_context_snapshot` で消える**。Space 変換はライブタイマーを止めて
+    /// から走るので、変換後の後追い更新（`on_waiting_timer`）が
+    /// `context_snapshot()` を見ても常に `tid=0` で空になる。消されない控えを
+    /// ここに持たせる。stale 判定は参照側の focus DM 比較で行う。
+    pub last_ctx: Option<ITfContext>,
+    pub last_tid: u32,
+    pub last_dm_ptr: usize,
+
     /// `on_live_timer` の bg=running 状態を 1 度だけログするためのフラグ。
     /// `swap_fired_once(true)` で「ログ済」に遷移、`reset_fired_once()` で戻す。
     pub fired_once: bool,
@@ -68,6 +79,24 @@ pub(super) fn set_context_snapshot(ctx: ITfContext, tid: u32, dm_ptr: usize) {
         s.tid = tid;
         s.composition_dm_ptr = dm_ptr;
     });
+}
+
+/// 打鍵のたびに (ctx, tid, dm_ptr) を控える。`clear_context_snapshot` では消えない。
+pub(super) fn remember_input_context(ctx: ITfContext, tid: u32, dm_ptr: usize) {
+    TL_LIVE_SESSION.with(|s| {
+        let mut s = s.borrow_mut();
+        s.last_ctx = Some(ctx);
+        s.last_tid = tid;
+        s.last_dm_ptr = dm_ptr;
+    });
+}
+
+/// 最後に打鍵があった時点の (ctx, tid, dm_ptr)。
+pub(super) fn last_input_context() -> (Option<ITfContext>, u32, usize) {
+    TL_LIVE_SESSION.with(|s| {
+        let s = s.borrow();
+        (s.last_ctx.clone(), s.last_tid, s.last_dm_ptr)
+    })
 }
 
 /// Phase1A 用の (ctx, tid, dm_ptr) を一括クリア (`stop_live_timer` 経由)。

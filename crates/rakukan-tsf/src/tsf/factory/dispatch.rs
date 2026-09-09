@@ -49,8 +49,15 @@ impl super::TextServiceFactory_Impl {
                         llm_pending,
                         candidates.len()
                     ),
-                    SessionState::LiveConv { reading, preview } => {
-                        format!("LiveConv(r={:?} p={:?})", reading, preview)
+                    SessionState::LiveConv {
+                        reading,
+                        preview,
+                        converted_len,
+                    } => {
+                        format!(
+                            "LiveConv(r={:?} p={:?} conv={})",
+                            reading, preview, converted_len
+                        )
                     }
                     SessionState::RangeSelect {
                         full_reading,
@@ -155,7 +162,14 @@ impl super::TextServiceFactory_Impl {
                                 pending
                             );
                             if let Ok(mut sess) = session_get() {
-                                sess.set_live_conv(reading, preview.clone());
+                                // stale_reading で弾いた後なので entry.reading ==
+                                // reading。preview は読み全体の変換結果。
+                                let converted_len = reading.chars().count();
+                                sess.set_live_conv_converted(
+                                    reading,
+                                    preview.clone(),
+                                    converted_len,
+                                );
                             }
                             // engine の borrow はここで終わり（以降 engine を使わない）
                             drop(guard);

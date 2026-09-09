@@ -1204,6 +1204,14 @@ pub enum SessionState {
     LiveConv {
         reading: String,
         preview: String,
+        /// `preview` が `reading` の先頭から何文字ぶんを変換した結果か。
+        ///
+        /// ライブ変換は BG の結果に、その後打たれたかなを継ぎ足して伸びる
+        /// （`live_continuation_display`）。したがって「読みは進んだが変換は
+        /// まだ追いついていない」状態が常態で、preview は
+        /// 「先頭 `converted_len` 文字ぶんの変換 ＋ 残りの生かな」の形になる。
+        /// 確定時の追いつき変換がどこまで書き換えてよいかの判断に使う。
+        converted_len: usize,
     },
 }
 
@@ -2016,8 +2024,30 @@ impl SessionState {
     /// ライブ変換表示状態へ遷移。
     /// `reading` = hiragana_buf（変換キー）、`preview` = BG トップ候補。
     pub fn set_live_conv(&mut self, reading: String, preview: String) {
+        // 打鍵で読みが伸びただけの遷移。変換済みの長さは据え置く（preview の
+        // 末尾に生かなが積まれるだけで、変換が進んだわけではない）。
+        let carried = match self {
+            SessionState::LiveConv { converted_len, .. } => *converted_len,
+            _ => 0,
+        };
+        self.set_live_conv_converted(reading, preview, carried);
+    }
+
+    /// BG 変換の結果を preview に反映する遷移。`converted_len` はその結果が
+    /// 読みの先頭から何文字ぶんを変換したものかを表す。
+    pub fn set_live_conv_converted(
+        &mut self,
+        reading: String,
+        preview: String,
+        converted_len: usize,
+    ) {
         caret_tail_clear();
-        *self = SessionState::LiveConv { reading, preview };
+        let converted_len = converted_len.min(reading.chars().count());
+        *self = SessionState::LiveConv {
+            reading,
+            preview,
+            converted_len,
+        };
         SESSION_SELECTING.store(false, std::sync::atomic::Ordering::Release);
     }
 
@@ -2027,8 +2057,20 @@ impl SessionState {
 
     /// LiveConv の (reading, preview) を返す。
     pub fn live_conv_parts(&self) -> Option<(&str, &str)> {
-        if let SessionState::LiveConv { reading, preview } = self {
+        if let SessionState::LiveConv {
+            reading, preview, ..
+        } = self
+        {
             Some((reading.as_str(), preview.as_str()))
+        } else {
+            None
+        }
+    }
+
+    /// LiveConv の preview が読みの先頭から何文字ぶんを変換したものかを返す。
+    pub fn live_conv_converted_len(&self) -> Option<usize> {
+        if let SessionState::LiveConv { converted_len, .. } = self {
+            Some(*converted_len)
         } else {
             None
         }
@@ -3172,6 +3214,7 @@ mod tests {
         let mut live = SessionState::LiveConv {
             reading: "よみ".to_string(),
             preview: "読み".to_string(),
+            converted_len: 2,
         };
         live.sync_preedit_reading("あいう");
         assert!(matches!(&live, SessionState::LiveConv { reading, .. } if reading == "よみ"));

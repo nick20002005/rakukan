@@ -323,6 +323,26 @@ const PREDICTION_MIN_READING_COVERAGE: f64 = 1.0 / 3.0;
 /// 満たす予測が下位にあれば拾えるようにする。
 const PREDICTION_OVERFETCH: usize = 4;
 
+/// MOZC 辞書より前に置く LLM 候補の件数。
+///
+/// 🔴 MOZC 辞書は活用形を単独エントリで持たないので、`はった` のような読みでは
+///    辞書側が人名・地名しか返さず、`貼った` は LLM からしか出てこない。辞書を
+///    先に全部並べると固有名詞が 11 件並んでから動詞が出る（2026-09-09 に実害）。
+///
+/// 件数を増やすと、辞書にある固有名詞を選ぶまでの手数が増える。第 1・第 2
+/// 候補が一般語で埋まれば体感はほぼ直るので 2 に留める。
+const LLM_HEAD_CANDIDATES: usize = 2;
+
+/// 上の枠に入れる候補を探す範囲（LLM 候補の先頭から何件見るか）。
+///
+/// 🔴 **LLM 側の順序も固有名詞に寄る**。`はった` の LLM 候補は
+///    `[八田, 張った, 貼った, …]` で、第 1 候補が地名だった（2026-09-09 の実測。
+///    ビーム変換が MOZC のコストを語彙として使っているため）。「LLM の上位を
+///    そのまま前に出す」だけでは地名が第 2 候補に居座るので、**MOZC が持って
+///    いない候補だけ**を前に出す（`dict_cands` に無いもの＝活用形などが該当）。
+///    MOZC が語を持っている通常の読みでは枠が空になり、従来と同じ順序になる。
+const LLM_HEAD_SCAN: usize = 3;
+
 /// な行かなを「ん + 母音」に開いた代替読みを列挙する。
 ///
 /// ローマ字入力では `n` + 母音 が な行になるので、「げんいん」を出すには
@@ -1457,6 +1477,39 @@ impl RakunEngine {
             }
         }
 
+        // 3.5 「ん」補完（辞書引きのみ）。げにん → げんいん → 原因。
+        for c in &n_fix_cands {
+            if merged.len() >= limit {
+                break;
+            }
+            if !merged.contains(c) {
+                merged.push(c.clone());
+            }
+        }
+
+        // 3.6 MOZC が持っていない LLM 候補を数件だけ、MOZC 辞書より前に置く。
+        //     活用形（`貼った`）はここでしか出てこない一方、固有名詞は MOZC に
+        //     あるので除かれる（`LLM_HEAD_SCAN` のコメント参照）。
+        //     ユーザー辞書（normal / low）と学習履歴、「ん」補完はいずれも
+        //     ユーザーの明示的な意思か辞書の確実な引きなので、ここより前のまま。
+        //
+        //     読みそのものが LLM の先頭に来ることがあるが、それも順序を変えずに
+        //     通す。ここで飛ばすと「MOZC が読みを先頭に返す」状況の再現順序が
+        //     崩れ、短文予測の挿入位置（読みと異なる最初の候補の後ろ）がずれる。
+        for c in llm_candidates
+            .iter()
+            .take(LLM_HEAD_SCAN)
+            .filter(|c| !dict_cands.iter().any(|d| d == *c))
+            .take(LLM_HEAD_CANDIDATES)
+        {
+            if merged.len() >= limit {
+                break;
+            }
+            if !merged.contains(c) {
+                merged.push(c.clone());
+            }
+        }
+
         // 4. 残りの辞書候補（学習で上昇済みのものは既に merged に含まれる）
         //    読みそのもの（MOZC はひらがな表記を候補として返す）は情報が無いので
         //    入れない。これで「先頭が読みと同じ」＝ユーザー辞書か学習履歴の
@@ -1468,16 +1521,6 @@ impl RakunEngine {
             }
             if c == hiragana {
                 continue;
-            }
-            if !merged.contains(c) {
-                merged.push(c.clone());
-            }
-        }
-
-        // 4.5 「ん」補完（辞書引きのみ）。げにん → げんいん → 原因。
-        for c in &n_fix_cands {
-            if merged.len() >= limit {
-                break;
             }
             if !merged.contains(c) {
                 merged.push(c.clone());

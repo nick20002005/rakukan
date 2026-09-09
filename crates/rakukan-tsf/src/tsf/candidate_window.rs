@@ -1289,19 +1289,31 @@ pub fn on_waiting_timer() {
             probe_selected_text = sess.current_candidate().unwrap_or("").to_string();
         }
 
+        // BG の結果は候補ウィンドウだけでなく composition にも書く。
+        // ここを更新しないと、インラインは 250ms タイムアウト時のライブ
+        // プレビュー（読みの途中までしか変換されていない文字列）のまま
+        // 次のキー入力まで残り、変換そのものが失敗したように見える。
+        let composition_updated = try_update_selecting_composition(&preedit_key);
+
         // Phase 6b 第2段: WM_TIMER 経路の pending update を観測する。
-        // この経路では candidate window は更新するが、WndProc コンテキストで
-        // EditSession を開けないため TSF composition は更新しない（次のキー入力時の
-        // poll で拾う）。composition_updated=false でこの設計上のラグを可視化する。
+        // composition_updated=false は Phase1A 相当の SetText が確認できなかった
+        // ケース（フォーカス移動 / APPLY_LOCK busy / 遅延実行）で、その場合は
+        // 従来どおり次のキー入力時の poll で拾われる。
         if let Some(view) = probe_view {
             tracing::info!(
-                "candidate_display_probe event=wm_timer_pending_update reading_len={} source={} first_candidate={:?} page_selected={} selected_candidate={:?} composition_candidate={:?} selected_match=false composition_updated=false llm_pending=false corresponding_reading_len={} suffix_len={}",
+                "candidate_display_probe event=wm_timer_pending_update reading_len={} source={} first_candidate={:?} page_selected={} selected_candidate={:?} composition_candidate={:?} selected_match={} composition_updated={} llm_pending=false corresponding_reading_len={} suffix_len={}",
                 preedit_key.chars().count(),
                 view.source.as_str(),
                 page_cands.first().map(String::as_str).unwrap_or(""),
                 page_selected,
                 probe_selected_text,
-                "",
+                if composition_updated {
+                    probe_selected_text.as_str()
+                } else {
+                    ""
+                },
+                composition_updated,
+                composition_updated,
                 view.corresponding_reading_len,
                 view.suffix.chars().count()
             );
@@ -1486,6 +1498,14 @@ pub fn on_waiting_timer() {
 pub fn live_input_notify(ctx: &windows::Win32::UI::TextServices::ITfContext, tid: u32) {
     use windows::core::Interface;
 
+    // ライブ変換の有効・無効に関わらず控える。Space 変換の後追い更新
+    // (`try_update_selecting_composition`) はライブ用スナップショットが
+    // 消えた後に走るため、こちらを見る。
+    let input_dm_ptr = unsafe { ctx.GetDocumentMgr().ok() }
+        .map(|dm| dm.as_raw() as usize)
+        .unwrap_or(0);
+    crate::tsf::live_session::remember_input_context(ctx.clone(), tid, input_dm_ptr);
+
     // ── config.live_conversion.enabled チェック ─────────────────────────────
     let cfg = crate::engine::config::current_config();
     if !cfg.live_conversion.enabled {
@@ -1504,9 +1524,7 @@ pub fn live_input_notify(ctx: &windows::Win32::UI::TextServices::ITfContext, tid
 
     // ITfContext / tid / DM ptr を thread_local LiveConvSession にキャッシュ
     // (on_live_timer の Phase1A で使用)
-    let live_dm_ptr = unsafe { ctx.GetDocumentMgr().ok() }
-        .map(|dm| dm.as_raw() as usize)
-        .unwrap_or(0);
+    let live_dm_ptr = input_dm_ptr;
     crate::tsf::live_session::set_context_snapshot(ctx.clone(), tid, live_dm_ptr);
     if live_dm_ptr == 0 {
         tracing::debug!("[Live] live_input_notify: no document manager, Phase1A disabled");
@@ -1997,6 +2015,159 @@ fn build_apply_snapshot(data: LivePreview) -> LiveSnapshot {
     }
 }
 
+/// EditSession の中で composition の全体を `text` に差し替える。
+///
+/// Phase1A（ライブ変換）と Space 変換後の後追い更新（`on_waiting_timer`）の
+/// 共通処理。`COMPOSITION_APPLY_LOCK` が busy なら SetText を諦めて `false` を
+/// 返す（呼び出し側は「適用できなかった」として扱う）。
+///
+/// # Safety
+/// `ec` は TSF から渡された有効な EditCookie でなければならない。
+unsafe fn set_composition_text(
+    ec: u32,
+    ctx: &windows::Win32::UI::TextServices::ITfContext,
+    text: &str,
+    log_tag: &str,
+) -> windows::core::Result<bool> {
+    use windows::Win32::Foundation::E_FAIL;
+    use windows::Win32::UI::TextServices::{
+        TF_ANCHOR_END, TF_SELECTION, TF_SELECTIONSTYLE, TfActiveSelEnd,
+    };
+    unsafe {
+        let comp = crate::engine::state::composition_clone()
+            .unwrap_or(None)
+            .ok_or_else(|| windows::core::Error::new(E_FAIL, "no composition"))?;
+        let range = comp
+            .GetRange()
+            .map_err(|e| windows::core::Error::new(E_FAIL, format!("GetRange: {e}")))?;
+        let text_w: Vec<u16> = text.encode_utf16().collect();
+        // M1.8 T-MID3: SetText 排他化。update_composition 系の SetText と
+        // 直列化されないと、deferred dispatch 順序によっては古い preview が
+        // 新しい preedit を上書きする risk がある。busy なら skip して
+        // 次回 timer / key で最新 gen の SetText を走らせる。
+        {
+            let _apply_guard = match crate::engine::state::COMPOSITION_APPLY_LOCK.try_lock() {
+                Ok(g) => g,
+                Err(_) => {
+                    tracing::debug!("{log_tag}: COMPOSITION_APPLY_LOCK busy, skip SetText");
+                    return Ok(false);
+                }
+            };
+            range
+                .SetText(ec, 0, &text_w)
+                .map_err(|e| windows::core::Error::new(E_FAIL, format!("SetText: {e}")))?;
+        }
+
+        let atom = crate::tsf::display_attr::atom_input();
+        if atom != 0 {
+            if let Ok(prop) =
+                ctx.GetProperty(&windows::Win32::UI::TextServices::GUID_PROP_ATTRIBUTE)
+            {
+                let _ = prop.Clear(ec, &range);
+                let var = windows_core::VARIANT::from(atom as i32);
+                let _ = prop.SetValue(ec, &range, &var);
+            }
+        }
+
+        if let Ok(cursor) = range.Clone() {
+            let _ = cursor.Collapse(ec, TF_ANCHOR_END);
+            let sel = TF_SELECTION {
+                range: std::mem::ManuallyDrop::new(Some(cursor)),
+                style: TF_SELECTIONSTYLE {
+                    ase: TfActiveSelEnd(0),
+                    fInterimChar: windows::Win32::Foundation::BOOL(0),
+                },
+            };
+            let _ = ctx.SetSelection(ec, &[sel]);
+        }
+        Ok(true)
+    }
+}
+
+/// Selecting 状態のまま `key` の変換を続けているなら、いま選択中の候補を返す。
+///
+/// 分割変換中（prefix / remainder が空でない）は composition を 3 分割して
+/// 属性を塗り分ける必要があり、単純な全体差し替えでは表示が壊れるので対象外。
+fn selecting_composition_text(key: &str) -> Option<String> {
+    use crate::engine::state::{SessionState, session_get};
+    let sess = session_get().ok()?;
+    let SessionState::Selecting {
+        original_preedit, ..
+    } = &*sess
+    else {
+        return None;
+    };
+    if original_preedit != key {
+        return None;
+    }
+    if !sess.selecting_prefix_clone().is_empty() || !sess.selecting_remainder_clone().is_empty() {
+        return None;
+    }
+    Some(sess.current_candidate()?.to_string())
+}
+
+/// Space 変換の後追い BG 更新で composition（インラインの下線付き本文）も書き換える。
+///
+/// `on_waiting_timer` の Selecting 分岐は長らく候補ウィンドウだけを更新していたため、
+/// インラインは `LLM_WAIT_INLINE_MS` タイムアウト時のライブプレビュー（読みの
+/// 途中までしか変換されていない文字列）のまま残っていた。Enter で確定されるのは
+/// セッションが持つ正しい候補なので実害は表示だけだが、目線が行くのはインライン側
+/// なので「最初の変換がトンチンカン」に見える。
+///
+/// ライブ変換の Phase1A と同じ経路（WM_TIMER から `RequestEditSession`）を使うが、
+/// 状態は Selecting のままなので `set_live_conv` もタイマー停止も行わない。
+/// EditSession は遅延実行されうるので、実行時にセッションから候補を読み直す
+/// （待っている間に ↓/Space で選択が動いていても正しい方を書く）。
+fn try_update_selecting_composition(key: &str) -> bool {
+    use crate::engine::state::composition_clone;
+    use crate::tsf::edit_session::EditSession;
+    use windows::Win32::UI::TextServices::TF_ES_READWRITE;
+
+    // 🔴 `context_snapshot()` は使えない。Space 変換は `stop_live_timer` を経て
+    // 走るので、ライブ変換用のスナップショットはこの時点で必ず空になっている。
+    let (ctx_opt, tid, live_dm_ptr) = crate::tsf::live_session::last_input_context();
+    let focused_dm_ptr = current_focus_dm_ptr();
+    let possible = ctx_opt.is_some()
+        && tid > 0
+        && live_dm_ptr != 0
+        && focused_dm_ptr == Some(live_dm_ptr)
+        && composition_clone().map(|g| g.is_some()).unwrap_or(false);
+    let Some(ctx) = ctx_opt.filter(|_| possible) else {
+        tracing::debug!(
+            "pending_composition_update: skipped (tid={tid} cached_dm={live_dm_ptr:#x} focus={focused_dm_ptr:?})"
+        );
+        return false;
+    };
+
+    let ctx_req = ctx.clone();
+    let captured_dm_ptr = live_dm_ptr;
+    let captured_key = key.to_string();
+    let applied = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let applied_in = applied.clone();
+
+    let session = EditSession::new(move |ec| unsafe {
+        use windows::Win32::Foundation::E_FAIL;
+        if current_focus_dm_ptr() != Some(captured_dm_ptr) {
+            return Err(windows::core::Error::new(
+                E_FAIL,
+                "focus DM changed before pending composition update",
+            ));
+        }
+        // 遅延実行されている間に確定・取消・別の読みへ進んでいたら書かない。
+        let Some(text) = selecting_composition_text(&captured_key) else {
+            tracing::debug!("pending_composition_update: session moved on, skip SetText");
+            return Ok(());
+        };
+        if set_composition_text(ec, &ctx, &text, "pending_composition_update")? {
+            applied_in.store(true, std::sync::atomic::Ordering::Release);
+        }
+        Ok(())
+    });
+
+    let result = unsafe { ctx_req.RequestEditSession(tid, &session, TF_ES_READWRITE) };
+    result.is_ok() && applied.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Phase 1A: RequestEditSession で直接 composition に SetText を書く。
 /// 成功したら `true` (caller は完了)、失敗したら `false` (Phase 1B へ落ちる)。
 fn try_apply_phase1a(snapshot: &LiveSnapshot) -> bool {
@@ -2047,9 +2218,6 @@ fn try_apply_phase1a(snapshot: &LiveSnapshot) -> bool {
 
     let session = EditSession::new(move |ec| unsafe {
         use windows::Win32::Foundation::E_FAIL;
-        use windows::Win32::UI::TextServices::{
-            TF_ANCHOR_END, TF_SELECTION, TF_SELECTIONSTYLE, TfActiveSelEnd,
-        };
         if cancelled_in.load(std::sync::atomic::Ordering::Acquire) {
             tracing::debug!("[Live] Phase1A: cancelled before deferred execution, skip");
             return Ok(());
@@ -2075,52 +2243,8 @@ fn try_apply_phase1a(snapshot: &LiveSnapshot) -> bool {
             );
             return Err(windows::core::Error::new(E_FAIL, "stale gen in Phase1A"));
         }
-        let comp = crate::engine::state::composition_clone()
-            .unwrap_or(None)
-            .ok_or_else(|| windows::core::Error::new(E_FAIL, "no composition"))?;
-        let range = comp
-            .GetRange()
-            .map_err(|e| windows::core::Error::new(E_FAIL, format!("GetRange: {e}")))?;
-        let text_w: Vec<u16> = preview_1a.encode_utf16().collect();
-        // M1.8 T-MID3: SetText 排他化。update_composition 系の SetText と
-        // 直列化されないと、deferred dispatch 順序によっては古い preview が
-        // 新しい preedit を上書きする risk がある。busy なら skip して
-        // 次回 timer / key で最新 gen の SetText を走らせる。
-        {
-            let _apply_guard = match crate::engine::state::COMPOSITION_APPLY_LOCK.try_lock() {
-                Ok(g) => g,
-                Err(_) => {
-                    tracing::debug!("[Live] Phase1A: COMPOSITION_APPLY_LOCK busy, skip SetText");
-                    return Ok(());
-                }
-            };
-            range
-                .SetText(ec, 0, &text_w)
-                .map_err(|e| windows::core::Error::new(E_FAIL, format!("SetText: {e}")))?;
-        }
-        applied_in.store(true, std::sync::atomic::Ordering::Release);
-
-        let atom = crate::tsf::display_attr::atom_input();
-        if atom != 0 {
-            if let Ok(prop) =
-                ctx.GetProperty(&windows::Win32::UI::TextServices::GUID_PROP_ATTRIBUTE)
-            {
-                let _ = prop.Clear(ec, &range);
-                let var = windows_core::VARIANT::from(atom as i32);
-                let _ = prop.SetValue(ec, &range, &var);
-            }
-        }
-
-        if let Ok(cursor) = range.Clone() {
-            let _ = cursor.Collapse(ec, TF_ANCHOR_END);
-            let sel = TF_SELECTION {
-                range: std::mem::ManuallyDrop::new(Some(cursor)),
-                style: TF_SELECTIONSTYLE {
-                    ase: TfActiveSelEnd(0),
-                    fInterimChar: windows::Win32::Foundation::BOOL(0),
-                },
-            };
-            let _ = ctx.SetSelection(ec, &[sel]);
+        if set_composition_text(ec, &ctx, &preview_1a, "[Live] Phase1A")? {
+            applied_in.store(true, std::sync::atomic::Ordering::Release);
         }
         Ok(())
     });
@@ -2128,7 +2252,13 @@ fn try_apply_phase1a(snapshot: &LiveSnapshot) -> bool {
     let result = unsafe { ctx_req.RequestEditSession(tid, &session, TF_ES_READWRITE) };
     if result.is_ok() && applied.load(std::sync::atomic::Ordering::Acquire) {
         if let Ok(mut sess) = crate::engine::state::session_get() {
-            sess.set_live_conv(snapshot.reading.clone(), snapshot.preview.clone());
+            // preview は snapshot.reading 全体に対する BG 結果。
+            let converted_len = snapshot.reading.chars().count();
+            sess.set_live_conv_converted(
+                snapshot.reading.clone(),
+                snapshot.preview.clone(),
+                converted_len,
+            );
         }
         if snapshot.keep_timer_running {
             tracing::debug!("[Live] Phase1A: keeping timer for pending BG merge");

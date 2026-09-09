@@ -341,20 +341,40 @@ impl super::TextServiceFactory_Impl {
 
     /// 入力中の予測ウィンドウ（`suggestion` モジュール）を候補リストとして開く。
     ///
-    /// 予測は表示しているだけで `SessionState` は Preedit / LiveConv のままなので、
-    /// ↓ / Tab が来たここで初めて `Selecting` に遷移させる。開けた場合 `true`。
+    /// 予測は表示しているだけで `SessionState` は Idle / Preedit / LiveConv の
+    /// ままなので、↓ / Tab が来たここで初めて `Selecting` に遷移させる。
+    /// 開けた場合 `true`。
+    ///
+    /// 🔴 **読みをセッション状態からだけ取ってはいけない**。素の打鍵（Idle から
+    /// 入力を始めた状態）では `SessionState` は Idle のままで、`original_preedit()`
+    /// は None を返す（`sync_preedit_reading` は既に Preedit の時しか追随しない）。
+    /// ライブ変換の preview が当たって LiveConv になるまでは、予測ウィンドウは
+    /// 出ているのに ↓ / Tab で開けない状態になる（読み 2 文字ちょうどでは
+    /// ライブ変換の下限が 3 文字なので永久に開けない）。engine が持っている
+    /// 実際の読み `engine_reading` でも引き直す。
     fn open_suggestion_list(
         &self,
         sess: &mut crate::engine::state::SessionState,
         ctx: ITfContext,
         tid: u32,
         sink: ITfCompositionSink,
+        engine_reading: Option<String>,
     ) -> Result<bool> {
-        let reading = sess.original_preedit().unwrap_or("").to_string();
-        if reading.is_empty() {
-            return Ok(false);
+        let mut readings: Vec<String> = Vec::new();
+        if let Some(r) = sess.original_preedit() {
+            if !r.is_empty() {
+                readings.push(r.to_string());
+            }
         }
-        let Some(items) = crate::tsf::suggestion::take_for(&reading) else {
+        if let Some(r) = engine_reading {
+            if !r.is_empty() && !readings.contains(&r) {
+                readings.push(r);
+            }
+        }
+        let Some((reading, items)) = readings
+            .into_iter()
+            .find_map(|r| crate::tsf::suggestion::take_for(&r).map(|items| (r, items)))
+        else {
             return Ok(false);
         };
         let caret = caret_rect_get();
@@ -407,17 +427,28 @@ impl super::TextServiceFactory_Impl {
             .as_ref()
             .map(|e| !e.preedit_is_empty())
             .unwrap_or(false);
-        if let Some(engine) = guard.as_mut() {
+        // 予測ウィンドウを開く時の「engine が持っている実際の読み」は guard を
+        // 落とす前に取っておく（セッション状態が Idle のままでも引けるように）。
+        let engine_reading = if let Some(engine) = guard.as_mut() {
             // 文節分割で作ったブロックは候補 1 件しか持たない。↓ / Tab /
             // PageDown で初めて候補を引く（Space と同じ遅延展開）。
             expand_current_block(engine);
-        }
+            Some(engine.hiragana_text())
+        } else {
+            None
+        };
         drop(guard);
         let mut sess = session_get()?;
         if !sess.is_candidate_list_active() {
             // 予測ウィンドウ表示中の ↓ → 予測候補を候補リストとして開く
             if matches!(dir, CandidateDir::Next)
-                && self.open_suggestion_list(&mut sess, ctx.clone(), tid, sink.clone())?
+                && self.open_suggestion_list(
+                    &mut sess,
+                    ctx.clone(),
+                    tid,
+                    sink.clone(),
+                    engine_reading,
+                )?
             {
                 return Ok(true);
             }
@@ -473,17 +504,28 @@ impl super::TextServiceFactory_Impl {
             .as_ref()
             .map(|e| !e.preedit_is_empty())
             .unwrap_or(false);
-        if let Some(engine) = guard.as_mut() {
+        // 予測ウィンドウを開く時の「engine が持っている実際の読み」は guard を
+        // 落とす前に取っておく（セッション状態が Idle のままでも引けるように）。
+        let engine_reading = if let Some(engine) = guard.as_mut() {
             // 文節分割で作ったブロックは候補 1 件しか持たない。↓ / Tab /
             // PageDown で初めて候補を引く（Space と同じ遅延展開）。
             expand_current_block(engine);
-        }
+            Some(engine.hiragana_text())
+        } else {
+            None
+        };
         drop(guard);
         let mut sess = session_get()?;
         if !sess.is_candidate_list_active() {
             // 予測ウィンドウ表示中の Tab（プリセットでは CandidatePageDown）→ 候補リストを開く
             if matches!(dir, CandidateDir::Next)
-                && self.open_suggestion_list(&mut sess, ctx.clone(), tid, sink.clone())?
+                && self.open_suggestion_list(
+                    &mut sess,
+                    ctx.clone(),
+                    tid,
+                    sink.clone(),
+                    engine_reading,
+                )?
             {
                 return Ok(true);
             }

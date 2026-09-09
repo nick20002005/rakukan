@@ -92,9 +92,49 @@ fn split_sentences(text: &str) -> impl Iterator<Item = &str> {
     })
 }
 
-/// 文中に「needle と一致し、かつ長さ `ECHO_RUN_MIN_CHARS` 以上の かな連続 run に
+/// 読み長に応じたエコー run の最小長。
+///
+/// 🔴 固定 8 文字だと、**読み自体が 8 文字未満のときは原理的に検出できない**。
+///    エコー源は確定された読みそのものなので run 長は読み長と同じにしかならず、
+///    `たもたれている`（7 文字）の実害を取りこぼした（2026-09-09）。読みが短い
+///    ときだけ条件を読み長まで下げ、`ECHO_RUN_MIN_CHARS_FLOOR` で誤爆側の
+///    下限を残す（「のことなら」= 5 文字への偶然一致は従来どおり削らない）。
+const ECHO_RUN_MIN_CHARS_FLOOR: usize = 6;
+
+fn echo_run_min_chars(reading_chars: usize) -> usize {
+    ECHO_RUN_MIN_CHARS
+        .min(reading_chars)
+        .max(ECHO_RUN_MIN_CHARS_FLOOR)
+}
+
+/// かな列に紛れ込んだ単独の ASCII 英字を落とした文字列を返す（変化が無ければ `None`）。
+///
+/// 🔴 ローマ字入力の打ち間違いで `たもたsれている` のように英字が 1 文字だけ
+///    残ったまま確定されることがある。この形は読みのプレフィックスと一致せず、
+///    かな run も英字で分断されるので、**エコー源として二重に検出をすり抜ける**
+///    （2026-09-09 に実害）。前後がかなの単独英字だけを落とすので、`AI` のような
+///    正当な英単語は残り、かな run が不当に連結されることもない。
+fn drop_stray_ascii_in_kana(text: &str) -> Option<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut dropped = false;
+    for (i, &c) in chars.iter().enumerate() {
+        let stray = c.is_ascii_alphabetic()
+            && i > 0
+            && is_kana_or_prolonged(chars[i - 1])
+            && chars.get(i + 1).copied().is_some_and(is_kana_or_prolonged);
+        if stray {
+            dropped = true;
+        } else {
+            out.push(c);
+        }
+    }
+    if dropped { Some(out) } else { None }
+}
+
+/// 文中に「needle と一致し、かつ長さ `min_run` 以上の かな連続 run に
 /// 含まれる」箇所があるか判定する。
-fn sentence_has_echo_run(sentence: &str, needle: &str, kata_needle: &str) -> bool {
+fn sentence_has_echo_run(sentence: &str, needle: &str, kata_needle: &str, min_run: usize) -> bool {
     for pat in [needle, kata_needle] {
         let mut search_from = 0;
         while let Some(rel) = sentence[search_from..].find(pat) {
@@ -111,7 +151,7 @@ fn sentence_has_echo_run(sentence: &str, needle: &str, kata_needle: &str) -> boo
                 .chars()
                 .take_while(|c| is_kana_or_prolonged(*c))
                 .count();
-            if run_len >= ECHO_RUN_MIN_CHARS {
+            if run_len >= min_run {
                 return true;
             }
             search_from = pos + pat.len();
@@ -141,11 +181,17 @@ fn strip_echo_context<'a>(context: &'a str, reading: &str) -> std::borrow::Cow<'
     }
     let needle: String = reading.chars().take(ECHO_NEEDLE_CHARS).collect();
     let kata_needle = hiragana_to_katakana(&needle);
+    let min_run = echo_run_min_chars(reading_chars);
 
     let mut kept = String::new();
     let mut removed = false;
     for sentence in split_sentences(context) {
-        if sentence_has_echo_run(sentence, &needle, &kata_needle) {
+        // 打ち間違いの英字が挟まった形も、落としたうえで一度見る。
+        let has_echo = sentence_has_echo_run(sentence, &needle, &kata_needle, min_run)
+            || drop_stray_ascii_in_kana(sentence).is_some_and(|s| {
+                sentence_has_echo_run(&s, &needle, &kata_needle, min_run)
+            });
+        if has_echo {
             tracing::info!(
                 needle = %needle,
                 dropped_head = %sentence.chars().take(20).collect::<String>(),
@@ -830,6 +876,27 @@ mod tests {
         let context = "それはそうだが、";
         assert_eq!(strip_echo_context(context, "それ"), context);
         assert_eq!(strip_echo_context(context, "は"), context);
+    }
+
+    #[test]
+    fn strip_echo_context_drops_echo_with_stray_romaji() {
+        // 実機事例（2026-09-09）: 打ち間違いで `たもたsれている` と未変換確定され、
+        // 次に同じ読みを変換すると全ビームがそれをコピーして `保たれている` が
+        // 候補から消えた。英字が挟まっていても落として検出する。
+        let context = "セーラー襟の背中側が持ち上がっている。が、形と長さはたもたsれている";
+        let reading = "たもたれている";
+        assert_eq!(
+            strip_echo_context(context, reading),
+            "セーラー襟の背中側が持ち上がっている。"
+        );
+    }
+
+    #[test]
+    fn strip_echo_context_keeps_multiletter_ascii_words() {
+        // 単独英字だけを落とすので、`AI` のような語でかな run が連結されない。
+        let context = "それはAIのことなら得意だ。";
+        let reading = "のことなら";
+        assert_eq!(strip_echo_context(context, reading), context);
     }
 
     #[test]

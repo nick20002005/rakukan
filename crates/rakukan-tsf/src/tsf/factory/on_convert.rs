@@ -1571,11 +1571,13 @@ impl super::TextServiceFactory_Impl {
                 if preview.is_empty() {
                     return Ok(false);
                 }
+                let converted_len = sess.live_conv_converted_len().unwrap_or(0);
                 sess.set_idle();
                 drop(sess);
                 candidate_window::hide();
                 candidate_window::stop_live_timer();
-                let (preview, unconverged) = catch_up_live_preview(engine, &reading, preview);
+                let (preview, unconverged) =
+                    catch_up_live_preview(engine, &reading, preview, converted_len);
                 if preview != reading
                     && !unconverged
                     && crate::engine::state::is_auto_learn_enabled()
@@ -2050,10 +2052,42 @@ impl super::TextServiceFactory_Impl {
 
 #[cfg(test)]
 mod tests {
-    use super::is_weak_merge;
+    use super::{is_weak_merge, live_preview_confirmed_head};
 
     fn v(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn confirmed_head_strips_unconverted_tail() {
+        // 2026-09-09 のログ: `がへんかんでき`(7) まで変換して `が変換でき` を得た
+        // あと、`なかった` を打ち足した状態で Enter。
+        assert_eq!(
+            live_preview_confirmed_head("がへんかんできなかった", "が変換できなかった", 7),
+            Some("が変換でき")
+        );
+    }
+
+    #[test]
+    fn confirmed_head_covers_whole_preview_when_fully_converted() {
+        assert_eq!(
+            live_preview_confirmed_head("へんかん", "変換", 4),
+            Some("変換")
+        );
+    }
+
+    #[test]
+    fn confirmed_head_is_none_without_any_conversion() {
+        assert_eq!(
+            live_preview_confirmed_head("たもたれている", "たもたれている", 0),
+            None
+        );
+    }
+
+    #[test]
+    fn confirmed_head_is_none_when_preview_shape_is_unexpected() {
+        // 記号の畳み込み等で「変換済み＋読みの残り」の形になっていない場合。
+        assert_eq!(live_preview_confirmed_head("あいうえお", "アイウ", 2), None);
     }
 
     #[test]
@@ -2115,6 +2149,7 @@ fn catch_up_live_preview(
     engine: &mut crate::engine::state::DynEngine,
     reading: &str,
     preview: String,
+    converted_len: usize,
 ) -> (String, bool) {
     let top = match engine.bg_peek_top_candidate(reading) {
         Some(top) => top,
@@ -2167,10 +2202,55 @@ fn catch_up_live_preview(
     match merged {
         Some(merged) => {
             if merged != preview {
+                if let Some(confirmed) =
+                    live_preview_confirmed_head(reading, &preview, converted_len)
+                    && !merged.starts_with(confirmed)
+                {
+                    tracing::info!(
+                        "[Live] commit catch-up: keep displayed {:?} (catch-up said {:?}, confirmed={:?})",
+                        preview,
+                        merged,
+                        confirmed
+                    );
+                    return (preview, false);
+                }
                 tracing::info!("[Live] commit catch-up: {:?} → {:?}", preview, merged);
             }
             (merged, false)
         }
         None => (preview, true),
+    }
+}
+
+/// preview のうち「BG 変換で確定していて、画面にもその形で出ていた」先頭部分を
+/// 返す。追いつき変換の結果を採ってよいかの判定に使う。
+///
+/// 🔴 追いつき変換は読み全体を一度に変換し直すので、ライブ変換が数文字ずつ
+///    積み上げた結果と食い違うことがある。実例（2026-09-09 のログ）: 画面には
+///    `が変換できなかった` と出ていたのに `が返還できなかった` が確定した。
+///    ライブ側は `がへんかんでき` の時点で `が変換でき` を得ていたが、追いつき
+///    側は `がへんかんできなかった` を頭から変換して `返還` を選んだ。
+///
+/// preview は「先頭 `converted_len` 文字ぶんの変換 ＋ 残りの生かな」の形なので、
+/// 末尾から読みの未変換ぶんを剥がせば確定済みの頭が取れる。これが追いつきの
+/// 結果の接頭辞になっていれば「preview の続きを変換しただけ」なので採ってよく、
+/// そうでなければ既に見えていた部分まで書き換えているので却下する。
+///
+/// 判定材料が無い場合（読み全体が未変換 / preview が想定の形でない）は `None` を
+/// 返し、従来どおり追いつきの結果に任せる。
+fn live_preview_confirmed_head<'a>(
+    reading: &str,
+    preview: &'a str,
+    converted_len: usize,
+) -> Option<&'a str> {
+    if converted_len == 0 {
+        return None;
+    }
+    let unconverted: String = reading.chars().skip(converted_len).collect();
+    let confirmed = preview.strip_suffix(&unconverted)?;
+    if confirmed.is_empty() {
+        None
+    } else {
+        Some(confirmed)
     }
 }
