@@ -599,6 +599,9 @@ fn build_engine_config_json() -> String {
     };
     let live_conv_beam_size = cfg.live_conversion.beam_size.clamp(1, 9);
     let convert_beam_size = cfg.conversion.beam_size.clamp(1, 30);
+    let rescore_enabled = cfg.conversion.rescore_enabled;
+    let rescore_min_reading_chars = cfg.conversion.rescore_min_reading_chars.max(1);
+    let rescore_min_gain = cfg.conversion.rescore_min_gain.max(0.0);
     let prediction_enabled = cfg.prediction.enabled;
     let prediction_max_candidates = cfg.prediction.max_candidates.clamp(0, 9);
     let prediction_min_reading_chars = cfg.prediction.min_reading_chars.max(1);
@@ -618,14 +621,14 @@ fn build_engine_config_json() -> String {
         .join(",");
 
     tracing::info!(
-        "engine config: num_candidates={num_candidates} n_gpu_layers={n_gpu_layers} main_gpu={main_gpu} model_variant={model_variant:?} digit_width={digit_width} alpha_width={alpha_width} symbol_width={symbol_width} digit_separator_auto={digit_separator_auto} digit_candidates_order=[{digit_candidates_order}] live_conv_beam_size={live_conv_beam_size} convert_beam_size={convert_beam_size} prediction_enabled={prediction_enabled} prediction_max_candidates={prediction_max_candidates} prediction_min_reading_chars={prediction_min_reading_chars}"
+        "engine config: num_candidates={num_candidates} n_gpu_layers={n_gpu_layers} main_gpu={main_gpu} model_variant={model_variant:?} digit_width={digit_width} alpha_width={alpha_width} symbol_width={symbol_width} digit_separator_auto={digit_separator_auto} digit_candidates_order=[{digit_candidates_order}] live_conv_beam_size={live_conv_beam_size} convert_beam_size={convert_beam_size} prediction_enabled={prediction_enabled} prediction_max_candidates={prediction_max_candidates} prediction_min_reading_chars={prediction_min_reading_chars} rescore_enabled={rescore_enabled} rescore_min_reading_chars={rescore_min_reading_chars} rescore_min_gain={rescore_min_gain}"
     );
     let mv_json = match &model_variant {
         Some(v) => format!(r#","model_variant":"{}""#, v),
         None => String::new(),
     };
     format!(
-        r#"{{"num_candidates":{num_candidates},"n_gpu_layers":{n_gpu_layers},"main_gpu":{main_gpu},"n_threads":0,"digit_width":"{digit_width}","alpha_width":"{alpha_width}","symbol_width":"{symbol_width}","digit_separator_auto":{digit_separator_auto},"digit_candidates_order":[{digit_candidates_order}],"live_conv_beam_size":{live_conv_beam_size},"convert_beam_size":{convert_beam_size},"prediction_enabled":{prediction_enabled},"prediction_max_candidates":{prediction_max_candidates},"prediction_min_reading_chars":{prediction_min_reading_chars}{mv_json}}}"#
+        r#"{{"num_candidates":{num_candidates},"n_gpu_layers":{n_gpu_layers},"main_gpu":{main_gpu},"n_threads":0,"digit_width":"{digit_width}","alpha_width":"{alpha_width}","symbol_width":"{symbol_width}","digit_separator_auto":{digit_separator_auto},"digit_candidates_order":[{digit_candidates_order}],"live_conv_beam_size":{live_conv_beam_size},"convert_beam_size":{convert_beam_size},"prediction_enabled":{prediction_enabled},"prediction_max_candidates":{prediction_max_candidates},"prediction_min_reading_chars":{prediction_min_reading_chars},"rescore_enabled":{rescore_enabled},"rescore_min_reading_chars":{rescore_min_reading_chars},"rescore_min_gain":{rescore_min_gain}{mv_json}}}"#
     )
 }
 

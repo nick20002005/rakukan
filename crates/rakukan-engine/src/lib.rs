@@ -28,6 +28,7 @@ pub mod dict;
 pub mod dict_prefix;
 pub mod digits;
 pub mod ffi;
+pub mod rescore;
 pub mod segments;
 pub use backend::{BackendSelection, GpuInfo, select_backend};
 // Backend は kanji::Backend と名前が被るため、rakukan の Backend は別名でエクスポート
@@ -268,6 +269,15 @@ pub struct EngineConfig {
     /// 短文予測を開始する読みの最小文字数。
     #[serde(default = "default_prediction_min_reading_chars")]
     pub prediction_min_reading_chars: usize,
+    /// 長文変換の n-best を辞書との整合で並べ替える（`rescore` モジュール）。
+    #[serde(default = "default_rescore_enabled")]
+    pub rescore_enabled: bool,
+    /// 並べ替えを適用する読みの最小文字数。これ未満は辞書が完全一致で効くので触らない。
+    #[serde(default = "default_rescore_min_reading_chars")]
+    pub rescore_min_reading_chars: usize,
+    /// 先頭候補を押しのけるのに必要なスコア差。小さくすると積極的になる。
+    #[serde(default = "default_rescore_min_gain")]
+    pub rescore_min_gain: f64,
 }
 
 fn is_kana_or_cjk(c: char) -> bool {
@@ -452,6 +462,18 @@ fn default_prediction_min_reading_chars() -> usize {
     2
 }
 
+fn default_rescore_enabled() -> bool {
+    true
+}
+
+fn default_rescore_min_reading_chars() -> usize {
+    12
+}
+
+fn default_rescore_min_gain() -> f64 {
+    24.0
+}
+
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
@@ -472,6 +494,9 @@ impl Default for EngineConfig {
             prediction_enabled: default_prediction_enabled(),
             prediction_max_candidates: default_prediction_max_candidates(),
             prediction_min_reading_chars: default_prediction_min_reading_chars(),
+            rescore_enabled: default_rescore_enabled(),
+            rescore_min_reading_chars: default_rescore_min_reading_chars(),
+            rescore_min_gain: default_rescore_min_gain(),
         }
     }
 }
@@ -1327,6 +1352,9 @@ impl RakunEngine {
         llm_candidates: Vec<String>,
         limit: usize,
     ) -> Vec<String> {
+        // 長文は辞書が完全一致で引けず LLM の区切りだけで決まるので、
+        // 先に n-best の並びを辞書との整合で見直す（集合は変えない）。
+        let llm_candidates = self.rescore_llm_candidates(hiragana, llm_candidates);
         // 優先順位: ユーザー辞書(normal) → 学習済み辞書候補（スコア順）
         //           → ユーザー辞書(low) → 残り辞書候補 → LLM
         // 学習スコアで上位に来た辞書候補を先に表示し、LLM は空きスロットを埋める。
@@ -1768,7 +1796,27 @@ impl RakunEngine {
     /// `conv_cache::reclaim_nonblocking()` が Done state から converter を
     /// 回収するため、converter を engine.kanji に戻す手間は不要。
     pub fn bg_peek_top_candidate(&self, key: &str) -> Option<String> {
-        conv_cache::peek_top_candidate(key)
+        // ライブ変換の preview はここの 1 件だけを見るので、並べ替えも
+        // ここで済ませる（先頭を見る前に n-best 全体を評価する）。
+        let cands = conv_cache::peek_candidates(key)?;
+        self.rescore_llm_candidates(key, cands).into_iter().next()
+    }
+
+    /// LLM の n-best を辞書との整合で並べ替える。候補の集合は変えない。
+    fn rescore_llm_candidates(&self, reading: &str, candidates: Vec<String>) -> Vec<String> {
+        if !self.config.rescore_enabled {
+            return candidates;
+        }
+        let Some(store) = self.dict_store.as_ref() else {
+            return candidates;
+        };
+        rescore::promote_dict_agreeing(
+            store,
+            reading,
+            candidates,
+            self.config.rescore_min_reading_chars,
+            self.config.rescore_min_gain,
+        )
     }
 
     /// key が一致する BG 変換結果を取得し、converter を engine に戻す。
@@ -1779,6 +1827,7 @@ impl RakunEngine {
     pub fn bg_take_candidates(&mut self, key: &str) -> Option<Vec<String>> {
         let (conv, cands) = conv_cache::take_ready(key)?;
         self.kanji = Some(conv);
+        let cands = self.rescore_llm_candidates(key, cands);
         let user_cands: Vec<String> = self
             .dict_store
             .as_ref()

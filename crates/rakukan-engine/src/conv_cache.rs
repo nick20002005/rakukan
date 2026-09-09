@@ -291,6 +291,25 @@ pub fn start(
 /// 次回 `bg_start` が呼ばれたとき、別キーなら conv_cache::start が
 /// pending を積んで worker が Done を上書きする (`reclaim_nonblocking` 経由で
 /// engine 側で converter を取り戻す経路もある)。
+/// バックグラウンド変換結果を **取り出さずに** 全件のぞく。
+///
+/// `peek_top_candidate` が先頭 1 件だけを返すのに対し、こちらは並べ替え
+/// （`rescore`）のように n-best 全体を見たい呼び出し元が使う。
+/// `take_ready` と違い converter を engine に戻さないので Done 状態は壊れない。
+pub fn peek_candidates(key: &str) -> Option<Vec<String>> {
+    let cache = &**CACHE;
+    let inner = cache.inner.lock().ok()?;
+    if let State::Done {
+        key: k, candidates, ..
+    } = &inner.state
+    {
+        if k == key {
+            return Some(candidates.clone());
+        }
+    }
+    None
+}
+
 pub fn peek_top_candidate(key: &str) -> Option<String> {
     let cache = &**CACHE;
     let inner = cache.inner.lock().ok()?;

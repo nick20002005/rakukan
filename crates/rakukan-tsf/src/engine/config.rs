@@ -335,6 +335,18 @@ fn default_convert_beam_size() -> usize {
     6
 }
 
+fn default_rescore_enabled() -> bool {
+    true
+}
+
+fn default_rescore_min_reading_chars() -> usize {
+    12
+}
+
+fn default_rescore_min_gain() -> f64 {
+    24.0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversionConfig {
     /// Space 変換時のビーム幅の**上限**。num_candidates と併せて min をとる。
@@ -347,6 +359,17 @@ pub struct ConversionConfig {
     /// 新形式では `[conversion].num_candidates` に保存する。
     #[serde(default)]
     pub num_candidates: Option<usize>,
+    /// 長文変換の候補を辞書との整合で並べ替える。
+    /// 読点の無い長文は辞書が完全一致で引けず LLM の区切りだけで決まるので、
+    /// n-best の中から辞書・ユーザー辞書・学習履歴と最も整合する候補を先頭にする。
+    #[serde(default = "default_rescore_enabled")]
+    pub rescore_enabled: bool,
+    /// 並べ替えを適用する読みの最小文字数。これ未満は辞書が完全一致で効く。
+    #[serde(default = "default_rescore_min_reading_chars")]
+    pub rescore_min_reading_chars: usize,
+    /// 先頭候補を押しのけるのに必要なスコア差。小さいほど積極的に入れ替える。
+    #[serde(default = "default_rescore_min_gain")]
+    pub rescore_min_gain: f64,
 }
 
 impl Default for ConversionConfig {
@@ -354,6 +377,9 @@ impl Default for ConversionConfig {
         Self {
             beam_size: default_convert_beam_size(),
             num_candidates: None,
+            rescore_enabled: default_rescore_enabled(),
+            rescore_min_reading_chars: default_rescore_min_reading_chars(),
+            rescore_min_gain: default_rescore_min_gain(),
         }
     }
 }
@@ -663,6 +689,18 @@ beam_size = 6
 # Space 変換で表示する候補数（1〜30、デフォルト 6）。
 # 新形式は [conversion].num_candidates。旧形式のルート直下 num_candidates も引き続き読める。
 # num_candidates = 6
+
+# 長文変換の候補並べ替え。
+# 読点の無い長文は辞書が「読み全体の完全一致」で引けず、区切りが LLM の
+# 出力だけで決まる。有効にすると n-best のそれぞれを読みへ割り戻し、
+# ユーザー辞書・学習履歴・MOZC 辞書と最も整合する候補を先頭に繰り上げる
+# （候補の集合・件数は変えない）。
+rescore_enabled = true
+# 並べ替えを適用する読みの最小文字数（これ未満は辞書が完全一致で効く）
+rescore_min_reading_chars = 12
+# 先頭候補を押しのけるのに必要なスコア差。小さいほど積極的に入れ替える。
+# 語の読み長の二乗 × 出自の重み（ユーザー辞書3 / 学習2 / 辞書1）で採点する。
+rescore_min_gain = 24.0
 
 [prediction]
 # 短文予測（Google 日本語入力の「予測候補」相当）。
