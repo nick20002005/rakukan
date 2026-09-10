@@ -604,6 +604,10 @@ pub struct RakunEngine {
     /// 末尾エントリは pending_romaji_buf に対応する未確定分（確定時に上書き）。
     /// F9/F10 でかな→ローマ字復元に使用する。
     romaji_input_log: Vec<String>,
+    /// 直前まで連続して積んだ「記号 1 文字 = 打鍵ログ 1 エントリ」の本数。
+    /// `collapse_symbol_repeat` が打鍵ログを縮めてよいかの判定に使う。
+    /// `force_preedit` のように読みだけを差し替えた直後は 0 に戻る。
+    symbol_log_run: usize,
     committed: String,
     dict_store: Option<DictStore>,
     /// 直近に「短文予測」として提示した候補: `(提示した読み, [(登録キー, surface)])`。
@@ -623,6 +627,7 @@ impl RakunEngine {
             hiragana_buf: String::new(),
             pending_romaji_buf: String::new(),
             romaji_input_log: Vec::new(),
+            symbol_log_run: 0,
             committed: String::new(),
             dict_store: None,
             last_predictions: Mutex::new(None),
@@ -684,9 +689,28 @@ impl RakunEngine {
         // 読みが伸びた打鍵だけを見る。force_preedit で置かれた末尾を、無関係な
         // 次の打鍵で遡って畳まないため。
         if self.hiragana_buf.len() > before {
+            let added: Vec<char> = self.hiragana_buf[before..].chars().collect();
+            self.bump_symbol_log_run(&added);
             self.collapse_symbol_repeat();
         }
         self.current_preedit()
+    }
+
+    /// 記号 1 文字を積んだ打鍵の連続本数を更新する。
+    ///
+    /// 1 打鍵で読みが 1 文字だけ伸び、その 1 文字が畳み込み対象の記号なら +1、
+    /// それ以外は 0 に戻す。[`Self::collapse_symbol_repeat`] が打鍵ログを
+    /// 縮めてよいかの判定に使う。
+    fn bump_symbol_log_run(&mut self, added: &[char]) {
+        let is_symbol = added.len() == 1
+            && SYMBOL_REPEAT_RULES
+                .iter()
+                .any(|(pattern, _)| pattern.starts_with(added[0]));
+        if is_symbol {
+            self.symbol_log_run += 1;
+        } else {
+            self.symbol_log_run = 0;
+        }
     }
 
     /// 記号の連打を 1 文字へ畳む（`。。。` → `⋯`）。
@@ -712,11 +736,25 @@ impl RakunEngine {
         self.hiragana_buf.push_str(output);
         self.romaji.replace_output_tail(pattern, output);
         // 記号は 1 文字 = 1 エントリで積まれている（trie / push_raw / separator の
-        // どの経路でも）ので、末尾 n 件をまとめて置き換える。
-        let keep = self.romaji_input_log.len().saturating_sub(n);
-        self.romaji_input_log.truncate(keep);
-        self.romaji_input_log.push(output.to_string());
-        debug!("engine::push: symbol repeat {:?} → {:?}", pattern, output);
+        // どの経路でも）ので、畳んだ n 文字を打鍵したのが自分なら末尾 n 件を
+        // まとめて置き換える。
+        //
+        // 末尾が自分の打鍵でないときは打鍵ログに触らない。TSF の `on_punctuate`
+        // は候補選択中に `force_preedit`（prefix + 変換対象）で読みを差し替えて
+        // から記号を積むので、ログの末尾は remainder の打鍵になっており、
+        // truncate するとそれを消す（F9/F10 の復元が壊れる）。
+        if self.symbol_log_run >= n {
+            let keep = self.romaji_input_log.len().saturating_sub(n);
+            self.romaji_input_log.truncate(keep);
+            self.romaji_input_log.push(output.to_string());
+            debug!("engine::push: symbol repeat {:?} → {:?}", pattern, output);
+        } else {
+            debug!(
+                "engine::push: symbol repeat {:?} → {:?} (打鍵ログは保持: run={})",
+                pattern, output, self.symbol_log_run
+            );
+        }
+        self.symbol_log_run = 0;
         true
     }
 
@@ -824,6 +862,8 @@ impl RakunEngine {
         self.hiragana_buf = text;
         self.pending_romaji_buf.clear();
         self.romaji = RomajiConverter::new();
+        // 読みだけを差し替えた末尾は「自分が打った記号」ではない。
+        self.symbol_log_run = 0;
     }
 
     /// 未確定のローマ字を確定させてから hiragana_buf に積む。
@@ -853,6 +893,7 @@ impl RakunEngine {
         self.romaji_input_log.push(c.to_string());
         // TSF は `.` `,` `/` を `direct_input_symbol` で和文記号に変えてから
         // この経路で積む（`push_char` を通らない）ので、ここでも畳む。
+        self.bump_symbol_log_run(&[c]);
         self.collapse_symbol_repeat();
     }
 
@@ -2197,6 +2238,24 @@ mod symbol_input_tests {
         assert_eq!(e.hiragana_text(), "そう");
         assert!(e.backspace());
         assert_eq!(e.hiragana_text(), "そ");
+    }
+
+    #[test]
+    fn symbol_fold_keeps_log_when_tail_is_not_typed_symbols() {
+        // TSF の `on_punctuate` は候補選択中に `force_preedit`（prefix + 変換対象）
+        // で読みを差し替えてから記号を積む。このとき打鍵ログの末尾は remainder の
+        // 打鍵なので、畳み込みで truncate してはいけない。
+        let mut e = RakunEngine::new(crate::EngineConfig::default());
+        for c in "sou..ka".chars() {
+            e.push_char(c);
+        }
+        assert_eq!(e.hiragana_text(), "そう。。か");
+        let before = e.romaji_input_log.clone();
+        e.force_preedit("そう。。".to_string());
+        e.push_raw('。');
+        assert_eq!(e.hiragana_text(), "そう⋯");
+        // 既存のエントリ（remainder の `ka` を含む）はそのまま残る
+        assert_eq!(&e.romaji_input_log[..before.len()], &before[..]);
     }
 
     #[test]
