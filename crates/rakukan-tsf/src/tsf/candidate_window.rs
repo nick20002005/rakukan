@@ -1184,6 +1184,81 @@ pub fn stop_waiting_timer() {
     }
 }
 
+/// Selecting 中の `llm_pending` を降ろす。
+///
+/// LLM の結果を待つのをやめる全経路で必要になる。立てたまま抜けると
+/// `on_convert` が「まだ変換中」と判断して Space を無視し続けるため、
+/// 候補送りも確定もできない状態でウィンドウが固まる。
+fn clear_llm_pending() {
+    use crate::engine::state::{SessionState, session_get};
+    if let Ok(mut sess) = session_get()
+        && let SessionState::Selecting {
+            ref mut llm_pending,
+            ..
+        } = *sess
+    {
+        *llm_pending = false;
+    }
+}
+
+/// 推論が失敗したときに候補ウィンドウへ出す文言。
+///
+/// GPU デバイスが消えたことも、エンジンを入れ直せば直ることも、ユーザーには
+/// 推測しようがない。特に「ドライバを入れ替えた後は入れ直しが要る」は、
+/// 黙って復帰させている限り一生気付けない。自力で直せた場合はその旨を、
+/// 直せなかった場合は次に何を試せばよいかを出す。
+pub fn bg_failure_status_text(action: crate::engine::state::BgFailureAction) -> &'static str {
+    use crate::engine::state::BgFailureAction;
+    match action {
+        BgFailureAction::Counting => "⚠ 変換エンジンが応答していません（辞書候補のみ）",
+        BgFailureAction::Reloading => "⚠ 変換エンジンを再起動中…（GPU ドライバ更新後に必要）",
+        BgFailureAction::ReloadDidNotHelp => "⚠ GPU が使えません。Windows の再起動をお試しください",
+    }
+}
+
+/// 推論が失敗した（`bg_status() == "error"`）ときの後始末。
+///
+/// 失敗した結果をキャッシュから回収して idle に戻し、連続失敗を数え、
+/// 表示中の辞書候補で操作を続けられる状態にする。GPU デバイスが消えている
+/// 場合は `bg_failure_watchdog` が規定回数でエンジンを再起動する。
+fn bg_failure_fallback(site: &str) {
+    use crate::engine::state::engine_get;
+    tracing::warn!("{site}: inference failed — falling back to dict candidates");
+    if let Ok(mut g) = engine_get()
+        && let Some(engine) = g.as_mut()
+    {
+        engine.bg_reclaim();
+    }
+    let action = crate::engine::state::bg_failure_watchdog();
+    clear_llm_pending();
+    stop_waiting_timer();
+
+    // 「⏳ 変換中...」のままだと、待てば直ると誤解させる。
+    // 実際には LLM 候補は来ないので、いま何が起きているかを出す。
+    let shown = match crate::engine::state::session_get() {
+        Ok(sess) => {
+            let cands = sess.page_candidates().to_vec();
+            let selected = sess.page_selected();
+            let info = sess.page_info();
+            Some((cands, selected, info))
+        }
+        Err(_) => None,
+    };
+    if let Some((cands, selected, info)) = shown
+        && !cands.is_empty()
+    {
+        let pos = crate::engine::state::caret_rect_get();
+        show_with_status(
+            &cands,
+            selected,
+            &info,
+            pos.left,
+            pos.bottom,
+            Some(bg_failure_status_text(action)),
+        );
+    }
+}
+
 /// WM_TIMER コールバック（TSFスレッド上で呼ばれる）。
 /// bg_status == "done" になったら候補を取り出して表示する。
 pub fn on_waiting_timer() {
@@ -1217,13 +1292,21 @@ pub fn on_waiting_timer() {
     };
 
     if let Some((preedit_key, pos_x, pos_y)) = selecting_info {
-        let bg_done = match engine_get() {
-            Ok(g) => g.as_ref().map(|e| e.bg_status() == "done").unwrap_or(false),
-            Err(_) => false,
+        let bg_status = match engine_get() {
+            Ok(g) => g.as_ref().map(|e| e.bg_status()).unwrap_or("idle"),
+            Err(_) => "idle",
         };
-        if !bg_done {
+        if bg_status == "error" {
+            // 推論が落ちた。候補は永久に来ないので、待機表示のまま固まらせず
+            // 辞書候補で確定できる状態に戻す。
+            bg_failure_fallback("on_waiting_timer(selecting)");
             return;
         }
+        if bg_status != "done" {
+            return;
+        }
+        // 推論が通った = デバイスは生きている
+        crate::engine::state::bg_failure_reset();
 
         const DICT_LIMIT: usize = 40;
         let result = (|| -> Option<Vec<String>> {
@@ -1260,6 +1343,9 @@ pub fn on_waiting_timer() {
             tracing::warn!(
                 "on_waiting_timer(selecting): bg_take_candidates returned None or empty"
             );
+            // llm_pending を降ろさずに抜けると、以降 Space が候補送りに
+            // 進めなくなる（on_convert が「変換中」と見なして待ち続ける）。
+            clear_llm_pending();
             stop_waiting_timer();
             return;
         };
@@ -1373,16 +1459,32 @@ pub fn on_waiting_timer() {
     };
 
     // engine の bg_status を確認
-    let bg_done = {
+    let bg_status = {
         match engine_get() {
-            Ok(g) => g.as_ref().map(|e| e.bg_status() == "done").unwrap_or(false),
-            Err(_) => false,
+            Ok(g) => g.as_ref().map(|e| e.bg_status()).unwrap_or("idle"),
+            Err(_) => "idle",
         }
     };
 
-    if !bg_done {
+    if bg_status == "error" {
+        // 推論が落ちた。待ち続けても完了しないのでタイマーを止め、
+        // 連続失敗ならエンジンを再起動して次の変換に備える。
+        tracing::warn!("on_waiting_timer: inference failed, stopping wait");
+        if let Ok(mut g) = engine_get()
+            && let Some(engine) = g.as_mut()
+        {
+            engine.bg_reclaim();
+        }
+        let _ = crate::engine::state::bg_failure_watchdog();
+        stop_waiting_timer();
+        return;
+    }
+
+    if bg_status != "done" {
         return; // まだ実行中 → 次の WM_TIMER を待つ
     }
+    // 推論が通った = デバイスは生きている
+    crate::engine::state::bg_failure_reset();
 
     // bg=done → 候補を取り出して表示
     stop_waiting_timer();
