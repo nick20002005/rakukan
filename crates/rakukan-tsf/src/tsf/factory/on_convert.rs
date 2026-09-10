@@ -166,6 +166,29 @@ fn is_weak_merge(merged: &[String], reading: &str, preedit: &str) -> bool {
     }
 }
 
+/// TSF 側が握ったままの「モデル未ロード」を解く。
+///
+/// エンジンホストが再起動すると、その瞬間に `is_kanji_ready=false` を掴んだ
+/// プロセスは自分から poll し直さない。復帰を試みるのが `on_convert[new]` の
+/// 中だけだったため、区読点を含む文（BlockSelecting 経路）はホスト再起動後
+/// ずっと変換できず生かなが返り続けた（2026-09-10）。
+fn ensure_model_ready(engine: &mut crate::engine::state::DynEngine) -> bool {
+    if engine.is_kanji_ready() {
+        return true;
+    }
+    let err = engine.last_error();
+    tracing::warn!("on_convert: kanji not ready, engine status={:?}", err);
+    if err == "model load complete" && engine.poll_model_ready() {
+        let ready = engine.is_kanji_ready();
+        tracing::info!(
+            "on_convert: model load complete was pending injection, kanji_ready={}",
+            ready
+        );
+        return ready;
+    }
+    false
+}
+
 /// 辞書・学習履歴だけで即時に出せる候補を返す（LLM 完了前の先行表示用）。
 ///
 /// 辞書検索の reading は `hiragana_text()`（未確定ローマ字を含まない読み）。
@@ -228,6 +251,10 @@ impl super::TextServiceFactory_Impl {
                 }
             }
         }
+
+        // 分岐に入る前にモデル未ロードのラッチを解く。区読点分割（Block）
+        // 経路はこの復帰を通らないので、ここで解かないと生かなのまま返る。
+        let _ = ensure_model_ready(engine);
 
         // ── LiveConv（ライブ変換表示中）: Space → reading で通常変換へ ──────
         // engine の hiragana_buf は LiveConv 遷移後も変化していないため、
@@ -958,15 +985,7 @@ impl super::TextServiceFactory_Impl {
             convert_mark("bg_start", convert_start, &mut convert_last);
         }
         if !kanji_ready {
-            let err = engine.last_error();
-            tracing::warn!("on_convert: kanji not ready, engine status={:?}", err);
-            if err == "model load complete" && engine.poll_model_ready() {
-                kanji_ready = engine.is_kanji_ready();
-                tracing::info!(
-                    "on_convert: model load complete was pending injection, kanji_ready={}",
-                    kanji_ready
-                );
-            }
+            kanji_ready = ensure_model_ready(engine);
         }
 
         let bg_status = engine.bg_status();

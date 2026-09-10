@@ -406,6 +406,9 @@ pub extern "C" fn engine_merge_candidates_for_reading(
 }
 
 // ─── 初期化（非同期）──────────────────────────────────────────────────────────
+/// モデルのロードが走っている間だけ true。`engine_poll_model_ready` からも
+/// 「誰もロードしていない」を判定するためにモジュール共有にしてある。
+static MODEL_LOADING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// モデル（漢字変換 LLM）のロードをバックグラウンドで開始する。
 ///
@@ -416,8 +419,6 @@ pub extern "C" fn engine_merge_candidates_for_reading(
 /// 併せて `MODEL_LOADING` ガードで並行 spawn を抑止する（`DICT_LOADING` と同形式）。
 #[unsafe(no_mangle)]
 pub extern "C" fn engine_start_load_model(handle: *mut c_void) {
-    static MODEL_LOADING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
     let engine = unsafe { &mut *(handle as *mut RakunEngine) };
     if engine.is_kanji_ready() {
         return;
@@ -511,7 +512,39 @@ pub extern "C" fn engine_poll_model_ready(handle: *mut c_void) -> bool {
             None => {}
         }
     }
+    // ここまで来た＝converter を持っておらず、注入待ちも無い。
+    //
+    // 🔴 ホスト再起動の直後に複数プロセスの Create が競合すると、モデルを
+    //    積んだ engine がそのまま差し替えられ、生き残った engine は
+    //    kanji=None・PENDING_CONVERTER 空・ロード未起動で固まる。誰も
+    //    start_load_model を呼び直さないので、辞書だけが効いて LLM 変換が
+    //    永久に返らなくなる（2026-09-10 に実害。区読点を含む文が生かなのまま）。
+    //    poll は変換のたびに来るので、ここから自分でロードを再開する。
+    if !MODEL_LOADING.load(std::sync::atomic::Ordering::Acquire)
+        && !crate::conv_cache::has_converter()
+        && auto_reload_cooldown_elapsed()
+    {
+        tracing::warn!("poll_model_ready: converter missing and no load in flight → reloading");
+        engine_start_load_model(handle);
+    }
     false
+}
+
+/// 自動再ロードの連打防止。ロードが失敗し続けるときに poll のたびに
+/// スレッドを起こさないよう、5 秒に 1 回までに絞る。
+fn auto_reload_cooldown_elapsed() -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static START: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
+    static LAST_MS: AtomicU64 = AtomicU64::new(0);
+    const COOLDOWN_MS: u64 = 5_000;
+
+    let now = START.elapsed().as_millis() as u64 + 1;
+    let last = LAST_MS.load(Ordering::Acquire);
+    if last != 0 && now.saturating_sub(last) < COOLDOWN_MS {
+        return false;
+    }
+    LAST_MS.store(now, Ordering::Release);
+    true
 }
 
 /// 辞書のロードをバックグラウンドで開始する。
