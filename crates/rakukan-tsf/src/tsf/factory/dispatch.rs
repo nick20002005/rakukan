@@ -24,6 +24,11 @@ impl super::TextServiceFactory_Impl {
         tid: u32,
         sink: ITfCompositionSink,
     ) -> Result<bool> {
+        // 直前の確定が edit session 拒否で書けていない場合、このキーが
+        // composition を書き換える前に書き直す（composition は失敗時に take
+        // されていないので、ここならまだ確定先が生きている）。
+        super::on_compose::retry_pending_commit("key");
+
         let mut guard = engine_try_get_or_create()?;
         let engine = match guard.as_mut() {
             Some(e) => e,

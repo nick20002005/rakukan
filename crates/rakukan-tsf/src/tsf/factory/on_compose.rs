@@ -11,9 +11,13 @@
 //!   `get_insert_range_or_end` / `get_document_end_range`)
 //! - 表示属性ヘルパー (`set_display_attr_prop`)
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+
 use anyhow::Result;
 use windows::Win32::UI::TextServices::{
-    GUID_PROP_ATTRIBUTE, ITfCompositionSink, ITfContext, TF_ES_READWRITE,
+    GUID_PROP_ATTRIBUTE, ITfCompositionSink, ITfContext, ITfEditSession,
+    TF_CONTEXT_EDIT_CONTEXT_FLAGS, TF_ES_ASYNC, TF_ES_READWRITE,
 };
 use windows::core::Interface;
 
@@ -22,6 +26,217 @@ use crate::engine::state::{
 };
 use crate::tsf::display_attr;
 use crate::tsf::edit_session::EditSession;
+
+// ─── 確定 EditSession の投入とリトライ ────────────────────────────────────────
+//
+// `RequestEditSession` の失敗は **out の hr** で返る（Rust 側の Result は呼び出し
+// そのものの失敗しか表さない）。ここを見ないと DoEditSession が一度も走らなかった
+// 場合でも成功扱いになり、確定テキストが 1 文字も書かれないまま消える。呼び元は
+// end_composition より前に engine.commit() / reset_preedit() を済ませているため、
+// 失われたテキストはどこにも残らない。
+//
+// 実測 (rakukan.log.1 2026-09-13T14:06:16): CommitRaw の直後に
+// hr=TS_E_READONLY(0x80040209) で edit session が走らず、確定済みの
+// 「同人パブリシャーを書き換える」が消えて打ち直しになった。同型の穴が
+// commit_then_start_composition / commit_text にもあり、そちらは hr を捨てて
+// いたためログにすら残っていなかった。
+
+/// 確定テキストを書き直す最大試行回数（初回を含む）。
+const COMMIT_RETRY_MAX: u32 = 3;
+
+/// 確定 EditSession の投入結果。
+enum CommitDispatch {
+    /// DoEditSession が走った（中身の成否はセッション内でログ済み）。
+    Executed,
+    /// TSF は受け付けたが実行は後（TF_ES_ASYNC）。実行の有無は `ran` で確かめる。
+    Deferred,
+    /// sync / async とも拒否された。テキストはまだどこにも書かれていない。
+    Rejected,
+}
+
+/// 書き込めなかった確定テキスト。次の打鍵とフォーカス喪失で書き直す。
+struct PendingCommit {
+    text: String,
+    /// 失敗時の DocumentMgr。別の入力欄へ書き込まないための照合用。
+    dm_ptr: usize,
+    /// 書き込みの占有券。最初に走った DoEditSession がこれを立て、後から走った
+    /// セッションは何もせずに戻る。TF_ES_ASYNC で積まれたセッションと書き直しの
+    /// セッションが両方走っても二重に書かないための唯一の防壁。
+    ran: Arc<AtomicBool>,
+    attempt: u32,
+}
+
+static PENDING_COMMIT: Mutex<Option<PendingCommit>> = Mutex::new(None);
+
+/// TSF DLL はアプリのプロセス内で動くので current_exe = 発生アプリ。
+fn current_app_name() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_default()
+}
+
+/// 拒否の理由切り分け用（TS_SD_READONLY=0x1 / TS_SD_LOADING=0x2）。
+fn doc_status(ctx: &ITfContext) -> String {
+    match unsafe { ctx.GetStatus() } {
+        Ok(st) => format!(
+            "dyn=0x{:x} static=0x{:x}",
+            st.dwDynamicFlags, st.dwStaticFlags
+        ),
+        Err(e) => format!("GetStatus failed: {e}"),
+    }
+}
+
+/// 確定系の EditSession を投入する。sync で拒否されたら TF_ES_ASYNC で投げ直す。
+///
+/// `EditSession` のクロージャは `DoEditSession` の中で `take()` されるため、
+/// 拒否されたセッションはそのまま再投入してよい（二重実行にはならない）。
+/// TF_ES_ASYNC で積んだセッションが後から走るケースは、`ran` を占有券として
+/// 使う各セッション先頭の `swap` で弾く。
+fn request_commit_session(
+    ctx: &ITfContext,
+    tid: u32,
+    session: &ITfEditSession,
+    ran: &Arc<AtomicBool>,
+    site: &str,
+    text: &str,
+) -> CommitDispatch {
+    match unsafe { ctx.RequestEditSession(tid, session, TF_ES_READWRITE) } {
+        Ok(hr) if hr.is_ok() => return CommitDispatch::Executed,
+        Ok(hr) => {
+            if ran.load(Ordering::SeqCst) {
+                // セッションは走った上でクロージャが Err を返した。再投入すると
+                // 二重に書く可能性があるのでここで止める。
+                tracing::warn!(
+                    "{site}: edit session ran but returned an error hr={hr:?} text={text:?} app={} status={}",
+                    current_app_name(),
+                    doc_status(ctx)
+                );
+                return CommitDispatch::Executed;
+            }
+            tracing::warn!(
+                "{site}: edit session not granted hr={hr:?} text={text:?} app={} status={} → retry async",
+                current_app_name(),
+                doc_status(ctx)
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                "{site}: RequestEditSession failed: {e} text={text:?} app={} status={} → retry async",
+                current_app_name(),
+                doc_status(ctx)
+            );
+        }
+    }
+
+    let async_flags = TF_CONTEXT_EDIT_CONTEXT_FLAGS(TF_ES_READWRITE.0 | TF_ES_ASYNC.0);
+    match unsafe { ctx.RequestEditSession(tid, session, async_flags) } {
+        Ok(hr) if hr.is_ok() => {
+            if ran.load(Ordering::SeqCst) {
+                CommitDispatch::Executed
+            } else {
+                // TS_S_ASYNC。実際に走るかは保証されないので pending にも積んでおく。
+                tracing::info!("{site}: queued as async edit session text={text:?}");
+                CommitDispatch::Deferred
+            }
+        }
+        Ok(hr) => {
+            tracing::warn!("{site}: async edit session rejected hr={hr:?} text={text:?}");
+            CommitDispatch::Rejected
+        }
+        Err(e) => {
+            tracing::warn!("{site}: async RequestEditSession failed: {e} text={text:?}");
+            CommitDispatch::Rejected
+        }
+    }
+}
+
+/// 書き込めなかった確定テキストを控える。`retry_pending_commit` が書き直す。
+fn pending_commit_push(
+    ctx: &ITfContext,
+    text: String,
+    ran: Arc<AtomicBool>,
+    attempt: u32,
+    site: &str,
+) {
+    if text.is_empty() {
+        return;
+    }
+    let dm_ptr = unsafe { ctx.GetDocumentMgr() }
+        .ok()
+        .map(|dm| dm.as_raw() as usize)
+        .unwrap_or(0);
+    tracing::warn!("pending_commit: queued site={site} attempt={attempt} text={text:?}");
+    let mut slot = PENDING_COMMIT
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(prev) = slot.replace(PendingCommit {
+        text,
+        dm_ptr,
+        ran,
+        attempt,
+    }) && !prev.ran.load(Ordering::SeqCst)
+    {
+        tracing::error!(
+            "pending_commit: dropped an earlier pending commit text={:?}",
+            prev.text
+        );
+    }
+}
+
+/// 取りこぼした確定テキストを書き直す。
+///
+/// 呼ぶのは「次の打鍵の入口」と「スレッドフォーカス喪失」の 2 箇所。打鍵の入口で
+/// 先に流し切ることで、そのキーの `update_composition` が composition を書き換える
+/// 前に確定が済む（composition は失敗時に take されていないのでまだ生きている）。
+pub(super) fn retry_pending_commit(trigger: &str) {
+    let entry = {
+        let mut slot = PENDING_COMMIT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        slot.take()
+    };
+    let Some(entry) = entry else {
+        return;
+    };
+    if entry.ran.load(Ordering::SeqCst) {
+        tracing::debug!(
+            "pending_commit: already applied, dropping text={:?}",
+            entry.text
+        );
+        return;
+    }
+    let attempt = entry.attempt + 1;
+    if attempt >= COMMIT_RETRY_MAX {
+        tracing::error!(
+            "pending_commit: gave up after {attempt} attempts, text lost text={:?}",
+            entry.text
+        );
+        return;
+    }
+    let (ctx, tid, dm_ptr) = crate::tsf::live_session::last_input_context();
+    let Some(ctx) = ctx else {
+        tracing::error!(
+            "pending_commit: no context to retry into, text lost text={:?}",
+            entry.text
+        );
+        return;
+    };
+    if entry.dm_ptr != 0 && dm_ptr != entry.dm_ptr {
+        tracing::error!(
+            "pending_commit: document changed (0x{:x} → 0x{:x}), not retrying text={:?}",
+            entry.dm_ptr,
+            dm_ptr,
+            entry.text
+        );
+        return;
+    }
+    tracing::warn!(
+        "pending_commit: retrying trigger={trigger} attempt={attempt} text={:?}",
+        entry.text
+    );
+    let _ = end_composition_attempt(ctx, tid, entry.text, attempt, entry.ran);
+}
 
 /// TSF コンテキストからキャレットのスクリーン座標 (x, y_bottom) を取得する。
 /// mozc の FillCharPosition と同じアプローチ: GetSelection → GetTextExt。
@@ -277,10 +492,18 @@ pub(super) fn update_composition_at(
 
         Ok(())
     });
+    // preedit の更新は失敗しても次の打鍵で書き直されるためリトライしないが、
+    // 「表示が古いまま」の調査にはログが要る。
     unsafe {
-        let _ = ctx_req
-            .RequestEditSession(tid, &session, TF_ES_READWRITE)
-            .map_err(|e| anyhow::anyhow!("RequestEditSession update: {e}"));
+        match ctx_req.RequestEditSession(tid, &session, TF_ES_READWRITE) {
+            Ok(hr) if hr.is_err() => {
+                tracing::debug!("update_composition: edit session failed hr={hr:?}");
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::debug!("update_composition: RequestEditSession failed: {e}");
+            }
+        }
     }
     Ok(())
 }
@@ -309,7 +532,14 @@ pub(super) fn commit_then_start_composition(
     // セッション外で take すると COMPOSITION=None になった瞬間に update_composition が
     // 誤ったカーソル位置から新 composition を開始するリスクがある。
     let ctx_req = ctx.clone();
+    let text_for_retry = commit_text.clone();
+    let ran = Arc::new(AtomicBool::new(false));
+    let ran_in_session = ran.clone();
     let session = EditSession::new(move |ec| unsafe {
+        if ran_in_session.swap(true, Ordering::SeqCst) {
+            tracing::debug!("commit_then_start[session]: already written, skipping");
+            return Ok(());
+        }
         use windows::Win32::UI::TextServices::{
             ITfContextComposition, TF_ANCHOR_END, TF_SELECTION, TF_SELECTIONSTYLE, TfActiveSelEnd,
         };
@@ -438,10 +668,22 @@ pub(super) fn commit_then_start_composition(
 
         Ok(())
     });
-    unsafe {
-        let _ = ctx_req
-            .RequestEditSession(tid, &session, TF_ES_READWRITE)
-            .map_err(|e| anyhow::anyhow!("RequestEditSession commit_then_start: {e}"));
+    // セッションが走らなかった場合、確定テキストと次の preedit の両方が消える。
+    // 控えに積めるのは確定テキストだけなので、書き直しは end_composition 相当に
+    // なる（次の preedit は engine 側に残っており、次の打鍵で composition が
+    // 作り直される）。
+    match request_commit_session(
+        &ctx_req,
+        tid,
+        &session,
+        &ran,
+        "commit_then_start",
+        &text_for_retry,
+    ) {
+        CommitDispatch::Executed => {}
+        CommitDispatch::Deferred | CommitDispatch::Rejected => {
+            pending_commit_push(&ctx_req, text_for_retry, ran, 0, "commit_then_start");
+        }
     }
     Ok(())
 }
@@ -657,9 +899,15 @@ fn update_composition_parts_impl(
         Ok(())
     });
     unsafe {
-        let _ = ctx_req
-            .RequestEditSession(tid, &session, TF_ES_READWRITE)
-            .map_err(|e| anyhow::anyhow!("RequestEditSession candidate_split: {e}"));
+        match ctx_req.RequestEditSession(tid, &session, TF_ES_READWRITE) {
+            Ok(hr) if hr.is_err() => {
+                tracing::debug!("candidate_split: edit session failed hr={hr:?}");
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::debug!("candidate_split: RequestEditSession failed: {e}");
+            }
+        }
     }
     Ok(())
 }
@@ -690,6 +938,21 @@ pub(super) fn update_caret_rect(ctx: ITfContext, tid: u32) {
 }
 
 pub(super) fn end_composition(ctx: ITfContext, tid: u32, text: String) -> Result<()> {
+    end_composition_attempt(ctx, tid, text, 0, Arc::new(AtomicBool::new(false)))
+}
+
+/// `end_composition` の本体。
+///
+/// - `attempt`: `retry_pending_commit` からの書き直し回数。
+/// - `claim`: 書き込みの占有券。書き直しでは元のセッションと同じものを渡し、
+///   先に走った側だけが実際に書くようにする。
+fn end_composition_attempt(
+    ctx: ITfContext,
+    tid: u32,
+    text: String,
+    attempt: u32,
+    claim: Arc<AtomicBool>,
+) -> Result<()> {
     use windows::Win32::Foundation::E_FAIL;
     use windows::Win32::UI::TextServices::{
         TF_ANCHOR_END, TF_SELECTION, TF_SELECTIONSTYLE, TfActiveSelEnd,
@@ -701,7 +964,14 @@ pub(super) fn end_composition(ctx: ITfContext, tid: u32, text: String) -> Result
     // セッション外で take すると COMPOSITION=None になった直後に次のキー入力が来たとき、
     // update_composition が existing=None を見て誤った位置から新 composition を開始してしまう。
     let ctx2 = ctx.clone();
+    let text_for_retry = text.clone();
+    let ran = claim;
+    let ran_in_session = ran.clone();
     let session = EditSession::new(move |ec| unsafe {
+        if ran_in_session.swap(true, Ordering::SeqCst) {
+            tracing::debug!("end_composition[session]: already written, skipping");
+            return Ok(());
+        }
         // SetText 排他化（commit_then_start_composition と同様、確定なので
         // try_lock + skip ではなくブロッキングで取得する）
         let _apply_guard = crate::engine::state::COMPOSITION_APPLY_LOCK
@@ -770,22 +1040,27 @@ pub(super) fn end_composition(ctx: ITfContext, tid: u32, text: String) -> Result
         }
 
         comp.EndComposition(ec).map_err(|e| {
-            tracing::warn!("end_composition: EndComposition failed text={:?}: {e}", text);
+            tracing::warn!(
+                "end_composition: EndComposition failed text={:?}: {e}",
+                text
+            );
             windows::core::Error::new(E_FAIL, format!("EndComposition: {e}"))
         })?;
         Ok(())
     });
     // 確定はユーザーテキストを失うと致命的なので、edit session の結果
-    // (phrSession) まで確認して失敗を必ずログに残す。
-    unsafe {
-        match ctx.RequestEditSession(tid, &session, TF_ES_READWRITE) {
-            Ok(hr) if hr.is_err() => {
-                tracing::warn!("end_composition: edit session failed hr={hr:?}");
-            }
-            Ok(_) => {}
-            Err(e) => {
-                tracing::warn!("end_composition: RequestEditSession failed: {e}");
-            }
+    // (phrSession) まで確認し、走らなかったなら書き直しの控えに積む。
+    match request_commit_session(
+        &ctx,
+        tid,
+        &session,
+        &ran,
+        "end_composition",
+        &text_for_retry,
+    ) {
+        CommitDispatch::Executed => {}
+        CommitDispatch::Deferred | CommitDispatch::Rejected => {
+            pending_commit_push(&ctx, text_for_retry, ran, attempt, "end_composition");
         }
     }
     Ok(())
@@ -795,7 +1070,14 @@ pub(super) fn commit_text(ctx: ITfContext, tid: u32, text: String) -> Result<()>
     use windows::Win32::Foundation::E_FAIL;
 
     let ctx_req = ctx.clone();
+    let text_for_retry = text.clone();
+    let ran = Arc::new(AtomicBool::new(false));
+    let ran_in_session = ran.clone();
     let session = EditSession::new(move |ec| unsafe {
+        if ran_in_session.swap(true, Ordering::SeqCst) {
+            tracing::debug!("commit_text[session]: already written, skipping");
+            return Ok(());
+        }
         use windows::Win32::UI::TextServices::{
             TF_ANCHOR_END, TF_SELECTION, TF_SELECTIONSTYLE, TfActiveSelEnd,
         };
@@ -819,10 +1101,18 @@ pub(super) fn commit_text(ctx: ITfContext, tid: u32, text: String) -> Result<()>
         }
         Ok(())
     });
-    unsafe {
-        let _ = ctx_req
-            .RequestEditSession(tid, &session, TF_ES_READWRITE)
-            .map_err(|e| anyhow::anyhow!("RequestEditSession commit: {e}"));
+    match request_commit_session(
+        &ctx_req,
+        tid,
+        &session,
+        &ran,
+        "commit_text",
+        &text_for_retry,
+    ) {
+        CommitDispatch::Executed => {}
+        CommitDispatch::Deferred | CommitDispatch::Rejected => {
+            pending_commit_push(&ctx_req, text_for_retry, ran, 0, "commit_text");
+        }
     }
     Ok(())
 }

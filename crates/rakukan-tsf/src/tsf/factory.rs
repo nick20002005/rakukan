@@ -1476,6 +1476,9 @@ impl ITfThreadFocusSink_Impl for TextServiceFactory_Impl {
 
     fn OnKillThreadFocus(&self) -> windows::core::Result<()> {
         tracing::debug!("OnKillThreadFocus: hide candidate window & stop live timer");
+        // 打鍵が来ないままフォーカスが移ると、書けていない確定テキストを
+        // 書き直す機会が無くなる。まだ元の ITfContext が生きているここで流す。
+        on_compose::retry_pending_commit("kill_focus");
         candidate_window::hide();
         candidate_window::stop_live_timer();
         candidate_window::stop_waiting_timer();
