@@ -1024,6 +1024,8 @@ impl super::TextServiceFactory_Impl {
         // 変わった直後に起動しないと、llm_pending のまま bg=idle で「⏳ 変換中...」が
         // 残る（host 再起動直後の Space、2026-09-12 実機で確認）。
         if kanji_ready && engine.bg_status() == "idle" {
+            // ワーカーが空いている = 前の変換は帰ってきている
+            bg_timeout_watchdog(false);
             tracing::debug!("on_convert: model ready → bg_start");
             engine.bg_start(llm_limit);
             convert_mark("bg_start", convert_start, &mut convert_last);

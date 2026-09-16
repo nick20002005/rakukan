@@ -1473,6 +1473,7 @@ pub fn on_waiting_timer() {
         if bg_status != "done" {
             return;
         }
+        crate::engine::state::bg_timeout_watchdog(false);
 
         const DICT_LIMIT: usize = 40;
         let result = (|| -> Option<Vec<String>> {
@@ -1703,6 +1704,11 @@ pub fn on_waiting_timer() {
     if bg_status != "done" {
         return; // まだ実行中 → 次の WM_TIMER を待つ
     }
+    // 詰まり開始の記録を消す。ここで消さないと、遅れて返った変換の時刻が
+    // 残り続け、次に 250ms を超えた変換で「数十秒詰まっている」と誤判定して
+    // エンジンを再起動する（2026-09-16 実ログ: 1 秒で返った変換の時刻が残り、
+    // 後の長文変換で 65 秒 / 3618 秒の詰まりとして reload された）。
+    crate::engine::state::bg_timeout_watchdog(false);
 
     // bg=done → 候補を取り出して表示
     stop_waiting_timer();

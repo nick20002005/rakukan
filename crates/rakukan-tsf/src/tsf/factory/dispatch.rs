@@ -30,6 +30,48 @@ impl super::TextServiceFactory_Impl {
             None => return Ok(false),
         };
 
+        // ── エンジンホスト再起動で失われた読みを戻す ──
+        // ホストは読みバッファが空の状態で立ち上がるが、セッションと composition は
+        // 未確定文字を持ったまま残る。放置すると Space も Backspace も空の読みに
+        // 対して動き、画面の文字を一切操作できなくなる（2026-09-16 実ログ:
+        // state=Preedit("かくていが…はず") hira="" で Space・Backspace とも無反応）。
+        // ホストは他の TSF プロセスからも再起動されるので、自プロセスの reload を
+        // 起点にせず、状態の食い違いそのもので判定する。Esc で全消去した後も
+        // 「セッションは Preedit のまま・engine は空」になるが、そちらは
+        // composition が閉じているので除く。
+        if engine.preedit_is_empty()
+            && matches!(crate::engine::state::composition_clone(), Ok(Some(_)))
+        {
+            let restore = match session_get() {
+                Ok(sess) => match &*sess {
+                    SessionState::Preedit { text } => Some((text.clone(), false)),
+                    SessionState::LiveConv { reading, .. } => Some((reading.clone(), false)),
+                    SessionState::Waiting {
+                        text,
+                        remainder_reading,
+                        ..
+                    } => Some((format!("{text}{remainder_reading}"), true)),
+                    _ => None,
+                },
+                Err(_) => None,
+            };
+            if let Some((reading, was_waiting)) = restore.filter(|(r, _)| !r.is_empty()) {
+                tracing::warn!(
+                    "handle_action: engine reading lost (host restarted?), restoring {:?}",
+                    reading
+                );
+                engine.force_preedit(reading.clone());
+                if was_waiting {
+                    // 待っていた BG 変換は旧ホストと一緒に消えており、待機は終わらない
+                    candidate_window::stop_waiting_timer();
+                    candidate_window::hide();
+                    if let Ok(mut sess) = session_get() {
+                        sess.set_preedit(reading);
+                    }
+                }
+            }
+        }
+
         // ── 診断: 全アクションの入口でセッション状態とBG状態をログ ──
         {
             let bg = engine.bg_status();
