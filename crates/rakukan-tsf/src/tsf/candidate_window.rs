@@ -2840,6 +2840,27 @@ pub fn on_live_timer() {
         stop_live_timer();
         return;
     }
+    // Space 変換を始めたら、画面の未確定文字列の実体はセッション側にある。
+    // BlockSelecting の engine は先頭ブロックの読みしか持たないので、ここで
+    // preview を当てると後続ブロックが表示ごと消え、Enter で先頭だけが確定する。
+    {
+        use crate::engine::state::{SESSION_STATE, SessionState};
+        match SESSION_STATE.try_lock() {
+            Ok(sess)
+                if matches!(
+                    *sess,
+                    SessionState::Idle
+                        | SessionState::Preedit { .. }
+                        | SessionState::LiveConv { .. }
+                ) => {}
+            Ok(_) => {
+                tracing::debug!("[Live] on_live_timer: session is converting, stop live timer");
+                stop_live_timer();
+                return;
+            }
+            Err(_) => return,
+        }
+    }
     let Some(elapsed) = pass_debounce() else {
         return;
     };
