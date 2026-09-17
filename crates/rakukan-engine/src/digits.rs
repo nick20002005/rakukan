@@ -177,27 +177,6 @@ fn is_kanji_number_char(c: char) -> bool {
         || c == '点'
 }
 
-/// 大字（`壱` `弐` `参` `拾`）1 文字だけで構成された漢字 run か。
-///
-/// 大字は金額表記で使う数字だが、`参考` `参加` `持参` の「参」、`拾う` `拾得` の
-/// 「拾」のように、日常語の一部としても現れる。これを数値として数えると、数字を
-/// 含む読みの変換結果が [`verify_digits_preserved`] で「数字が増えた」と判定されて
-/// 捨てられる（2026-09-15 実測: 読み `2まいめをさんこう` に対し変換器は
-/// `2枚目を参考` を返しているが、`参` を 3 と数えるため `2` と `23` の不一致に
-/// なり、読みのままの候補だけが残っていた）。
-///
-/// 大字を本当に数字として使う金額表記は `弐万` `参千` のように位の漢字が続くため
-/// run が 2 文字以上になり、この判定には掛からない。通常の漢数字（`三`）は対象外
-/// なので `3まい` → `三枚` のような既存の同値判定はそのまま動く。`零` は `〇` の
-/// 別表記でもあり大字に限った文字ではないため、ここでは扱わない。
-fn is_lone_daiji(kanji_run: &str) -> bool {
-    let mut chars = kanji_run.chars();
-    let Some(c) = chars.next() else {
-        return false;
-    };
-    chars.next().is_none() && matches!(c, '壱' | '弐' | '参' | '拾')
-}
-
 fn parse_kanji_integer_digits(s: &str) -> Option<String> {
     let mut total = 0u64;
     let mut group = 0u64;
@@ -808,11 +787,6 @@ fn extract_digits(s: &str, reading: &str) -> String {
 
     let flush_kanji_run = |out: &mut String, kanji_run: &mut String, after_digit: bool| {
         if kanji_run.is_empty() {
-            return;
-        }
-        // 大字 1 文字だけの run は数値として数えない（`is_lone_daiji` 参照）。
-        if is_lone_daiji(kanji_run) {
-            kanji_run.clear();
             return;
         }
         // 数字の直後の「万」「千」などは、入力読みに対応する数詞かなが
@@ -1695,23 +1669,6 @@ mod tests {
         assert!(!verify_digits_preserved("2024ねん", "二千二十五年"));
         // 単位だけの run でも、数字に続いていなければ数値として読む
         assert!(!verify_digits_preserved("まん", "5万"));
-    }
-
-    #[test]
-    fn lone_daiji_in_a_word_is_not_a_number() {
-        // 「参考」の「参」を大字の 3 と数えると、変換器が返した正しい候補を
-        // 「数字が増えた」として捨ててしまう（2026-09-15 実測）。
-        assert_eq!(extract_digits("2枚目を参考", "2まいめをさんこう"), "2");
-        assert!(verify_digits_preserved("2まいめをさんこう", "2枚目を参考"));
-        // 「拾う」の「拾」も同じ（単独では 10 と読まない）
-        assert_eq!(extract_digits("1個拾う", "1こひろう"), "1");
-        assert!(verify_digits_preserved("1こひろう", "1個拾う"));
-        // 位の漢字が続く金額表記は従来どおり数値として読む
-        assert_eq!(extract_digits("弐万円", "にまんえん"), "20000");
-        assert_eq!(extract_digits("参千円", "さんぜんえん"), "3000");
-        // 通常の漢数字 1 文字は対象外（3まい → 三枚 の同値判定を壊さない）
-        assert_eq!(extract_digits("三枚", "さんまい"), "3");
-        assert!(verify_digits_preserved("3まい", "三枚"));
     }
 
     #[test]
