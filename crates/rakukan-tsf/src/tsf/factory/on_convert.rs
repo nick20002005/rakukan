@@ -378,6 +378,10 @@ impl super::TextServiceFactory_Impl {
         // engine の hiragana_buf は LiveConv 遷移後も変化していないため、
         // session を Preedit に戻すだけで通常の on_convert フローに乗れる。
         let mut space_live_candidate: Option<CandidateView> = None;
+        // preview が実際に変換済みの読みの長さ（文字数）。preview は
+        // 「preview_for を変換した結果 + それ以降に打った生かな」なので、
+        // これより後ろは変換されていない。
+        let mut space_live_fresh_chars = 0usize;
         {
             let mut sess = session_get()?;
             if sess.is_live_conv() {
@@ -385,6 +389,11 @@ impl super::TextServiceFactory_Impl {
                     .live_conv_parts()
                     .map(|(r, p)| (r.to_string(), p.to_string()))
                     .unwrap_or_default();
+                space_live_fresh_chars = sess
+                    .live_conv_preview_for()
+                    .filter(|preview_for| reading.starts_with(preview_for))
+                    .map(|preview_for| preview_for.chars().count())
+                    .unwrap_or(0);
                 if !preview.is_empty() {
                     space_live_candidate = Some(CandidateView::compatible(
                         preview,
@@ -1000,7 +1009,11 @@ impl super::TextServiceFactory_Impl {
             );
 
             let mut blocks: Vec<ConversionBlock> = Vec::new();
+            // preedit 上でのブロック末尾の位置（文字数）
+            let mut block_offset_chars = 0usize;
             for (block_index, (reading, trailing_punct)) in blocks_raw.into_iter().enumerate() {
+                let block_end_chars = block_offset_chars + reading.chars().count();
+                block_offset_chars = block_end_chars + usize::from(trailing_punct.is_some());
                 if reading.is_empty() {
                     // 区読点のみのブロック（文頭の区読点など）は候補なしで残す
                     blocks.push(ConversionBlock {
@@ -1014,8 +1027,16 @@ impl super::TextServiceFactory_Impl {
                 }
                 // preview があればそれを第 1 候補にし、無い時だけ engine の
                 // プリエディットをこのブロックの読みに差し替えて sync 変換する。
+                //
+                // 🔴 ただし preview が読みの途中までしか変換されていない（打鍵に
+                //    ライブ変換が追いついていない）とき、その先のブロックの
+                //    preview は生かなのまま。これを第 1 候補にすると、Space を
+                //    押しても読点より後ろが変換されず、Enter でひらがなのまま
+                //    確定する（2026-09-18 に実害）。そのブロックは単独変換に落とす。
+                let preview_covers_block = block_end_chars <= space_live_fresh_chars;
                 let preview_top = preview_blocks
                     .as_ref()
+                    .filter(|_| preview_covers_block)
                     .and_then(|v| v.get(block_index))
                     .filter(|s| !s.is_empty())
                     .cloned();
