@@ -77,6 +77,9 @@ pub struct GeneralConfig {
     pub n_gpu_layers: Option<u32>,
     #[serde(default)]
     pub main_gpu: i32,
+    /// LLM 推論スレッド数。未指定（または 0）は llama.cpp の既定値。
+    #[serde(default)]
+    pub n_threads: Option<u32>,
     #[serde(default)]
     pub model_variant: Option<String>,
 }
@@ -88,6 +91,7 @@ impl Default for GeneralConfig {
             gpu_backend: None,
             n_gpu_layers: None,
             main_gpu: 0,
+            n_threads: None,
             model_variant: None,
         }
     }
@@ -675,6 +679,10 @@ n_gpu_layers = 16
 
 # 使用する GPU インデックス（複数 GPU 環境で 2 枚目以降を使う場合に変更）
 main_gpu = 0
+
+# CPU 推論のスレッド数（コメントアウト時は llama.cpp の既定値）
+# ゲーム等と CPU を取り合って変換が遅い場合に調整する
+# n_threads = 4
 
 # LLM モデル ID
 # jinen-v1-xsmall-q5  : 軽量・推奨（約 30 MB、低スペック PC 向け、デフォルト）

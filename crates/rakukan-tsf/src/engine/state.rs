@@ -648,6 +648,7 @@ fn build_engine_config_json() -> String {
     let num_candidates = cfg.effective_num_candidates();
     let main_gpu = cfg.general.main_gpu;
     let n_gpu_layers = cfg.general.n_gpu_layers.unwrap_or(u32::MAX);
+    let n_threads = cfg.general.n_threads.unwrap_or(0);
     let model_variant = cfg.general.model_variant.clone();
     let digit_width = match cfg.input.digit_width {
         super::config::DigitWidth::Fullwidth => "fullwidth",
@@ -685,7 +686,7 @@ fn build_engine_config_json() -> String {
         .join(",");
 
     tracing::info!(
-        "engine config: num_candidates={num_candidates} n_gpu_layers={n_gpu_layers} main_gpu={main_gpu} model_variant={model_variant:?} digit_width={digit_width} alpha_width={alpha_width} symbol_width={symbol_width} digit_separator_auto={digit_separator_auto} digit_candidates_order=[{digit_candidates_order}] live_conv_beam_size={live_conv_beam_size} convert_beam_size={convert_beam_size} prediction_enabled={prediction_enabled} prediction_max_candidates={prediction_max_candidates} prediction_min_reading_chars={prediction_min_reading_chars} rescore_enabled={rescore_enabled} rescore_min_reading_chars={rescore_min_reading_chars} rescore_min_gain={rescore_min_gain}"
+        "engine config: num_candidates={num_candidates} n_gpu_layers={n_gpu_layers} main_gpu={main_gpu} n_threads={n_threads} model_variant={model_variant:?} digit_width={digit_width} alpha_width={alpha_width} symbol_width={symbol_width} digit_separator_auto={digit_separator_auto} digit_candidates_order=[{digit_candidates_order}] live_conv_beam_size={live_conv_beam_size} convert_beam_size={convert_beam_size} prediction_enabled={prediction_enabled} prediction_max_candidates={prediction_max_candidates} prediction_min_reading_chars={prediction_min_reading_chars} rescore_enabled={rescore_enabled} rescore_min_reading_chars={rescore_min_reading_chars} rescore_min_gain={rescore_min_gain}"
     );
     // 診断用の強制失敗（Issue #43）。既定 false なので通常は JSON に載らない。
     let force_inference_failure = cfg.diagnostics.force_inference_failure;
@@ -699,7 +700,7 @@ fn build_engine_config_json() -> String {
         None => String::new(),
     };
     format!(
-        r#"{{"num_candidates":{num_candidates},"n_gpu_layers":{n_gpu_layers},"main_gpu":{main_gpu},"n_threads":0,"digit_width":"{digit_width}","alpha_width":"{alpha_width}","symbol_width":"{symbol_width}","digit_separator_auto":{digit_separator_auto},"digit_candidates_order":[{digit_candidates_order}],"live_conv_beam_size":{live_conv_beam_size},"convert_beam_size":{convert_beam_size},"prediction_enabled":{prediction_enabled},"prediction_max_candidates":{prediction_max_candidates},"prediction_min_reading_chars":{prediction_min_reading_chars},"rescore_enabled":{rescore_enabled},"rescore_min_reading_chars":{rescore_min_reading_chars},"rescore_min_gain":{rescore_min_gain},"force_inference_failure":{force_inference_failure}{mv_json}}}"#
+        r#"{{"num_candidates":{num_candidates},"n_gpu_layers":{n_gpu_layers},"main_gpu":{main_gpu},"n_threads":{n_threads},"digit_width":"{digit_width}","alpha_width":"{alpha_width}","symbol_width":"{symbol_width}","digit_separator_auto":{digit_separator_auto},"digit_candidates_order":[{digit_candidates_order}],"live_conv_beam_size":{live_conv_beam_size},"convert_beam_size":{convert_beam_size},"prediction_enabled":{prediction_enabled},"prediction_max_candidates":{prediction_max_candidates},"prediction_min_reading_chars":{prediction_min_reading_chars},"rescore_enabled":{rescore_enabled},"rescore_min_reading_chars":{rescore_min_reading_chars},"rescore_min_gain":{rescore_min_gain},"force_inference_failure":{force_inference_failure}{mv_json}}}"#
     )
 }
 
