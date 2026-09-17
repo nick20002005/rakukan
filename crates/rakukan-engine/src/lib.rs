@@ -828,6 +828,9 @@ pub struct RakunEngine {
     /// 現在の読みで学習すると「読みに無い文字を含む表記」が完全一致エントリになる
     /// （`learn_rekeyed_to_prediction` 参照）。学習を元のキーへ振り直すために覚える。
     last_predictions: Mutex<Option<(String, Vec<(String, String)>)>>,
+    /// 直近に学習語で差し替えた候補: `(読み, 差し替え内容)`。
+    /// 元の候補が確定されたら `learn_declined_rewrite` が使う。
+    last_learned_rewrite: Mutex<Option<(String, rescore::LearnedRewrite)>>,
 }
 
 impl RakunEngine {
@@ -843,6 +846,7 @@ impl RakunEngine {
             committed: String::new(),
             dict_store: None,
             last_predictions: Mutex::new(None),
+            last_learned_rewrite: Mutex::new(None),
         }
     }
 
@@ -1477,6 +1481,7 @@ impl RakunEngine {
     /// 学習語を DictStore に即時反映してファイルにも保存する。
     pub fn learn(&mut self, reading: &str, surface: &str) {
         if let Some(store) = &self.dict_store {
+            self.learn_declined_rewrite(store, reading, surface);
             let key = self.learn_key_for(reading, surface);
             store.learn(&key, surface);
         } else {
@@ -1486,6 +1491,7 @@ impl RakunEngine {
 
     pub fn learn_force(&mut self, reading: &str, surface: &str) {
         if let Some(store) = &self.dict_store {
+            self.learn_declined_rewrite(store, reading, surface);
             let key = self.learn_key_for(reading, surface);
             store.learn_force(&key, surface);
         } else {
@@ -2046,13 +2052,42 @@ impl RakunEngine {
         let Some(store) = self.dict_store.as_ref() else {
             return candidates;
         };
-        rescore::promote_dict_agreeing(
+        let candidates = rescore::promote_dict_agreeing(
             store,
             reading,
             candidates,
             self.config.rescore_min_reading_chars,
             self.config.rescore_min_gain,
-        )
+        );
+        let (candidates, rewrite) = rescore::apply_learned_runs(store, reading, candidates);
+        if let Some(rewrite) = rewrite
+            && let Ok(mut slot) = self.last_learned_rewrite.lock()
+        {
+            *slot = Some((reading.to_string(), rewrite));
+        }
+        candidates
+    }
+
+    /// 学習語の差し替え（`rescore::apply_learned_runs`）を断って元の候補を確定したら、
+    /// 差し替えた run の読みに LLM の表記を学習させ、次から差し替えないようにする。
+    fn learn_declined_rewrite(&self, store: &DictStore, reading: &str, surface: &str) {
+        let Ok(mut slot) = self.last_learned_rewrite.lock() else {
+            return;
+        };
+        let Some((rewrite_reading, rewrite)) = slot.as_ref() else {
+            return;
+        };
+        if rewrite_reading != reading || rewrite.original != surface {
+            return;
+        }
+        for (run_reading, llm_surface) in &rewrite.runs {
+            info!(
+                "learn: learned-run rewrite declined reading={:?} run={:?} keep={:?}",
+                reading, run_reading, llm_surface
+            );
+            store.learn_force(run_reading, llm_surface);
+        }
+        *slot = None;
     }
 
     /// key が一致する BG 変換結果を取得し、converter を engine に戻す。

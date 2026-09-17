@@ -275,6 +275,125 @@ pub fn promote_dict_agreeing(
     out
 }
 
+/// 長文の途中へ差し込む学習語の、読みの最小文字数。2 文字の読み
+/// （`いま`・`にち`・`えん`）は同音異義が多く、文脈を無視して塗り替えると壊す。
+const LEARNED_RUN_MIN_READING_CHARS: usize = 3;
+
+/// 長文の途中へ差し込む学習語の、減衰済み確定回数の下限。
+/// 「1 回選んだだけ」の語を文中の同音語すべてに波及させないための閾値。
+const LEARNED_RUN_MIN_FREQ: f64 = 3.0;
+
+/// 漢字かカタカナを含むか。学習表記が記号（`かっこ` → `「」`、`みぎ` → `→`）や
+/// ひらがな・英字だけのときは、文中の語を置き換えない。
+fn has_kanji_or_katakana(s: &str) -> bool {
+    s.chars()
+        .any(|c| matches!(c, 'ァ'..='ヶ' | '一'..='鿿' | '㐀'..='䶿' | '々'))
+}
+
+/// 表層 run 1 つを学習表記へ置き換えるべきなら、その表記を返す。
+fn learned_replacement(store: &DictStore, run: &AlignedRun) -> Option<String> {
+    if !matches!(run.kind, RunKind::Kanji | RunKind::Katakana) {
+        return None;
+    }
+    if run.reading.chars().count() < LEARNED_RUN_MIN_READING_CHARS {
+        return None;
+    }
+    let learned = store.lookup_learn(&run.reading);
+    let top = learned.first()?;
+    // LLM と同じ表記を一度でも選んでいるなら、文脈で使い分けている語。触らない。
+    if learned.iter().any(|s| s == &run.surface) {
+        return None;
+    }
+    if store
+        .lookup_user(&run.reading)
+        .iter()
+        .any(|s| s == &run.surface)
+    {
+        return None;
+    }
+    if !has_kanji_or_katakana(top) || store.learn_freq(&run.reading, top) < LEARNED_RUN_MIN_FREQ {
+        return None;
+    }
+    Some(top.clone())
+}
+
+/// よく使っている学習語を、長文の第 1 候補の途中にも効かせる。
+///
+/// 学習履歴も辞書と同じく読み全体の完全一致でしか引かれないので、
+/// `みかん → 美柑` を何十回確定していても、`みかんのへやのはいけい` と伸びた
+/// 瞬間に効かなくなる。`promote_dict_agreeing` は n-best の中から選び直すだけ
+/// なので、LLM が `美柑` を一度も出さなければ救えない。
+///
+/// そこで第 1 候補を読みへ割り戻し、漢字・カタカナ run の読みが学習キーと一致し、
+/// かつ LLM とは別の表記を何度も選んでいるなら、その run だけ学習表記へ
+/// 差し替えた候補を **先頭に足す**。元の第 1 候補は 2 番目に残るので、
+/// 文脈上は LLM が正しかった場合も 1 打鍵で戻せる。
+///
+/// 置き換えを断られたら（元の候補が確定されたら）、その読みでは LLM の表記も
+/// 使うと学習させる。次からは `learned_replacement` の「LLM と同じ表記を選んだ
+/// ことがある」で止まる（`しんちょう → 身長` を覚えていても、文中の `慎重` を
+/// 塗り替え続けないため）。
+///
+/// 候補が 0 件のときは何もしない（件数が増えるのは実候補がある時だけ）。
+pub fn apply_learned_runs(
+    store: &DictStore,
+    reading: &str,
+    candidates: Vec<String>,
+) -> (Vec<String>, Option<LearnedRewrite>) {
+    let Some(first) = candidates.first() else {
+        return (candidates, None);
+    };
+    let Some(runs) = align(reading, first) else {
+        return (candidates, None);
+    };
+    if runs.len() < 2 {
+        // 読み全体が 1 run なら完全一致の学習が merge 側で効く。
+        return (candidates, None);
+    }
+
+    let mut replaced_runs: Vec<(String, String)> = Vec::new();
+    let mut rewritten = String::new();
+    for run in &runs {
+        match learned_replacement(store, run) {
+            Some(s) => {
+                rewritten.push_str(&s);
+                replaced_runs.push((run.reading.clone(), run.surface.clone()));
+            }
+            None => rewritten.push_str(&run.surface),
+        }
+    }
+    if replaced_runs.is_empty() {
+        return (candidates, None);
+    }
+
+    tracing::info!(
+        reading = %reading,
+        from = %first,
+        to = %rewritten,
+        "rescore: applied learned runs"
+    );
+    let rewrite = LearnedRewrite {
+        original: first.clone(),
+        runs: replaced_runs,
+    };
+    let mut out = Vec::with_capacity(candidates.len() + 1);
+    out.push(rewritten);
+    for c in candidates {
+        if !out.contains(&c) {
+            out.push(c);
+        }
+    }
+    (out, Some(rewrite))
+}
+
+/// `apply_learned_runs` が差し替えた内容。`original` が確定されたら、
+/// `runs` の `(読み, LLM の表記)` を学習して次から差し替えないようにする。
+#[derive(Clone, Debug, PartialEq)]
+pub struct LearnedRewrite {
+    pub original: String,
+    pub runs: Vec<(String, String)>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,5 +518,51 @@ surfaces = ["指示"]
         let partial = dict_agreement_score(&store, reading, "指示ぶんをかくにんする").unwrap();
         let whole = dict_agreement_score(&store, reading, "指示文をかくにんする").unwrap();
         assert!(whole > partial, "whole={whole} should beat partial={partial}");
+    }
+
+    #[test]
+    fn applies_frequently_learned_word_inside_long_reading() {
+        let (_dir, store) = store_with_user_entries("");
+        let reading = "みかんのへやのはいけい";
+        let cands = vec![
+            "蜜柑の部屋の背景".to_string(),
+            "みかんの部屋の背景".to_string(),
+        ];
+
+        // 1 回選んだだけでは文中の同音語を塗り替えない。
+        store.learn_force("みかん", "美柑");
+        let (got, rewrite) = apply_learned_runs(&store, reading, cands.clone());
+        assert_eq!(got, cands);
+        assert!(rewrite.is_none());
+
+        for _ in 0..3 {
+            store.learn_force("みかん", "美柑");
+        }
+        let (got, rewrite) = apply_learned_runs(&store, reading, cands);
+        assert_eq!(
+            rewrite.unwrap().runs,
+            vec![("みかん".to_string(), "蜜柑".to_string())]
+        );
+        assert_eq!(
+            got,
+            vec![
+                "美柑の部屋の背景".to_string(),
+                "蜜柑の部屋の背景".to_string(),
+                "みかんの部屋の背景".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn keeps_llm_surface_the_user_has_also_chosen() {
+        let (_dir, store) = store_with_user_entries("");
+        for _ in 0..4 {
+            store.learn_force("さくら", "サクラ");
+        }
+        store.learn_force("さくら", "桜");
+        store.learn_force("さくら", "サクラ");
+        let cands = vec!["桜が咲いた".to_string()];
+        let (got, _) = apply_learned_runs(&store, "さくらがさいた", cands.clone());
+        assert_eq!(got, cands);
     }
 }

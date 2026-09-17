@@ -505,6 +505,23 @@ impl DictStore {
         scored.into_iter().map(|(_, _, s)| s).collect()
     }
 
+    /// `(reading, surface)` の学習回数を、減衰を今の時刻まで延長した値で返す。
+    /// 未学習なら 0.0。
+    ///
+    /// `lookup_learn` の並びは「最後に確定した表記が先頭」なので、1 回選んだだけの
+    /// 語と何十回も使っている語の区別が付かない。長文の途中へ学習を効かせる
+    /// （engine の `rescore::apply_learned_runs`）ときに「よく使っている」を判定する。
+    pub fn learn_freq(&self, reading: &str, surface: &str) -> f64 {
+        let Ok(hist) = self.inner.learn_history.read() else {
+            return 0.0;
+        };
+        let now = now_unix_secs();
+        hist.get(reading)
+            .and_then(|entries| entries.iter().find(|e| e.surface == surface))
+            .map(|e| e.suggestion_freq as f64 * decay_factor(e.last_access_time, now))
+            .unwrap_or(0.0)
+    }
+
     /// 学習履歴から `prefix` で**始まる（かつ prefix より長い）**読みのエントリを
     /// score 降順で返す。Google 日本語入力の「短文予測」に相当する。
     ///
