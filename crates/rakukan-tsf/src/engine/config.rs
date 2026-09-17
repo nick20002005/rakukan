@@ -19,6 +19,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub conversion: ConversionConfig,
     #[serde(default)]
+    pub prediction: PredictionConfig,
+    #[serde(default)]
     pub appearance: AppearanceConfig,
     #[serde(default)]
     pub diagnostics: DiagnosticsConfig,
@@ -331,6 +333,18 @@ fn default_convert_beam_size() -> usize {
     6
 }
 
+fn default_rescore_enabled() -> bool {
+    true
+}
+
+fn default_rescore_min_reading_chars() -> usize {
+    12
+}
+
+fn default_rescore_min_gain() -> f64 {
+    24.0
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConversionConfig {
     /// Space 変換時のビーム幅の**上限**。num_candidates と併せて min をとる。
@@ -343,6 +357,17 @@ pub struct ConversionConfig {
     /// 新形式では `[conversion].num_candidates` に保存する。
     #[serde(default)]
     pub num_candidates: Option<usize>,
+    /// 長文変換の候補を辞書との整合で並べ替える。
+    /// 読点の無い長文は辞書が完全一致で引けず LLM の区切りだけで決まるので、
+    /// n-best の中から辞書・ユーザー辞書・学習履歴と最も整合する候補を先頭にする。
+    #[serde(default = "default_rescore_enabled")]
+    pub rescore_enabled: bool,
+    /// 並べ替えを適用する読みの最小文字数。これ未満は辞書が完全一致で効く。
+    #[serde(default = "default_rescore_min_reading_chars")]
+    pub rescore_min_reading_chars: usize,
+    /// 先頭候補を押しのけるのに必要なスコア差。小さいほど積極的に入れ替える。
+    #[serde(default = "default_rescore_min_gain")]
+    pub rescore_min_gain: f64,
 }
 
 impl Default for ConversionConfig {
@@ -350,6 +375,61 @@ impl Default for ConversionConfig {
         Self {
             beam_size: default_convert_beam_size(),
             num_candidates: None,
+            rescore_enabled: default_rescore_enabled(),
+            rescore_min_reading_chars: default_rescore_min_reading_chars(),
+            rescore_min_gain: default_rescore_min_gain(),
+        }
+    }
+}
+
+/// 短文予測（Google 日本語入力の「予測候補」相当）。
+///
+/// 確定済みのフレーズを、その読みの**先頭一致**で候補に差し込む。
+/// 例: 「かんたんなことばでぶんせき → 簡単な言葉で分析」を確定したあとに
+/// 「かんたん」まで入力すると、候補 2 番目に全体が出る。
+/// 不要になった予測は候補選択中に Ctrl+Delete で削除できる。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PredictionConfig {
+    #[serde(default = "default_prediction_enabled")]
+    pub enabled: bool,
+    /// 候補リストに差し込む予測の最大件数。
+    #[serde(default = "default_prediction_max_candidates")]
+    pub max_candidates: usize,
+    /// 予測を開始する読みの最小文字数。短すぎると候補が発散する。
+    #[serde(default = "default_prediction_min_reading_chars")]
+    pub min_reading_chars: usize,
+    /// 入力中（Space を押す前）に予測ウィンドウを自動で出す。
+    #[serde(default = "default_suggest_while_typing")]
+    pub suggest_while_typing: bool,
+    /// 予測ウィンドウに並べる最大件数（1〜9）。
+    #[serde(default = "default_suggest_max_candidates")]
+    pub suggest_max_candidates: usize,
+}
+
+fn default_prediction_enabled() -> bool {
+    true
+}
+fn default_prediction_max_candidates() -> usize {
+    2
+}
+fn default_prediction_min_reading_chars() -> usize {
+    2
+}
+fn default_suggest_while_typing() -> bool {
+    true
+}
+fn default_suggest_max_candidates() -> usize {
+    4
+}
+
+impl Default for PredictionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_prediction_enabled(),
+            max_candidates: default_prediction_max_candidates(),
+            min_reading_chars: default_prediction_min_reading_chars(),
+            suggest_while_typing: default_suggest_while_typing(),
+            suggest_max_candidates: default_suggest_max_candidates(),
         }
     }
 }
@@ -626,6 +706,11 @@ symbol_width = "fullwidth"
 digit_separator_auto = true
 # 数字だけの reading に対して提示する候補種別と順序
 digit_candidates_order = ["arabic", "fullwidth", "positional", "per_digit", "daiji"]
+# アプリごとの「文字入力欄が開いたときのモード」（exe 名 → hiragana / alphanumeric）。
+# Photoshop の文字ツールのように入力用の文書が新しく作られるアプリで、
+# その文書に入ったら日本語、抜けたら元のモードに戻す。
+# [input.text_field_mode]
+# "Photoshop.exe" = "hiragana"
 # 確定時に学習するか (デフォルト: true)。
 # false にすると学習を完全に抑止する。
 auto_learn = true
@@ -662,10 +747,39 @@ beam_size = 6
 # 新形式は [conversion].num_candidates。旧形式のルート直下 num_candidates も引き続き読める。
 # num_candidates = 6
 
+# 長文変換の候補並べ替え。
+# 読点の無い長文は辞書が「読み全体の完全一致」で引けず、区切りが LLM の
+# 出力だけで決まる。有効にすると n-best のそれぞれを読みへ割り戻し、
+# ユーザー辞書・学習履歴・MOZC 辞書と最も整合する候補を先頭に繰り上げる
+# （候補の集合・件数は変えない）。
+rescore_enabled = true
+# 並べ替えを適用する読みの最小文字数（これ未満は辞書が完全一致で効く）
+rescore_min_reading_chars = 12
+# 先頭候補を押しのけるのに必要なスコア差。小さいほど積極的に入れ替える。
+# 語の読み長の二乗 × 出自の重み（ユーザー辞書3 / 学習2 / 辞書1）で採点する。
+rescore_min_gain = 24.0
+
+[prediction]
+# 短文予測（Google 日本語入力の「予測候補」相当）。
+# 一度確定したフレーズを、その読みの前方一致で候補に差し込む。
+# 例:「かんたんなことばでぶんせき → 簡単な言葉で分析」を確定したあと、
+#     「かんたん」まで入力すると候補 2 番目に全体が出る。
+# 不要な予測は候補選択中に Ctrl+Delete で学習履歴ごと削除できる。
+enabled = true
+# 候補リストに差し込む予測の最大件数（0〜9、既定 2）
+max_candidates = 2
+# 予測を開始する読みの最小文字数（既定 2）
+min_reading_chars = 2
+# 入力中（Space を押す前）に予測ウィンドウを自動で出す（既定 true）。
+# 出た予測は Tab / ↓ で候補リストとして開ける。
+suggest_while_typing = true
+# 予測ウィンドウに並べる最大件数（1〜9、既定 4）
+suggest_max_candidates = 4
+
 [appearance]
-# 候補ウィンドウのフォントサイズ（ピクセル）。既定 17
+# 候補ウィンドウのフォント高さ（ピクセル）。既定 17
 # 行の高さ・余白・最小幅も同じ比率で拡大するので、この値だけ変えればよい。
-# 10〜72 にクランプされる。次回の候補表示から反映。
+# 10〜72 にクランプされる。IME をオフ→オンで反映。
 candidate_font_height = 17
 
 [diagnostics]

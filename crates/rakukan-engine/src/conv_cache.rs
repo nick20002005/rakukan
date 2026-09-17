@@ -42,10 +42,17 @@ use crate::{DigitCandidateKind, default_digit_candidates_order};
 
 /// ワーカーへの変換リクエスト（single-slot 上書き式キュー）
 struct Request {
-    /// TSF 側の打鍵そのままの読みと照合するキャッシュキー。
+    /// キャッシュのキー。TSF 側が持つ読み（`hiragana_buf`）と一致させる。
     hiragana: String,
-    /// 先頭ラテン語ランの復元後、変換器へ実際に渡す読み。
+    /// 変換器へ実際に渡す読み。`hiragana` と同じこともあれば、先頭の英単語を
+    /// 打鍵どおりに復元した形（`せえdれあmのぺーす` → `seedreamのぺーす`）の
+    /// こともある。キーと分けているのは、呼び出し側が結果を引くときに使うのは
+    /// あくまで打鍵そのままの読みだから。
     conv_reading: String,
+    /// 読みの先頭がユーザー辞書の語に前方一致した場合の (表記, 残りの読み)。
+    /// ワーカーが残りを変換して `語 + 残り` を候補に足す。辞書は engine 側に
+    /// あるので、ここまで持ってきてもらう必要がある。
+    dict_prefix: Option<(String, String)>,
     committed: String,
     converter: KanaKanjiConverter,
     n: usize,
@@ -146,6 +153,7 @@ fn worker_loop(cache: Arc<Cache>) {
 
         let key = req.hiragana.clone();
         let conv_reading = req.conv_reading.clone();
+        let dict_prefix = req.dict_prefix.clone();
         let committed = req.committed.clone();
         let n = req.n;
         let digit_candidates_order = req.digit_candidates_order.clone();
@@ -154,7 +162,7 @@ fn worker_loop(cache: Arc<Cache>) {
         let converter = req.converter;
 
         let t = std::time::Instant::now();
-        let (converter, candidates, failed) =
+        let (converter, mut candidates, failed) =
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 crate::digits::convert_with_digit_protection(
                     &converter,
@@ -184,6 +192,23 @@ fn worker_loop(cache: Arc<Cache>) {
                     (converter, vec![], true)
                 }
             };
+
+        // ユーザー辞書語の前方一致候補（`To LOVEる` ＋ `と` → `To LOVEると`）。
+        // 残りの読みをもう一度変換するため LLM 呼び出しが 1 回増えるが、
+        // 走るのは前方一致した時だけで、残りの読みは短いことが多い。
+        if let Some(split) = dict_prefix {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                crate::dict_prefix::insert_candidates(
+                    &converter,
+                    &split,
+                    &committed,
+                    &digit_candidates_order,
+                    alpha_fullwidth_first,
+                    symbol_fullwidth_first,
+                    &mut candidates,
+                );
+            }));
+        }
 
         let mut inner = cache.inner.lock().unwrap();
         if let Some(pending) = inner.pending.as_mut() {
@@ -218,6 +243,7 @@ fn worker_loop(cache: Arc<Cache>) {
 pub fn start(
     hiragana: String,
     conv_reading: String,
+    dict_prefix: Option<(String, String)>,
     committed: String,
     converter: KanaKanjiConverter,
     n: usize,
@@ -250,6 +276,7 @@ pub fn start(
     inner.pending = Some(Request {
         hiragana,
         conv_reading,
+        dict_prefix,
         committed,
         converter,
         n,
@@ -276,6 +303,25 @@ pub fn start(
 /// 次回 `bg_start` が呼ばれたとき、別キーなら conv_cache::start が
 /// pending を積んで worker が Done を上書きする (`reclaim_nonblocking` 経由で
 /// engine 側で converter を取り戻す経路もある)。
+/// バックグラウンド変換結果を **取り出さずに** 全件のぞく。
+///
+/// `peek_top_candidate` が先頭 1 件だけを返すのに対し、こちらは並べ替え
+/// （`rescore`）のように n-best 全体を見たい呼び出し元が使う。
+/// `take_ready` と違い converter を engine に戻さないので Done 状態は壊れない。
+pub fn peek_candidates(key: &str) -> Option<Vec<String>> {
+    let cache = &**CACHE;
+    let inner = cache.inner.lock().ok()?;
+    if let State::Done {
+        key: k, candidates, ..
+    } = &inner.state
+    {
+        if k == key {
+            return Some(candidates.clone());
+        }
+    }
+    None
+}
+
 pub fn peek_top_candidate(key: &str) -> Option<String> {
     let cache = &**CACHE;
     let inner = cache.inner.lock().ok()?;

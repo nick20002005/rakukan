@@ -76,7 +76,7 @@ use crate::{
         },
         user_action::UserAction,
     },
-    globals::{GUID_DISPLAY_ATTRIBUTE, GUID_DISPLAY_ATTRIBUTE_INPUT},
+    globals::{GUID_DISPLAY_ATTRIBUTE, GUID_DISPLAY_ATTRIBUTE_DONE, GUID_DISPLAY_ATTRIBUTE_INPUT},
     tsf::{
         candidate_window, display_attr, ime_sync,
         language_bar::{self, LANGBAR_SINK_COOKIE},
@@ -95,6 +95,8 @@ use on_compose::{
     commit_text, commit_then_start_composition, end_composition, get_caret_pos_from_context,
     update_caret_rect, update_composition, update_composition_candidate_parts,
     update_composition_range_select,
+    update_composition_at,
+    update_composition_block_parts,
 };
 
 const ID_MENU_IME_ON: u32 = 1;
@@ -513,8 +515,13 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
                     .RegisterGUID(&GUID_DISPLAY_ATTRIBUTE_INPUT)
                     .unwrap_or(0);
                 let atom_conv = catmgr.RegisterGUID(&GUID_DISPLAY_ATTRIBUTE).unwrap_or(0);
-                display_attr::set_atoms(atom_input, atom_conv);
-                tracing::debug!("display attr atoms: input={atom_input} conv={atom_conv}");
+                let atom_done = catmgr
+                    .RegisterGUID(&GUID_DISPLAY_ATTRIBUTE_DONE)
+                    .unwrap_or(0);
+                display_attr::set_atoms(atom_input, atom_conv, atom_done);
+                tracing::debug!(
+                    "display attr atoms: input={atom_input} conv={atom_conv} done={atom_done}"
+                );
             }
         }
 
@@ -585,14 +592,7 @@ impl ITfTextInputProcessor_Impl for TextServiceFactory_Impl {
                     let _ = src.UnadviseSink(inner.threadfocus_cookie);
                     tracing::debug!("ITfThreadFocusSink unregistered");
                 }
-                // ITfCompartmentEventSink 登録解除（inner は不変借用なので値だけ読む）
-                if inner.openclose_cookie != 0
-                    && let Some(comp) = inner.openclose_comp.as_ref()
-                    && let Ok(src) = comp.cast::<ITfSource>()
-                {
-                    let _ = src.UnadviseSink(inner.openclose_cookie);
-                    tracing::debug!("ITfCompartmentEventSink unregistered");
-                }
+
             }
         }
         // 解除したコンパートメントの参照は落とす（Activate で登録し直される）。
@@ -699,7 +699,9 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
         let has_preedit = engine_try_get_or_create()
             .ok()
             .and_then(|g| g.as_ref().map(|e| !e.preedit_is_empty()))
-            .unwrap_or(false);
+            .unwrap_or(false)
+            // キャレット編集中は engine が空でも右側に読みが退避している
+            || !crate::engine::state::caret_tail_is_empty();
 
         // 選択モード中はプリエディットありと同じ扱い（候補操作キーを消費するため）
         // AtomicBool でロックなし高速チェック
@@ -1023,16 +1025,18 @@ fn key_should_eat(action: &UserAction, has_preedit: bool) -> bool {
         | UserAction::CandidatePageUp
         | UserAction::CursorLeft
         | UserAction::CursorRight
-        // Home / End: 未確定文字列がある間はアプリへ渡さない（Issue #11）。
-        // 透過させるとアプリ側が未確定文字列を無視してキャレットを行頭 / 行末へ動かす。
         | UserAction::CursorHome
-        | UserAction::CursorEnd => has_preedit,
+        | UserAction::CursorEnd
+        | UserAction::Delete => has_preedit,
         // Shift+Left/Right: composition がアクティブな間は必ず消費する。
         // 透過させるとアプリが composition テキストを直接編集してしまう。
         // has_preedit=false（composition なし）のときだけ透過。
         UserAction::SegmentShrink | UserAction::SegmentExtend => has_preedit,
         UserAction::Punctuate(_) => true,
         UserAction::CandidateSelect(_) => has_preedit,
+        // Ctrl+Delete: 候補ウィンドウが出ている時だけ消費する。プリエディットが
+        // 無い場面ではアプリ本来の「単語削除」を通す。
+        UserAction::CandidateForget => has_preedit,
         _ => false,
     }
 }
@@ -1059,10 +1063,12 @@ pub(super) fn action_name(a: &UserAction) -> &'static str {
         UserAction::CandidatePageDown => "CandidatePageDown",
         UserAction::CandidatePageUp => "CandidatePageUp",
         UserAction::CandidateSelect(_) => "CandidateSelect",
+        UserAction::CandidateForget => "CandidateForget",
         UserAction::CursorLeft => "CursorLeft",
         UserAction::CursorRight => "CursorRight",
         UserAction::CursorHome => "CursorHome",
         UserAction::CursorEnd => "CursorEnd",
+        UserAction::Delete => "Delete",
         UserAction::Punctuate(_) => "Punctuate",
         UserAction::SegmentShrink => "SegmentShrink",
         UserAction::SegmentExtend => "SegmentExtend",
@@ -1298,6 +1304,9 @@ impl ITfThreadFocusSink_Impl for TextServiceFactory_Impl {
 
     fn OnKillThreadFocus(&self) -> windows::core::Result<()> {
         tracing::debug!("OnKillThreadFocus: hide candidate window & stop live timer");
+        // 打鍵が来ないままフォーカスが移ると、書けていない確定テキストを
+        // 書き直す機会が無くなる。まだ元の ITfContext が生きているここで流す。
+        on_compose::retry_pending_commit("kill_focus");
         candidate_window::hide();
         candidate_window::stop_live_timer();
         candidate_window::stop_waiting_timer();

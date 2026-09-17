@@ -151,6 +151,18 @@ const COLOR_BG: COLORREF = COLORREF(0x00_FF_FF_FF);
 /// 通常行のテキスト色（黒）
 const COLOR_FG: COLORREF = COLORREF(0x00_00_00_00);
 
+/// 候補ウィンドウをキャレットのどちら側に出すか。
+///
+/// どちらも画面に入りきらない場合は反対側へ反転する
+/// （`calc_window_y` / `calc_window_y_above`）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Placement {
+    /// キャレットの下（変換候補リストの既定）
+    Below,
+    /// キャレットの上（入力中の予測候補）
+    Above,
+}
+
 // ─── スレッドローカル状態 ──────────────────────────────────────────────────────
 
 thread_local! {
@@ -162,6 +174,13 @@ thread_local! {
     static TL_WIN_WIDTH: Cell<i32> = Cell::new(Layout::with_font_height(configured_font_height()).win_width_min);
     /// 表示中ウィンドウのレイアウト寸法。`show_with_status()` の開始時にのみ更新する。
     static TL_LAYOUT: Cell<Layout> = Cell::new(Layout::with_font_height(configured_font_height()));
+    /// 候補ウィンドウをキャレットの上下どちら側に出すか。
+    /// `show_above` / `show_suggestion` が `Above` にし、`hide()` と
+    /// `set_placement_below()` で `Below` に戻る。`show()` は現在値を引き継ぐので、
+    /// 予測から Tab/↓ で開いた候補リストが候補移動のたびに下へ飛んだりしない。
+    static TL_PLACEMENT: Cell<Placement> = Cell::new(Placement::Below);
+    /// `Above` のときに基準にするキャレット上端（スクリーン座標）。
+    static TL_CARET_TOP: Cell<i32> = Cell::new(0);
 
     // ─── [Live] ライブ変換セッション状態は `live_session.rs` の LiveConvSession に集約 (M4 Phase 1)。
     // 旧 TL_LIVE_CTX / TL_LIVE_TID / TL_LIVE_DM_PTR は削除済み。
@@ -217,6 +236,11 @@ struct CandData {
     page_info: String,
     /// 候補の上に表示するステータス行（選択不可、グレー表示）
     status_line: Option<String>,
+    /// 行頭に選択番号（1〜9）を出すか。
+    ///
+    /// 予測ウィンドウ（入力中に自動で出るリスト）では **false**。この状態の
+    /// 数字キーは候補選択ではなく通常の数字入力なので、番号を出すと嘘になる。
+    numbered: bool,
 }
 
 // ─── HWND ヘルパー ────────────────────────────────────────────────────────────
@@ -228,6 +252,9 @@ fn get_hwnd() -> HWND {
 
 #[inline]
 fn set_hwnd(hwnd: HWND) {
+    // hwnd が差し替わると、その hwnd に紐づいていたライブタイマーは失われる。
+    // 次の live_input_notify で必ず張り直すためにフラグを落とす。
+    crate::tsf::live_session::set_timer_armed(false);
     TL_HWND.with(|c| c.set(hwnd.0 as isize));
 }
 
@@ -532,7 +559,11 @@ unsafe fn draw(hdc: HDC) {
         let is_sel = i == data.selected;
         FillRect(hdc, &row, if is_sel { sel_brush } else { wht_brush });
         SetTextColor(hdc, if is_sel { COLOR_SEL_FG } else { COLOR_FG });
-        let text = format!("{} {}", i + 1, cand);
+        let text = if data.numbered {
+            format!("{} {}", i + 1, cand)
+        } else {
+            cand.clone()
+        };
         let text_w: Vec<u16> = text.encode_utf16().collect();
         let _ = TextOutW(
             hdc,
@@ -665,9 +696,95 @@ pub fn show_with_status(
     y: i32,
     status_line: Option<&str>,
 ) {
+    show_inner(
+        page_candidates,
+        page_selected,
+        page_info,
+        x,
+        y,
+        status_line,
+        true,
+        None,
+    )
+}
+
+/// 予測ウィンドウから Tab/↓ で開いた候補リスト用。予測と同じくキャレットの
+/// 上側に出す（Tab を押した瞬間にウィンドウが下へ飛ぶのを避ける）。
+pub fn show_above(
+    page_candidates: &[String],
+    page_selected: usize,
+    page_info: &str,
+    x: i32,
+    caret_top: i32,
+    caret_bottom: i32,
+) {
+    show_inner(
+        page_candidates,
+        page_selected,
+        page_info,
+        x,
+        caret_bottom,
+        None,
+        true,
+        Some((Placement::Above, caret_top)),
+    )
+}
+
+/// 入力中の予測ウィンドウ用。行頭の選択番号を出さない（数字キーはまだ
+/// 通常の数字入力なので、番号を振ると押せるように見えてしまう）。
+///
+/// 表示位置は**キャレットの上**。打鍵中のこのウィンドウが下に出ると、これから
+/// 打つ行そのものを覆ってしまうため（入りきらないときだけ下へ反転する）。
+pub fn show_suggestion(
+    page_candidates: &[String],
+    x: i32,
+    caret_top: i32,
+    caret_bottom: i32,
+    status_line: Option<&str>,
+) {
+    // selected にリスト外の添字を渡してどの行もハイライトしない
+    show_inner(
+        page_candidates,
+        page_candidates.len(),
+        "",
+        x,
+        caret_bottom,
+        status_line,
+        false,
+        Some((Placement::Above, caret_top)),
+    )
+}
+
+/// 候補ウィンドウの表示側をキャレットの下（既定）へ戻す。
+///
+/// 予測ウィンドウを出したまま Space で明示変換に入った場合、そのまま
+/// `show()` を呼ぶと `Above` を引き継いでしまうので、新しい変換を始める
+/// 経路で明示的に呼ぶ。
+pub fn set_placement_below() {
+    TL_PLACEMENT.with(|c| c.set(Placement::Below));
+}
+
+/// `placement`: `Some((側, キャレット上端))` を渡すとその側に固定する。
+/// `None` は「今の側を引き継ぐ」（候補移動・ページ送り・BG 更新の再表示用）。
+#[allow(clippy::too_many_arguments)]
+fn show_inner(
+    page_candidates: &[String],
+    page_selected: usize,
+    page_info: &str,
+    x: i32,
+    y: i32,
+    status_line: Option<&str>,
+    numbered: bool,
+    placement: Option<(Placement, i32)>,
+) {
     if page_candidates.is_empty() {
         hide();
         return;
+    }
+
+    if let Some((p, caret_top)) = placement {
+        TL_PLACEMENT.with(|c| c.set(p));
+        TL_CARET_TOP.with(|c| c.set(caret_top));
     }
 
     let has_pager = !page_info.is_empty();
@@ -681,6 +798,7 @@ pub fn show_with_status(
         d.selected = page_selected;
         d.page_info = page_info.to_string();
         d.status_line = status_line.map(|s| s.to_string());
+        d.numbered = numbered;
     });
 
     let n = page_candidates.len();
@@ -705,7 +823,7 @@ pub fn show_with_status(
     TL_WIN_WIDTH.with(|c| c.set(win_width));
 
     // ─── 画面端検出：ウィンドウが画面外にはみ出す場合はキャレットの上側に反転 ───
-    let win_y = unsafe { calc_window_y(x, y, win_h) };
+    let win_y = unsafe { calc_window_y_for_placement(x, y, win_h) };
     let win_x = unsafe { calc_window_x(x, y, win_width) };
 
     let hwnd = get_hwnd();
@@ -751,6 +869,48 @@ pub fn show_with_status(
             }
         }
     }
+}
+
+/// 現在の表示側（`TL_PLACEMENT`）に従って候補ウィンドウの表示 Y を計算する。
+unsafe fn calc_window_y_for_placement(x: i32, caret_bottom: i32, win_h: i32) -> i32 {
+    match TL_PLACEMENT.with(|c| c.get()) {
+        Placement::Below => calc_window_y(x, caret_bottom, win_h),
+        Placement::Above => {
+            let caret_top = TL_CARET_TOP.with(|c| c.get());
+            calc_window_y_above(x, caret_top, caret_bottom, win_h)
+        }
+    }
+}
+
+/// キャレットの**上側**に出すときの表示 Y。
+///
+/// 作業領域の上端を超えてしまう場合は下側（`calc_window_y`）へ反転する。
+/// `caret_top` はアプリによっては 0 や下端と同値で返ってくるので、
+/// 高さが取れないときは `CARET_HEIGHT_ESTIMATE` で補う。
+unsafe fn calc_window_y_above(x: i32, caret_top: i32, caret_bottom: i32, win_h: i32) -> i32 {
+    let top = if caret_top > 0 && caret_top < caret_bottom {
+        caret_top
+    } else {
+        caret_bottom - CARET_HEIGHT_ESTIMATE
+    };
+    // 上側：4ドット上
+    let above = top - win_h - 4;
+    let pt = POINT { x, y: caret_bottom };
+    let hmon = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+    let mut mi = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if GetMonitorInfoW(hmon, &mut mi).as_bool() && above < mi.rcWork.top {
+        tracing::debug!(
+            "candwin::flip_down: caret_top={} win_h={} work_top={}",
+            top,
+            win_h,
+            mi.rcWork.top
+        );
+        return calc_window_y(x, caret_bottom, win_h);
+    }
+    above
 }
 
 /// キャレット下端 `caret_bottom` から候補ウィンドウの表示 Y を計算する。
@@ -807,7 +967,7 @@ pub fn reposition(x: i32, y: i32) {
     }
     let win_h = lay.window_height(n, has_pager, has_status);
     let win_w = TL_WIN_WIDTH.with(|c| c.get());
-    let win_y = unsafe { calc_window_y(x, y, win_h) };
+    let win_y = unsafe { calc_window_y_for_placement(x, y, win_h) };
     let win_x = unsafe { calc_window_x(x, y, win_w) };
     unsafe {
         let _ = SetWindowPos(
@@ -839,6 +999,11 @@ pub fn update_selection(page_selected: usize, page_info: &str) {
 
 /// 候補ウィンドウを隠す。ウィンドウ自体は破棄しない（次回 show で再利用）。
 pub fn hide() {
+    // 予測ウィンドウとして出していた状態も同時に捨てる（確定・キャンセル経路は
+    // hide() だけを呼ぶので、ここで面倒を見ないと表示状態が残る）。
+    crate::tsf::suggestion::forget_shown();
+    // 次に開くウィンドウは既定（キャレットの下）から始める。
+    TL_PLACEMENT.with(|c| c.set(Placement::Below));
     let hwnd = get_hwnd();
     if is_valid(hwnd) {
         unsafe {
@@ -1542,19 +1707,31 @@ pub fn on_waiting_timer() {
             probe_selected_text = sess.current_candidate().unwrap_or("").to_string();
         }
 
+        // BG の結果は候補ウィンドウだけでなく composition にも書く。
+        // ここを更新しないと、インラインは 250ms タイムアウト時のライブ
+        // プレビュー（読みの途中までしか変換されていない文字列）のまま
+        // 次のキー入力まで残り、変換そのものが失敗したように見える。
+        let composition_updated = try_update_selecting_composition(&preedit_key);
+
         // Phase 6b 第2段: WM_TIMER 経路の pending update を観測する。
-        // この経路では candidate window は更新するが、WndProc コンテキストで
-        // EditSession を開けないため TSF composition は更新しない（次のキー入力時の
-        // poll で拾う）。composition_updated=false でこの設計上のラグを可視化する。
+        // composition_updated=false は Phase1A 相当の SetText が確認できなかった
+        // ケース（フォーカス移動 / APPLY_LOCK busy / 遅延実行）で、その場合は
+        // 従来どおり次のキー入力時の poll で拾われる。
         if let Some(view) = probe_view {
             tracing::info!(
-                "candidate_display_probe event=wm_timer_pending_update reading_len={} source={} first_candidate={:?} page_selected={} selected_candidate={:?} composition_candidate={:?} selected_match=false composition_updated=false llm_pending=false corresponding_reading_len={} suffix_len={}",
+                "candidate_display_probe event=wm_timer_pending_update reading_len={} source={} first_candidate={:?} page_selected={} selected_candidate={:?} composition_candidate={:?} selected_match={} composition_updated={} llm_pending=false corresponding_reading_len={} suffix_len={}",
                 preedit_key.chars().count(),
                 view.source.as_str(),
                 page_cands.first().map(String::as_str).unwrap_or(""),
                 page_selected,
                 probe_selected_text,
-                "",
+                if composition_updated {
+                    probe_selected_text.as_str()
+                } else {
+                    ""
+                },
+                composition_updated,
+                composition_updated,
                 view.corresponding_reading_len,
                 view.suffix.chars().count()
             );
@@ -1828,6 +2005,14 @@ pub fn on_waiting_timer() {
 pub fn live_input_notify(ctx: &windows::Win32::UI::TextServices::ITfContext, tid: u32) {
     use windows::core::Interface;
 
+    // ライブ変換の有効・無効に関わらず控える。Space 変換の後追い更新
+    // (`try_update_selecting_composition`) はライブ用スナップショットが
+    // 消えた後に走るため、こちらを見る。
+    let input_dm_ptr = unsafe { ctx.GetDocumentMgr().ok() }
+        .map(|dm| dm.as_raw() as usize)
+        .unwrap_or(0);
+    crate::tsf::live_session::remember_input_context(ctx.clone(), tid, input_dm_ptr);
+
     // ── config.live_conversion.enabled チェック ─────────────────────────────
     let cfg = crate::engine::config::current_config();
     if !cfg.live_conversion.enabled {
@@ -1846,9 +2031,7 @@ pub fn live_input_notify(ctx: &windows::Win32::UI::TextServices::ITfContext, tid
 
     // ITfContext / tid / DM ptr を thread_local LiveConvSession にキャッシュ
     // (on_live_timer の Phase1A で使用)
-    let live_dm_ptr = unsafe { ctx.GetDocumentMgr().ok() }
-        .map(|dm| dm.as_raw() as usize)
-        .unwrap_or(0);
+    let live_dm_ptr = input_dm_ptr;
     crate::tsf::live_session::set_context_snapshot(ctx.clone(), tid, live_dm_ptr);
     if live_dm_ptr == 0 {
         tracing::debug!("[Live] live_input_notify: no document manager, Phase1A disabled");
@@ -1894,14 +2077,25 @@ pub fn live_input_notify(ctx: &windows::Win32::UI::TextServices::ITfContext, tid
         }
     };
 
-    // ライブタイマーを起動（既存なら上書き）
-    unsafe {
-        SetTimer(hwnd, LIVE_TIMER_ID, LIVE_POLL_MS, None);
+    // ライブタイマーを起動する。
+    //
+    // 🔴 **既に走っているタイマーに `SetTimer` を重ねてはいけない**。同じ (hwnd, id)
+    // への SetTimer は周期を先頭からやり直すので、打鍵ごとに張り直すと WM_TIMER が
+    // いつまでも届かない。USER タイマーの実効分解能は 15.625ms 刻みで、
+    // `LIVE_POLL_MS` = 50ms は実測 62.5ms 周期になる。debounce(80ms) を満たすのは
+    // 2 tick 目 = 125ms なので、**打鍵間隔が 125ms を切ると preview が一度も更新
+    // されないまま生のかなで伸び続ける**（2026-09-01 実測: FIRED の elapsed は
+    // 110-129ms に 7481 件・170-189ms に 910 件で、80-109ms は 32 件しかない）。
+    if !crate::tsf::live_session::is_timer_armed() {
+        unsafe {
+            SetTimer(hwnd, LIVE_TIMER_ID, LIVE_POLL_MS, None);
+        }
+        crate::tsf::live_session::set_timer_armed(true);
+        tracing::info!(
+            "[Live] live_input_notify: timer armed debounce={}ms",
+            debounce_ms
+        );
     }
-    tracing::info!(
-        "[Live] live_input_notify: timer armed debounce={}ms",
-        debounce_ms
-    );
 }
 
 /// ライブタイマーを明示的に停止する（IMEオフ・確定・キャンセル時）。
@@ -1912,6 +2106,7 @@ pub fn stop_live_timer() {
             let _ = KillTimer(hwnd, LIVE_TIMER_ID);
         }
     }
+    crate::tsf::live_session::set_timer_armed(false);
     crate::tsf::live_session::clear_context_snapshot();
     tracing::debug!("[Live] stop_live_timer");
 }
@@ -1983,17 +2178,26 @@ fn is_symbol_only_preview(s: &str) -> bool {
             .all(|c| !c.is_alphanumeric() && !c.is_whitespace())
 }
 
+/// preview がこれ以上古いまま打鍵が続いたら、debounce を待たずに 1 回走らせる上限。
+///
+/// debounce だけだと「打鍵が止まるまで preview を更新しない」ので、速く打ち続けて
+/// いる間は生のかなが伸び続ける。
+const LIVE_MAX_STALE_MS: u64 = 400;
+
 /// debounce 経過時刻を返す。debounce 中なら `None` (caller は早期リターン)。
+///
+/// 最後に通過してから `LIVE_MAX_STALE_MS` 以上経っているときは、debounce 中でも通す。
 fn pass_debounce() -> Option<u64> {
     let debounce_ms = LIVE_DEBOUNCE_CFG_MS.load(AO::Relaxed);
     let now = current_millis();
     let last = crate::tsf::live_session::load_last_input_ms();
     let elapsed = now.saturating_sub(last);
-    if elapsed < debounce_ms {
-        None
-    } else {
-        Some(elapsed)
+    let stale = now.saturating_sub(crate::tsf::live_session::load_last_fire_ms());
+    if elapsed < debounce_ms && stale < LIVE_MAX_STALE_MS {
+        return None;
     }
+    crate::tsf::live_session::store_last_fire_ms(now);
+    Some(elapsed)
 }
 
 /// engine からの probe 結果。
@@ -2069,6 +2273,47 @@ fn has_immediate_live_preview_candidate(
 
 fn is_dict_like_preview_candidate(candidates: &[String], reading: &str, preview: &str) -> bool {
     preview != reading && candidates.iter().any(|candidate| candidate == preview)
+}
+
+/// bg の結果が現在の読みに追いついていないので、この tick は preview を
+/// 更新せず見送るべきかを判定する。
+///
+/// 🔴 `bg_status == "done"` は「**何かの** 変換が終わった」としか言っていない。
+///    bg 変換は 1 本しか走らないので、打鍵が速いと done の中身は数文字前の
+///    読みの結果になる。`bg_peek_top_candidate(現在の読み)` はキー不一致で
+///    `None` を返し、そのまま辞書だけのフォールバックに落ちる。
+///    `もうこうれいだよ` のような助動詞込みの読みは辞書に無いので空振りし、
+///    **読みそのものが preview になる**（＝変換が消えたように見える）。
+///
+/// 🔴 さらに悪いことに、この経路は現在の読みでの変換を仕掛け直さない。次の
+///    tick でも `bg_status` は古いキーのまま `done` なので同じ判断を繰り返し、
+///    打鍵を止めても復帰しない。Backspace で読みが縮むと走っている変換と必ず
+///    キーがズレるため、「typo を消して打ち直すと以後ずっと生かな」になる
+///    （2026-09-08 のログ実測: 読み 8 文字以上で preview が生かなになった 74 回は
+///    74 回とも直前が `bg=done`。`running` 由来は 0 件）。
+///
+/// 判定は「辞書マージが読み以外を 1 件も出せなかった」＝実候補ゼロ。
+/// `has_immediate_live_preview_candidate` と同じ述語を、取得済みの候補列に
+/// 対して適用している。ユーザー辞書や学習履歴が「ひらがなのまま」を指示して
+/// いる場合は文字種候補（カタカナ）が並ぶので実候補ありと判定され、ここには
+/// 落ちてこない。
+fn should_defer_stale_bg_preview(
+    used_bg_candidate: bool,
+    bg_status: &str,
+    dict_like_candidates: &[String],
+    reading: &str,
+) -> bool {
+    if used_bg_candidate {
+        return false;
+    }
+    // running は既存の待機経路（`ensure_bg_running`）が面倒を見る。
+    // ここで拾うのは「done なのに中身が古い読み」だけ。
+    if bg_status != "done" {
+        return false;
+    }
+    !dict_like_candidates
+        .iter()
+        .any(|candidate| !candidate.is_empty() && candidate != reading)
 }
 
 /// bg ワーカーが done で結果取得可能なら `true`、そうでなければ caller は return。
@@ -2178,12 +2423,32 @@ fn fetch_preview() -> Option<LivePreview> {
                 .next()
                 .filter(|s| !s.is_empty())
         } else {
+            // 先頭が読みそのものなら、それは学習履歴／ユーザー辞書の「ひらがなの
+            // まま」の意思（辞書由来の読み一致候補は engine 側で落としてある）。
+            // 飛ばさずに preview にする。
             dict_like_candidates
                 .iter()
                 .cloned()
-                .into_iter()
-                .find(|s| !s.is_empty() && s != &reading)
+                .find(|s| !s.is_empty())
         };
+        if should_defer_stale_bg_preview(
+            used_bg_candidate,
+            bg_status,
+            &dict_like_candidates,
+            &reading,
+        ) {
+            // 今の読みで変換を仕掛け直す。`bg_start` は先頭で古い `Done` を
+            // 回収するので、これが唯一の復帰経路になる。preview は更新せず
+            // 前回のものを残し、タイマーは回したまま次の発火に委ねる。
+            let restarted = crate::engine::state::start_live_bg_if_ready(eng, &reading);
+            tracing::info!(
+                "[Live] on_live_timer: stale bg result reading={:?} → 再変換を要求 restarted={}",
+                reading,
+                restarted
+            );
+            return None;
+        }
+
         let keep_short_preview = preview
             .as_ref()
             .is_some_and(|p| is_dict_like_preview_candidate(&dict_like_candidates, &reading, p));
@@ -2258,6 +2523,159 @@ fn build_apply_snapshot(data: LivePreview) -> LiveSnapshot {
     }
 }
 
+/// EditSession の中で composition の全体を `text` に差し替える。
+///
+/// Phase1A（ライブ変換）と Space 変換後の後追い更新（`on_waiting_timer`）の
+/// 共通処理。`COMPOSITION_APPLY_LOCK` が busy なら SetText を諦めて `false` を
+/// 返す（呼び出し側は「適用できなかった」として扱う）。
+///
+/// # Safety
+/// `ec` は TSF から渡された有効な EditCookie でなければならない。
+unsafe fn set_composition_text(
+    ec: u32,
+    ctx: &windows::Win32::UI::TextServices::ITfContext,
+    text: &str,
+    log_tag: &str,
+) -> windows::core::Result<bool> {
+    use windows::Win32::Foundation::E_FAIL;
+    use windows::Win32::UI::TextServices::{
+        TF_ANCHOR_END, TF_SELECTION, TF_SELECTIONSTYLE, TfActiveSelEnd,
+    };
+    unsafe {
+        let comp = crate::engine::state::composition_clone()
+            .unwrap_or(None)
+            .ok_or_else(|| windows::core::Error::new(E_FAIL, "no composition"))?;
+        let range = comp
+            .GetRange()
+            .map_err(|e| windows::core::Error::new(E_FAIL, format!("GetRange: {e}")))?;
+        let text_w: Vec<u16> = text.encode_utf16().collect();
+        // M1.8 T-MID3: SetText 排他化。update_composition 系の SetText と
+        // 直列化されないと、deferred dispatch 順序によっては古い preview が
+        // 新しい preedit を上書きする risk がある。busy なら skip して
+        // 次回 timer / key で最新 gen の SetText を走らせる。
+        {
+            let _apply_guard = match crate::engine::state::COMPOSITION_APPLY_LOCK.try_lock() {
+                Ok(g) => g,
+                Err(_) => {
+                    tracing::debug!("{log_tag}: COMPOSITION_APPLY_LOCK busy, skip SetText");
+                    return Ok(false);
+                }
+            };
+            range
+                .SetText(ec, 0, &text_w)
+                .map_err(|e| windows::core::Error::new(E_FAIL, format!("SetText: {e}")))?;
+        }
+
+        let atom = crate::tsf::display_attr::atom_input();
+        if atom != 0 {
+            if let Ok(prop) =
+                ctx.GetProperty(&windows::Win32::UI::TextServices::GUID_PROP_ATTRIBUTE)
+            {
+                let _ = prop.Clear(ec, &range);
+                let var = windows_core::VARIANT::from(atom as i32);
+                let _ = prop.SetValue(ec, &range, &var);
+            }
+        }
+
+        if let Ok(cursor) = range.Clone() {
+            let _ = cursor.Collapse(ec, TF_ANCHOR_END);
+            let sel = TF_SELECTION {
+                range: std::mem::ManuallyDrop::new(Some(cursor)),
+                style: TF_SELECTIONSTYLE {
+                    ase: TfActiveSelEnd(0),
+                    fInterimChar: windows::Win32::Foundation::BOOL(0),
+                },
+            };
+            let _ = ctx.SetSelection(ec, &[sel]);
+        }
+        Ok(true)
+    }
+}
+
+/// Selecting 状態のまま `key` の変換を続けているなら、いま選択中の候補を返す。
+///
+/// 分割変換中（prefix / remainder が空でない）は composition を 3 分割して
+/// 属性を塗り分ける必要があり、単純な全体差し替えでは表示が壊れるので対象外。
+fn selecting_composition_text(key: &str) -> Option<String> {
+    use crate::engine::state::{SessionState, session_get};
+    let sess = session_get().ok()?;
+    let SessionState::Selecting {
+        original_preedit, ..
+    } = &*sess
+    else {
+        return None;
+    };
+    if original_preedit != key {
+        return None;
+    }
+    if !sess.selecting_prefix_clone().is_empty() || !sess.selecting_remainder_clone().is_empty() {
+        return None;
+    }
+    Some(sess.current_candidate()?.to_string())
+}
+
+/// Space 変換の後追い BG 更新で composition（インラインの下線付き本文）も書き換える。
+///
+/// `on_waiting_timer` の Selecting 分岐は長らく候補ウィンドウだけを更新していたため、
+/// インラインは `LLM_WAIT_INLINE_MS` タイムアウト時のライブプレビュー（読みの
+/// 途中までしか変換されていない文字列）のまま残っていた。Enter で確定されるのは
+/// セッションが持つ正しい候補なので実害は表示だけだが、目線が行くのはインライン側
+/// なので「最初の変換がトンチンカン」に見える。
+///
+/// ライブ変換の Phase1A と同じ経路（WM_TIMER から `RequestEditSession`）を使うが、
+/// 状態は Selecting のままなので `set_live_conv` もタイマー停止も行わない。
+/// EditSession は遅延実行されうるので、実行時にセッションから候補を読み直す
+/// （待っている間に ↓/Space で選択が動いていても正しい方を書く）。
+fn try_update_selecting_composition(key: &str) -> bool {
+    use crate::engine::state::composition_clone;
+    use crate::tsf::edit_session::EditSession;
+    use windows::Win32::UI::TextServices::TF_ES_READWRITE;
+
+    // 🔴 `context_snapshot()` は使えない。Space 変換は `stop_live_timer` を経て
+    // 走るので、ライブ変換用のスナップショットはこの時点で必ず空になっている。
+    let (ctx_opt, tid, live_dm_ptr) = crate::tsf::live_session::last_input_context();
+    let focused_dm_ptr = current_focus_dm_ptr();
+    let possible = ctx_opt.is_some()
+        && tid > 0
+        && live_dm_ptr != 0
+        && focused_dm_ptr == Some(live_dm_ptr)
+        && composition_clone().map(|g| g.is_some()).unwrap_or(false);
+    let Some(ctx) = ctx_opt.filter(|_| possible) else {
+        tracing::debug!(
+            "pending_composition_update: skipped (tid={tid} cached_dm={live_dm_ptr:#x} focus={focused_dm_ptr:?})"
+        );
+        return false;
+    };
+
+    let ctx_req = ctx.clone();
+    let captured_dm_ptr = live_dm_ptr;
+    let captured_key = key.to_string();
+    let applied = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let applied_in = applied.clone();
+
+    let session = EditSession::new(move |ec| unsafe {
+        use windows::Win32::Foundation::E_FAIL;
+        if current_focus_dm_ptr() != Some(captured_dm_ptr) {
+            return Err(windows::core::Error::new(
+                E_FAIL,
+                "focus DM changed before pending composition update",
+            ));
+        }
+        // 遅延実行されている間に確定・取消・別の読みへ進んでいたら書かない。
+        let Some(text) = selecting_composition_text(&captured_key) else {
+            tracing::debug!("pending_composition_update: session moved on, skip SetText");
+            return Ok(());
+        };
+        if set_composition_text(ec, &ctx, &text, "pending_composition_update")? {
+            applied_in.store(true, std::sync::atomic::Ordering::Release);
+        }
+        Ok(())
+    });
+
+    let result = unsafe { ctx_req.RequestEditSession(tid, &session, TF_ES_READWRITE) };
+    result.is_ok() && applied.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// Phase 1A: RequestEditSession で直接 composition に SetText を書く。
 /// 成功したら `true` (caller は完了)、失敗したら `false` (Phase 1B へ落ちる)。
 fn try_apply_phase1a(snapshot: &LiveSnapshot) -> bool {
@@ -2308,9 +2726,6 @@ fn try_apply_phase1a(snapshot: &LiveSnapshot) -> bool {
 
     let session = EditSession::new(move |ec| unsafe {
         use windows::Win32::Foundation::E_FAIL;
-        use windows::Win32::UI::TextServices::{
-            TF_ANCHOR_END, TF_SELECTION, TF_SELECTIONSTYLE, TfActiveSelEnd,
-        };
         if cancelled_in.load(std::sync::atomic::Ordering::Acquire) {
             tracing::debug!("[Live] Phase1A: cancelled before deferred execution, skip");
             return Ok(());
@@ -2336,51 +2751,8 @@ fn try_apply_phase1a(snapshot: &LiveSnapshot) -> bool {
             );
             return Err(windows::core::Error::new(E_FAIL, "stale gen in Phase1A"));
         }
-        let comp = crate::engine::state::composition_clone()
-            .unwrap_or(None)
-            .ok_or_else(|| windows::core::Error::new(E_FAIL, "no composition"))?;
-        let range = comp
-            .GetRange()
-            .map_err(|e| windows::core::Error::new(E_FAIL, format!("GetRange: {e}")))?;
-        let text_w: Vec<u16> = preview_1a.encode_utf16().collect();
-        // M1.8 T-MID3: SetText 排他化。update_composition 系の SetText と
-        // 直列化されないと、deferred dispatch 順序によっては古い preview が
-        // 新しい preedit を上書きする risk がある。busy なら skip して
-        // 次回 timer / key で最新 gen の SetText を走らせる。
-        {
-            let _apply_guard = match crate::engine::state::COMPOSITION_APPLY_LOCK.try_lock() {
-                Ok(g) => g,
-                Err(_) => {
-                    tracing::debug!("[Live] Phase1A: COMPOSITION_APPLY_LOCK busy, skip SetText");
-                    return Ok(());
-                }
-            };
-            range
-                .SetText(ec, 0, &text_w)
-                .map_err(|e| windows::core::Error::new(E_FAIL, format!("SetText: {e}")))?;
-        }
-        applied_in.store(true, std::sync::atomic::Ordering::Release);
-
-        let atom = crate::tsf::display_attr::atom_input();
-        if atom != 0
-            && let Ok(prop) =
-                ctx.GetProperty(&windows::Win32::UI::TextServices::GUID_PROP_ATTRIBUTE)
-        {
-            let _ = prop.Clear(ec, &range);
-            let var = windows_core::VARIANT::from(atom as i32);
-            let _ = prop.SetValue(ec, &range, &var);
-        }
-
-        if let Ok(cursor) = range.Clone() {
-            let _ = cursor.Collapse(ec, TF_ANCHOR_END);
-            let sel = TF_SELECTION {
-                range: std::mem::ManuallyDrop::new(Some(cursor)),
-                style: TF_SELECTIONSTYLE {
-                    ase: TfActiveSelEnd(0),
-                    fInterimChar: windows::Win32::Foundation::BOOL(0),
-                },
-            };
-            let _ = ctx.SetSelection(ec, &[sel]);
+        if set_composition_text(ec, &ctx, &preview_1a, "[Live] Phase1A")? {
+            applied_in.store(true, std::sync::atomic::Ordering::Release);
         }
         Ok(())
     });
@@ -2462,6 +2834,12 @@ fn queue_phase1b(snapshot: &LiveSnapshot) {
 ///   5. `build_apply_snapshot` — display_shown 組み立て
 ///   6. `try_apply_phase1a` (RequestEditSession) / `queue_phase1b` (LIVE_PREVIEW_QUEUE)
 pub fn on_live_timer() {
+    // キャレット編集中は engine が読みの左側しか持っていないので、preview を
+    // 出すと右側が消える。編集が終わる（Space / 末尾へ戻る）まで止める。
+    if !crate::engine::state::caret_tail_is_empty() {
+        stop_live_timer();
+        return;
+    }
     let Some(elapsed) = pass_debounce() else {
         return;
     };
@@ -2558,6 +2936,69 @@ mod tests {
     fn fit_font_height_keeps_configured_without_monitor_info() {
         assert_eq!(fit_font_height(72, 0, 9, true, true), 72);
         assert_eq!(fit_font_height(72, -1, 9, true, true), 72);
+    }
+
+    use super::should_defer_stale_bg_preview;
+
+    #[test]
+    fn defer_when_bg_done_but_stale_and_no_real_candidate() {
+        // done なのにキーが古い → 辞書は読みしか返せない。ここで preview を
+        // 更新すると生かなに落ちて二度と戻らない。
+        assert!(should_defer_stale_bg_preview(
+            false,
+            "done",
+            &["もうこうれいだよ".to_string()],
+            "もうこうれいだよ",
+        ));
+    }
+
+    #[test]
+    fn no_defer_when_bg_candidate_matched_current_reading() {
+        assert!(!should_defer_stale_bg_preview(
+            true,
+            "done",
+            &["もうこうれいだよ".to_string()],
+            "もうこうれいだよ",
+        ));
+    }
+
+    #[test]
+    fn no_defer_while_bg_still_running() {
+        // running は ensure_bg_running の待機経路が担当する
+        assert!(!should_defer_stale_bg_preview(
+            false,
+            "running",
+            &["もうこうれいだよ".to_string()],
+            "もうこうれいだよ",
+        ));
+        assert!(!should_defer_stale_bg_preview(
+            false,
+            "idle",
+            &["もうこうれいだよ".to_string()],
+            "もうこうれいだよ",
+        ));
+    }
+
+    #[test]
+    fn no_defer_when_dict_has_a_real_candidate() {
+        assert!(!should_defer_stale_bg_preview(
+            false,
+            "done",
+            &["恒例".to_string(), "こうれい".to_string()],
+            "こうれい",
+        ));
+    }
+
+    #[test]
+    fn no_defer_when_user_wants_kana_and_char_type_candidates_follow() {
+        // ユーザー辞書／学習履歴が「ひらがなのまま」を指示している場合は
+        // 文字種候補が並ぶので実候補ありと判定される。
+        assert!(!should_defer_stale_bg_preview(
+            false,
+            "done",
+            &["なんか".to_string(), "ナンカ".to_string()],
+            "なんか",
+        ));
     }
 
     #[test]

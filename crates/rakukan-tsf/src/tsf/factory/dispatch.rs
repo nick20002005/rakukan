@@ -24,6 +24,11 @@ impl super::TextServiceFactory_Impl {
         tid: u32,
         sink: ITfCompositionSink,
     ) -> Result<bool> {
+        // 直前の確定が edit session 拒否で書けていない場合、このキーが
+        // composition を書き換える前に書き直す（composition は失敗時に take
+        // されていないので、ここならまだ確定先が生きている）。
+        super::on_compose::retry_pending_commit("key");
+
         let mut guard = engine_try_get_or_create()?;
         let engine = match guard.as_mut() {
             Some(e) => e,
@@ -178,6 +183,7 @@ impl super::TextServiceFactory_Impl {
                     let preview = entry.preview;
                     let apply = if let Ok(sess) = session_get() {
                         matches!(*sess, SessionState::Preedit { .. })
+                            && crate::engine::state::caret_tail_is_empty()
                     } else {
                         false
                     };
@@ -446,6 +452,28 @@ impl super::TextServiceFactory_Impl {
             }
         } // if !is_cancel
 
+        // キャレット編集中（← で読みの途中にいる）に、キャレットを意識しない
+        // アクションが来たら、退避している右側の読みを engine の末尾へ戻してから
+        // 処理する。Space / Enter / F6〜F10 / IME 切替 / Shift+← などは
+        // 読み全体を対象にするのが Google 日本語入力と同じ挙動。
+        let caret_aware = matches!(
+            action,
+            UserAction::Input(_)
+                | UserAction::InputRaw(_)
+                | UserAction::Backspace
+                | UserAction::Delete
+                | UserAction::CursorLeft
+                | UserAction::CursorRight
+                | UserAction::CursorHome
+                | UserAction::CursorEnd
+        );
+        if !caret_aware && !crate::engine::state::caret_tail_is_empty() {
+            crate::engine::state::caret_merge_into_engine(engine);
+            if let Ok(mut sess) = session_get() {
+                sess.sync_preedit_reading(&engine.hiragana_text());
+            }
+        }
+
         match action {
             UserAction::Input(c) => {
                 if let Some(symbol) = text_util::direct_input_symbol(c) {
@@ -491,10 +519,12 @@ impl super::TextServiceFactory_Impl {
                 self.on_candidate_page(ctx, tid, sink, guard, CandidateDir::Prev)
             }
             UserAction::CandidateSelect(n) => self.on_candidate_select(n, ctx, tid, sink, guard),
+            UserAction::CandidateForget => self.on_candidate_forget(ctx, tid, sink, guard),
             UserAction::CursorLeft => self.on_segment_move_left(ctx, tid, sink, guard),
-            UserAction::CursorRight => self.on_segment_move_right(ctx, tid, sink, guard),
             UserAction::CursorHome => self.on_cursor_jump(ctx, tid, sink, guard, false),
             UserAction::CursorEnd => self.on_cursor_jump(ctx, tid, sink, guard, true),
+            UserAction::Delete => self.on_delete(ctx, tid, sink, guard),
+            UserAction::CursorRight => self.on_segment_move_right(ctx, tid, sink, guard),
             UserAction::Punctuate(c) => self.on_punctuate(c, ctx, tid, sink, guard),
             UserAction::SegmentShrink => self.on_segment_shrink(ctx, tid, sink, guard),
             UserAction::SegmentExtend => self.on_segment_extend(ctx, tid, sink, guard),

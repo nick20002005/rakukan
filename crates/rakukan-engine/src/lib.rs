@@ -19,7 +19,7 @@
 // ── 統合した karukan-engine モジュール ────────────────────────────────────────
 pub mod kana;
 pub mod kanji;
-mod latin_run;
+pub mod latin_run;
 pub mod romaji;
 
 pub use kana::{
@@ -32,8 +32,10 @@ pub use romaji::{BackspaceResult, ConversionEvent, RomajiConverter};
 pub mod backend;
 pub mod conv_cache;
 pub mod dict;
+pub mod dict_prefix;
 pub mod digits;
 pub mod ffi;
+pub mod rescore;
 pub mod segments;
 pub use backend::{BackendSelection, GpuInfo, select_backend};
 // Backend は kanji::Backend と名前が被るため、rakukan の Backend は別名でエクスポート
@@ -45,6 +47,7 @@ pub use rakukan_dict::mozc_dict::MozcDict;
 pub use rakukan_dict::{DictStore, find_mozc_dict, user_dict_path};
 
 use kanji::{Backend as KarukanBackend, registry};
+use std::sync::Mutex;
 use thiserror::Error;
 use tracing::{debug, info};
 
@@ -255,10 +258,198 @@ pub struct EngineConfig {
     /// 診断用: 推論を必ず失敗させる（既定 false）。Issue #43 の復帰段階の確認用。
     #[serde(default)]
     pub force_inference_failure: bool,
+    /// 短文予測（学習済みフレーズの前方一致予測）を有効にする。
+    #[serde(default = "default_prediction_enabled")]
+    pub prediction_enabled: bool,
+    /// 1 回の候補リストに差し込む短文予測の最大件数。
+    #[serde(default = "default_prediction_max_candidates")]
+    pub prediction_max_candidates: usize,
+    /// 短文予測を開始する読みの最小文字数。
+    #[serde(default = "default_prediction_min_reading_chars")]
+    pub prediction_min_reading_chars: usize,
+    /// 長文変換の n-best を辞書との整合で並べ替える（`rescore` モジュール）。
+    #[serde(default = "default_rescore_enabled")]
+    pub rescore_enabled: bool,
+    /// 並べ替えを適用する読みの最小文字数。これ未満は辞書が完全一致で効くので触らない。
+    #[serde(default = "default_rescore_min_reading_chars")]
+    pub rescore_min_reading_chars: usize,
+    /// 先頭候補を押しのけるのに必要なスコア差。小さくすると積極的になる。
+    #[serde(default = "default_rescore_min_gain")]
+    pub rescore_min_gain: f64,
+}
+
+fn is_kana_or_cjk(c: char) -> bool {
+    matches!(c,
+        '\u{3041}'..='\u{309f}'   // ひらがな
+        | '\u{30a0}'..='\u{30ff}' // カタカナ
+        | '\u{3400}'..='\u{4dbf}' // CJK 拡張A
+        | '\u{4e00}'..='\u{9fff}' // CJK 統合漢字
+        | '\u{f900}'..='\u{faff}' // CJK 互換漢字
+        | '\u{ff66}'..='\u{ff9f}' // 半角カタカナ
+    )
+}
+
+/// 「記号だけでできている候補」か。
+///
+/// MOZC 辞書には 1 つの読みに記号がまとめて登録されていることがあり、
+/// 「たんい」は ¢ £ ¤ ¥ ° ‰ ′ ″ ₠… だけで 50 件を占める。辞書候補を
+/// 素直に前へ並べると表示スロット（既定 8）が記号で埋まり、LLM が返す
+/// 「単位」が 1 件も入らない。記号だけの候補は LLM の後ろへ回す。
+///
+/// ASCII 英数字だけの候補（"PC" など）は語として扱う。"°C" のように
+/// 記号が混ざるものは記号側。
+fn is_symbol_only_candidate(s: &str) -> bool {
+    !s.is_empty()
+        && !s.chars().any(is_kana_or_cjk)
+        && !s.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// 「ん」補完を試す読みの最小文字数。
+const N_INSERTION_MIN_READING_CHARS: usize = 3;
+/// 1 回の変換で試す代替読みの上限。
+const N_INSERTION_MAX_READINGS: usize = 4;
+/// 代替読みから拾う候補の上限。
+const N_INSERTION_MAX_CANDIDATES: usize = 3;
+
+/// 短文予測を**変換候補リストへ差し込む**ときに要求する、打った読みの被覆率。
+///
+/// 予測ウィンドウ（[`RakunEngine::predict`]）とは別枠の、もっと厳しい条件。
+/// `lookup_learn_prefix_keyed` は「前方一致するより長いキー」を全部拾うので、
+/// 打った読みが 2 文字でも 12 文字のフレーズが引ける。それが merge の §6 で
+/// 実候補の直後に固定挿入されると、上位 2 枠が読みと無関係な過去の長文で
+/// 埋まる（実害 2026-09-08: `はじ` → `["恥ぢ", "初めてお邪魔するもの",
+/// "初めて見る場合は全画面で生成結果を", "恥じ", …]` で「端」が 8 番目まで
+/// 沈んだ。`がめ` → `["ガメ", "画面に天井が入り", "画面いっぱいのあるかな
+/// シャドウ", …]` も同じ）。
+///
+/// 予測が「補完」として意味を持つのは読みの大半を打ち終えてからなので、
+/// キーの一定割合を打っていない予測は変換リストへは入れない。予測ウィンドウ
+/// 側は従来どおり全部出す（あそこは前方一致で長文を出すための場所）。
+const PREDICTION_MIN_READING_COVERAGE: f64 = 1.0 / 3.0;
+
+/// 被覆率で絞る前に引いておく倍率。スコア上位が偶然すべて長文でも、条件を
+/// 満たす予測が下位にあれば拾えるようにする。
+const PREDICTION_OVERFETCH: usize = 4;
+
+/// な行かなを「ん + 母音」に開いた代替読みを列挙する。
+///
+/// ローマ字入力では `n` + 母音 が な行になるので、「げんいん」を出すには
+/// `gennin` と n を 2 回打つ必要がある。1 回で済ませると「げにん」になり、
+/// 目的の語が候補に出てこない（原因 / 雰囲気 / 恋愛 / 千円 / 全員 / 金曜 …）。
+///
+/// 先頭のかなは対象外（「ん」で始まる読みは作らない）。
+/// 2 文字以下の読みも対象外。「たに」を「たんい」に開くのは踏み込みすぎで、
+/// 谷 のような正当な変換の後ろに無関係な候補を足すだけになる。
+fn n_insertion_readings(reading: &str) -> Vec<String> {
+    let chars: Vec<char> = reading.chars().collect();
+    if chars.len() < N_INSERTION_MIN_READING_CHARS {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 1;
+    while i < chars.len() {
+        // にゃ/にゅ/にょ は 2 文字まとめて「んや/んゆ/んよ」に開く（きにょう → きんよう）
+        let (consumed, vowel) = match (chars[i], chars.get(i + 1)) {
+            ('に', Some('ゃ')) => (2, 'や'),
+            ('に', Some('ゅ')) => (2, 'ゆ'),
+            ('に', Some('ょ')) => (2, 'よ'),
+            ('な', _) => (1, 'あ'),
+            ('に', _) => (1, 'い'),
+            ('ぬ', _) => (1, 'う'),
+            ('ね', _) => (1, 'え'),
+            ('の', _) => (1, 'お'),
+            _ => {
+                i += 1;
+                continue;
+            }
+        };
+        let mut alt: String = chars[..i].iter().collect();
+        alt.push('ん');
+        alt.push(vowel);
+        alt.extend(chars[i + consumed..].iter());
+        out.push(alt);
+        if out.len() >= N_INSERTION_MAX_READINGS {
+            break;
+        }
+        i += consumed;
+    }
+    out
+}
+
+/// ASCII 図形文字 (U+0021..U+007E) を全角形 (U+FF01..U+FF5E) に写す。
+/// 読みが「外来語っぽい」かを判定する。
+///
+/// 辞書に載っていない外来語（`でもりっしゃー` → `デモリッシャー`）を、辞書引きが
+/// 空振りしたときにカタカナで先頭に出すための手掛かり。Google 日本語入力は
+/// 未知語でもカタカナを上位に出してくるが、rakukan は辞書か LLM 頼みなので
+/// 「変換できない」ように見えていた。
+///
+/// 誤爆を避けるため、和語・漢語の読みには現れないシグナルだけを見る:
+/// 長音符 `ー` と、外来語専用の拗音（`ふぁ` `てぃ` `うぃ` `しぇ` `つぁ` など）。
+/// `まいめ` `つづけて` のような普通の読みは該当しない。
+///
+/// 呼び出し側で「辞書に完全一致が 1 件も無い」ことを必ず確認すること。
+/// 単独で使うと `らーめん` のような辞書に載っている語まで巻き込む。
+fn is_loanword_reading(reading: &str) -> bool {
+    // 🔴 語 1 個ぶんの長さに限る。rakukan は **区読点でしかブロック分割しない**ので、
+    //    読点の無い文は全体が 1 つの読みとして渡ってくる。長さで縛らないと
+    //    「れーるがんいますぐにつくれない」が「ー を含む未知語」と判定され、
+    //    文まるごとカタカナが第 1 候補になる（2026-08-31 に実害）。
+    //    外来語は「いんたーふぇーす」「こみゅにけーしょん」あたりが上限なので 10。
+    const MAX_WORD_CHARS: usize = 10;
+    let len = reading.chars().count();
+    if !(3..=MAX_WORD_CHARS).contains(&len) {
+        return false;
+    }
+    // ひらがな以外（ASCII・数字・記号・漢字）が混ざる読みは対象外。
+    // 英数まじりは英数候補、数字まじりは digits.rs の担当。
+    if !reading.chars().all(|c| matches!(c, 'ぁ'..='ゟ' | 'ー')) {
+        return false;
+    }
+    if reading.contains('ー') || reading.contains('ゔ') {
+        return true;
+    }
+    const FOREIGN_DIGRAPHS: [&str; 22] = [
+        "ふぁ", "ふぃ", "ふぇ", "ふぉ", "ふゅ", "てぃ", "てゅ", "でぃ", "でゅ", "うぃ", "うぇ",
+        "うぉ", "しぇ", "ちぇ", "じぇ", "つぁ", "つぃ", "つぇ", "つぉ", "くぁ", "くぉ", "ぐぁ",
+    ];
+    FOREIGN_DIGRAPHS.iter().any(|d| reading.contains(d))
+}
+
+fn ascii_to_fullwidth(c: char) -> char {
+    if ('!'..='~').contains(&c) {
+        char::from_u32(c as u32 + 0xFEE0).unwrap_or(c)
+    } else {
+        c
+    }
 }
 
 fn default_confidence_margin() -> Option<f32> {
     Some(3.0)
+}
+
+fn default_prediction_enabled() -> bool {
+    true
+}
+
+fn default_prediction_max_candidates() -> usize {
+    2
+}
+
+fn default_prediction_min_reading_chars() -> usize {
+    2
+}
+
+fn default_rescore_enabled() -> bool {
+    true
+}
+
+fn default_rescore_min_reading_chars() -> usize {
+    12
+}
+
+fn default_rescore_min_gain() -> f64 {
+    24.0
 }
 
 impl Default for EngineConfig {
@@ -279,6 +470,12 @@ impl Default for EngineConfig {
             confidence_margin: default_confidence_margin(),
             min_top_confidence: None,
             force_inference_failure: false,
+            prediction_enabled: default_prediction_enabled(),
+            prediction_max_candidates: default_prediction_max_candidates(),
+            prediction_min_reading_chars: default_prediction_min_reading_chars(),
+            rescore_enabled: default_rescore_enabled(),
+            rescore_min_reading_chars: default_rescore_min_reading_chars(),
+            rescore_min_gain: default_rescore_min_gain(),
         }
     }
 }
@@ -592,6 +789,21 @@ struct InputEntry {
     /// Backspace 再生（Step 10-3）で区間の境界として使う。
     closes_run: bool,
 }
+/// 記号の連打を 1 文字へ畳む規則（読みの末尾一致 → 置換）。上から順に試す。
+///
+/// `。。。` は三点リーダーの代用として最も多く打たれる形で、`・・・` / `、、、` も
+/// 同じ意図。`...` / `．．．` は英字直後（`alpha_symbol_separator_auto` が `.` を
+/// 和文の `。` にしない経路）で出る形。出力は中央寄せの `⋯`（U+22EF）。
+/// `…`（U+2026）は欧文フォントでベースラインに沈むので使わない。
+/// 二点リーダー `‥` は `z,` で打てるのでここでは扱わない（`、、` を畳むと
+/// 読点 2 連の打ち間違いを巻き込む）。
+const SYMBOL_REPEAT_RULES: &[(&str, &str)] = &[
+    ("。。。", "⋯"),
+    ("・・・", "⋯"),
+    ("、、、", "⋯"),
+    ("．．．", "⋯"),
+    ("...", "⋯"),
+];
 
 pub struct RakunEngine {
     romaji: RomajiConverter,
@@ -610,6 +822,12 @@ pub struct RakunEngine {
     log_detached_at: usize,
     committed: String,
     dict_store: Option<DictStore>,
+    /// 直近に「短文予測」として提示した候補: `(提示した読み, [(登録キー, surface)])`。
+    ///
+    /// 予測候補は現在の読みより**長いキー**の学習フレーズなので、確定時にそのまま
+    /// 現在の読みで学習すると「読みに無い文字を含む表記」が完全一致エントリになる
+    /// （`learn_rekeyed_to_prediction` 参照）。学習を元のキーへ振り直すために覚える。
+    last_predictions: Mutex<Option<(String, Vec<(String, String)>)>>,
 }
 
 impl RakunEngine {
@@ -624,6 +842,7 @@ impl RakunEngine {
             log_detached_at: 0,
             committed: String::new(),
             dict_store: None,
+            last_predictions: Mutex::new(None),
         }
     }
 
@@ -723,6 +942,42 @@ impl RakunEngine {
     }
 
     pub fn push_char(&mut self, c: char) -> PreeditState {
+        let before = self.hiragana_buf.len();
+        self.push_char_inner(c);
+        if self.hiragana_buf.len() > before {
+            self.collapse_symbol_repeat();
+        }
+        self.current_preedit()
+    }
+
+    fn collapse_symbol_repeat(&mut self) {
+        let Some((pattern, output)) = SYMBOL_REPEAT_RULES
+            .iter()
+            .find(|(pattern, _)| self.hiragana_buf.ends_with(pattern))
+        else {
+            return;
+        };
+        let keep = self.hiragana_buf.len() - pattern.len();
+        self.hiragana_buf.truncate(keep);
+        self.hiragana_buf.push_str(output);
+        self.romaji.replace_output_tail(pattern, output);
+        let n = pattern.chars().count();
+        let start = self.input_log.len().saturating_sub(n);
+        let logged: String = self.input_log[start..].iter().map(|e| e.output.as_str()).collect();
+        // force_preedit より前の打鍵は別の読みを表すため、畳み込まない。
+        if start >= self.log_detached_at && logged == *pattern {
+            let typed: String = self.input_log[start..].iter().map(|e| e.typed.as_str()).collect();
+            self.input_log.truncate(start);
+            self.input_log.push(InputEntry {
+                typed,
+                output: output.to_string(),
+                kind: InputKind::Raw,
+                closes_run: true,
+            });
+        }
+    }
+
+    fn push_char_inner(&mut self, c: char) -> PreeditState {
         // 数字と trie 外の ASCII 記号は pending を閉じてから経路 3・4 で扱う。
         // `,./[]\-` と英字は trie に委ねる（pending と結合しうるため）。
         if !self.pending_romaji_buf.is_empty() && !is_trie_input_char(c) {
@@ -841,6 +1096,7 @@ impl RakunEngine {
         self.close_pending();
         self.hiragana_buf.push(c);
         self.log_push(c, c, InputKind::Raw);
+        self.collapse_symbol_repeat();
     }
 
     /// Shift+アルファベット用: alpha_width 設定に従って全角 or 半角の大文字を hiragana_buf に追加。
@@ -1044,6 +1300,54 @@ impl RakunEngine {
         }
     }
 
+    /// 読みに対する辞書候補だけを返す（ユーザー辞書・学習履歴の完全一致・
+    /// システム辞書。短文予測も LLM も引かず、内部状態を一切変えない）。
+    ///
+    /// 文節境界の探索（`Shift+←/→`）が「この読みは辞書に載っている語か」を
+    /// 何度も問い合わせるための入口。`merge_candidates_for_reading` は短文予測を
+    /// 差し込むうえ「直近に提示した予測」を覚えてしまうので、探索には使えない。
+    pub fn dict_lookup(&self, reading: &str, limit: usize) -> Vec<String> {
+        if reading.is_empty() || limit == 0 {
+            return vec![];
+        }
+        let Some(store) = self.dict_store.as_ref() else {
+            return vec![];
+        };
+        let mut out: Vec<String> = Vec::new();
+        for c in store
+            .lookup_user(reading)
+            .into_iter()
+            .chain(store.lookup_learn(reading))
+            .chain(store.lookup_user_low(reading))
+            .chain(store.lookup_dict(reading, limit))
+        {
+            if c.is_empty() || c == reading || out.contains(&c) {
+                continue;
+            }
+            out.push(c);
+            if out.len() >= limit {
+                break;
+            }
+        }
+        out
+    }
+
+    pub fn dict_prefix_split(&self, reading: &str) -> Option<(String, String)> {
+        let store = self.dict_store.as_ref()?;
+        let chars: Vec<char> = reading.chars().collect();
+        if chars.len() <= dict_prefix::MIN_PREFIX_CHARS {
+            return None;
+        }
+        for len in (dict_prefix::MIN_PREFIX_CHARS..chars.len()).rev() {
+            let key: String = chars[..len].iter().collect();
+            if let Some(surface) = store.lookup_user(&key).into_iter().next() {
+                let remainder: String = chars[len..].iter().collect();
+                return Some((surface, remainder));
+            }
+        }
+        None
+    }
+
     pub fn convert(&self, num_candidates: usize) -> Result<Vec<String>, EngineError> {
         if self.hiragana_buf.is_empty() {
             return Ok(vec![]);
@@ -1052,16 +1356,31 @@ impl RakunEngine {
             .kanji
             .as_ref()
             .ok_or(EngineError::ModelNotInitialized)?;
-        digits::convert_with_digit_protection(
+        let reading = self.conv_reading();
+        let alpha_fullwidth_first = matches!(self.config.alpha_width, AlphaWidth::Fullwidth);
+        let symbol_fullwidth_first = matches!(self.config.symbol_width, SymbolWidth::Fullwidth);
+        let mut cands = digits::convert_with_digit_protection(
             kanji,
-            &self.conv_reading(),
+            &reading,
             &self.committed,
             num_candidates,
             &self.config.digit_candidates_order,
-            matches!(self.config.alpha_width, AlphaWidth::Fullwidth),
-            matches!(self.config.symbol_width, SymbolWidth::Fullwidth),
+            alpha_fullwidth_first,
+            symbol_fullwidth_first,
         )
-        .map_err(|e| EngineError::ConversionFailed(e.to_string()))
+        .map_err(|e| EngineError::ConversionFailed(e.to_string()))?;
+        if let Some(split) = self.dict_prefix_split(&reading) {
+            dict_prefix::insert_candidates(
+                kanji,
+                &split,
+                &self.committed,
+                &self.config.digit_candidates_order,
+                alpha_fullwidth_first,
+                symbol_fullwidth_first,
+                &mut cands,
+            );
+        }
+        Ok(cands)
     }
 
     pub fn convert_default(&self) -> Result<Vec<String>, EngineError> {
@@ -1158,7 +1477,8 @@ impl RakunEngine {
     /// 学習語を DictStore に即時反映してファイルにも保存する。
     pub fn learn(&mut self, reading: &str, surface: &str) {
         if let Some(store) = &self.dict_store {
-            store.learn(reading, surface);
+            let key = self.learn_key_for(reading, surface);
+            store.learn(&key, surface);
         } else {
             tracing::warn!("learn: dict_store not initialized");
         }
@@ -1166,9 +1486,105 @@ impl RakunEngine {
 
     pub fn learn_force(&mut self, reading: &str, surface: &str) {
         if let Some(store) = &self.dict_store {
-            store.learn_force(reading, surface);
+            let key = self.learn_key_for(reading, surface);
+            store.learn_force(&key, surface);
         } else {
             tracing::warn!("learn_force: dict_store not initialized");
+        }
+    }
+
+    /// 直近に提示した予測候補（`predict` / merge の 6. ブロック）を覚える。
+    fn remember_predictions(&self, reading: &str, inserted: Vec<(String, String)>) {
+        if inserted.is_empty() {
+            return;
+        }
+        let Ok(mut slot) = self.last_predictions.lock() else {
+            return;
+        };
+        // 同じ読みなら足し込む。予測ウィンドウ（`predict`）と変換候補（merge）は
+        // どちらが後に呼ばれるか決まっていないので、上書きすると片方が消える。
+        match slot.as_mut() {
+            Some((prev_reading, entries)) if prev_reading == reading => {
+                for e in inserted {
+                    if !entries.contains(&e) {
+                        entries.push(e);
+                    }
+                }
+            }
+            _ => *slot = Some((reading.to_string(), inserted)),
+        }
+    }
+
+    /// 学習キーを決める。予測候補として出した表記を確定した場合は、**現在の読みでは
+    /// なく登録元の（より長い）読み**を返す。
+    ///
+    /// 🔴 予測は「読みの前方一致で長いフレーズを出す」機能なので、確定を通常の学習と
+    /// 同じ扱いにすると必ず「短い読み → 読みに無い文字を含む表記」の完全一致エントリが
+    /// できる。学習履歴はマージ順 2 番＝辞書にも LLM にも勝つので、以後その読みを打つ
+    /// たびに毎回それが先頭に出る（ライブ変換の preview も奪う）。しかも確定するたび
+    /// 強化されるので自己増幅する。実害 2026-09-01: `せいふくのさわりかた` を打つと
+    /// preview が `制服のさわりかたの`（末尾の「の」は読みに無い）になった。
+    fn learn_key_for(&self, reading: &str, surface: &str) -> String {
+        let Ok(slot) = self.last_predictions.lock() else {
+            return reading.to_string();
+        };
+        let Some((pred_reading, entries)) = slot.as_ref() else {
+            return reading.to_string();
+        };
+        if pred_reading != reading {
+            return reading.to_string();
+        }
+        for (key, pred_surface) in entries {
+            if pred_surface == surface && key != reading {
+                info!(
+                    "learn: rekey prediction reading={:?} → key={:?} surface={:?}",
+                    reading, key, surface
+                );
+                return key.clone();
+            }
+        }
+        reading.to_string()
+    }
+
+    /// 入力中の予測候補（Google 日本語入力の予測ウィンドウ相当）を返す。
+    ///
+    /// 学習履歴のみを引く（LLM も MOZC 辞書も引かない）ので、打鍵ごとに呼んでも
+    /// HashMap の前方一致走査だけで済む。
+    pub fn predict(&self, reading: &str, limit: usize) -> Vec<String> {
+        if !self.config.prediction_enabled {
+            return vec![];
+        }
+        if reading.chars().count() < self.config.prediction_min_reading_chars {
+            return vec![];
+        }
+        let keyed = self
+            .dict_store
+            .as_ref()
+            .map(|d| d.lookup_learn_suggest_keyed(reading, limit))
+            .unwrap_or_default();
+        // 予測ウィンドウから確定した場合も学習キーを振り直せるよう覚えておく
+        // （読みと同じキーのものは振り直す必要が無いので記録しない）。
+        self.remember_predictions(
+            reading,
+            keyed
+                .iter()
+                .filter(|(key, _)| key != reading)
+                .cloned()
+                .collect(),
+        );
+        keyed.into_iter().map(|(_, s)| s).collect()
+    }
+
+    /// 学習履歴から候補を削除する（候補ウィンドウでの明示削除）。
+    ///
+    /// `reading` に前方一致するキーもまとめて対象にするため、短文予測で出てきた
+    /// 候補（現在の読みより長いキーで登録されている）もその場で消せる。
+    pub fn forget(&mut self, reading: &str, surface: &str) -> bool {
+        if let Some(store) = &self.dict_store {
+            store.forget_matching(reading, surface) > 0
+        } else {
+            tracing::warn!("forget: dict_store not initialized");
+            false
         }
     }
 
@@ -1180,6 +1596,67 @@ impl RakunEngine {
         self.dict_store.as_ref()
     }
 
+    /// 入力したローマ字をそのまま出す「英数候補」。戻り値は (半角, 全角)。
+    ///
+    /// `claude` のように日本語のローマ字綴りとして成立しない語は、かな変換を
+    /// 通すと `cぁうで` のような無意味な読みになり、どの候補も当たらない。
+    /// F9/F10 を押せば `romaji_input_log` から復元できるが、それは「変換候補に
+    /// 出ていないだけで、打った文字列はエンジンが保持している」という状態なので、
+    /// 候補として提示する。
+    ///
+    /// `hiragana` がプリエディット全体と一致する時だけ返す。文節分割された
+    /// 部分読みに対してプリエディット全体のローマ字を出さないためのガード。
+    /// 打鍵したローマ字（半角英数）と、その全角版を返す。
+    ///
+    /// 読みが打鍵ログから復元できる場合だけ返す。F9/F10 で `force_preedit`
+    /// された後や、記号・空白が混ざった入力では `None`（記号混じりは
+    /// digits.rs のリテラル保護レイヤーの担当）。
+    fn romaji_alnum_candidates(&self, hiragana: &str) -> Option<(String, String)> {
+        // かなに変換しきれず末尾に残っているローマ字（pending）も含める。
+        // 「mac」は 'm','a' が「ま」になり 'c' が pending に残るため、ログだけを
+        // 見ると "ma" になって "mac" がどこにも出てこない。プリエディットの
+        // 表示は「まc」なので、確定すると composition 全体が置き換わる＝
+        // "mac" を候補に出して問題ない。
+        let romaji = format!("{}{}", self.romaji_log_str(), self.pending_romaji_buf);
+        if romaji.is_empty() {
+            return None;
+        }
+        // 英字を含む純粋な英数字列のみ。記号・空白が混ざるものは
+        // digits.rs のリテラル保護レイヤーの担当。
+        if !romaji.chars().all(|c| c.is_ascii_alphanumeric())
+            || !romaji.chars().any(|c| c.is_ascii_alphabetic())
+        {
+            return None;
+        }
+        // 呼び出し側が渡す読みは経路によって 2 種類ある。
+        //   - ライブ変換 / 学習系: hiragana_buf（pending を含まない）＝「ま」
+        //   - Space 変換 (on_convert): preedit_display()（pending 込み）＝「まc」
+        // どちらでも同じ英数候補を出す。片方としか比べないと、Space で変換した
+        // ときだけ "mac" が出ない（2026-08-31 に実害）。
+        let kana = self.hiragana_from_romaji_log();
+        let kana_with_pending = format!("{kana}{}", self.pending_romaji_buf);
+        if hiragana != kana && hiragana != kana_with_pending {
+            return None;
+        }
+        let full: String = romaji.chars().map(ascii_to_fullwidth).collect();
+        Some((romaji, full))
+    }
+
+    /// 候補の**先頭**に置いてよい英数候補。
+    ///
+    /// 読みに ASCII 英字が残っている = ローマ字がかなに変換しきれていない、
+    /// という場合だけ返す。"つづけて" のような普通の読みで先頭を "tudukete" に
+    /// 奪われると、候補リストが英数字で埋まるうえ、変換途中で候補が 0 件の
+    /// 瞬間にライブ変換の preview まで英字になってしまう。
+    /// 普通の読みの英数候補は末尾の文字種候補（`merge_candidates_for_reading`
+    /// の 8. ブロック）が拾う。
+    fn romaji_literal_candidates(&self, hiragana: &str) -> Option<(String, String)> {
+        if !hiragana.chars().any(|c| c.is_ascii_alphabetic()) {
+            return None;
+        }
+        self.romaji_alnum_candidates(hiragana)
+    }
+
     pub fn merge_candidates_for_reading(
         &self,
         hiragana: &str,
@@ -1189,10 +1666,19 @@ impl RakunEngine {
         // 優先順位（Step 12-1、Issue #13 / #37）: 学習履歴 → ユーザー辞書 → システム辞書 → LLM
         // 学習履歴を先頭に置くので、ユーザー辞書の表記を別の候補で上書きできる。
         // LLM は末尾だが、辞書候補が上限まで埋めても LLM の枠は確保する（#42 の 4）。
+        // 長文は辞書が完全一致で引けず LLM の区切りだけで決まるので、
+        // 先に n-best の並びを辞書との整合で見直す（集合は変えない）。
+        let llm_candidates = self.rescore_llm_candidates(hiragana, llm_candidates);
         let user_cands: Vec<String> = self
             .dict_store
             .as_ref()
             .map(|d| d.lookup_user(hiragana))
+            .unwrap_or_default();
+
+        let user_low_cands: Vec<String> = self
+            .dict_store
+            .as_ref()
+            .map(|d| d.lookup_user_low(hiragana))
             .unwrap_or_default();
 
         let learn_cands: Vec<String> = self
@@ -1201,10 +1687,41 @@ impl RakunEngine {
             .map(|d| d.lookup_learn(hiragana))
             .unwrap_or_default();
 
-        let dict_cands: Vec<String> = self
+        // MOZC 辞書候補は「語」と「記号だけ」に分ける。記号だけのものは LLM の
+        // 後ろへ回す（`is_symbol_only_candidate` のコメント参照）。
+        let (dict_cands, dict_symbol_cands): (Vec<String>, Vec<String>) = self
             .dict_store
             .as_ref()
             .map(|d| d.lookup_dict(hiragana, limit))
+            .unwrap_or_default()
+            .into_iter()
+            .partition(|c| !is_symbol_only_candidate(c));
+
+        // 「ん」を 1 打鍵で済ませたときの取りこぼしを辞書だけで補う。
+        // LLM は呼ばないので変換の待ち時間は増えない。
+        let n_fix_cands: Vec<String> = self
+            .dict_store
+            .as_ref()
+            .map(|d| {
+                let mut out: Vec<String> = Vec::new();
+                for alt in n_insertion_readings(hiragana) {
+                    let alt_cands = d
+                        .lookup_user(&alt)
+                        .into_iter()
+                        .chain(d.lookup_learn(&alt))
+                        .chain(d.lookup_dict(&alt, N_INSERTION_MAX_CANDIDATES * 2));
+                    for c in alt_cands {
+                        if is_symbol_only_candidate(&c) || out.contains(&c) {
+                            continue;
+                        }
+                        out.push(c);
+                        if out.len() >= N_INSERTION_MAX_CANDIDATES {
+                            return out;
+                        }
+                    }
+                }
+                out
+            })
             .unwrap_or_default();
 
         // 記号・絵文字は通常候補と別に引き、マージ後に位置を決める（Step 12-2、#42）
@@ -1218,9 +1735,41 @@ impl RakunEngine {
             .as_ref()
             .map(|d| d.lookup_emoji(hiragana))
             .unwrap_or_default();
+        // 短文予測（Google 日本語入力の「予測候補」相当）。
+        // 読みが前方一致する学習済みフレーズを引く。読みが短いうちは候補が
+        // 発散するので `prediction_min_reading_chars` 未満では引かない。
+        //
+        // さらに `PREDICTION_MIN_READING_COVERAGE` で「打った読みがキーの何割か」
+        // を見る。スコア上位が全部長文だと絞った後に 0 件になるので、上限より
+        // 多めに引いてから絞り、最後に `prediction_max_candidates` へ丸める。
+        let prediction_cands: Vec<(String, String)> = if self.config.prediction_enabled
+            && hiragana.chars().count() >= self.config.prediction_min_reading_chars
+        {
+            let typed_chars = hiragana.chars().count();
+            self.dict_store
+                .as_ref()
+                .map(|d| {
+                    d.lookup_learn_prefix_keyed(
+                        hiragana,
+                        self.config.prediction_max_candidates * PREDICTION_OVERFETCH,
+                    )
+                    .into_iter()
+                    .filter(|(key, _)| {
+                        let key_chars = key.chars().count();
+                        key_chars > 0
+                            && (typed_chars as f64) / (key_chars as f64)
+                                >= PREDICTION_MIN_READING_COVERAGE
+                    })
+                    .take(self.config.prediction_max_candidates)
+                    .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
 
         debug!(
-            "engine::merge: reading={:?} dict_store={} user_cands={:?} learn_cands={:?} dict_cands={:?} llm_cands={:?}",
+            "engine::merge: reading={:?} dict_store={} user_cands={:?} user_low_cands={:?} learn_cands={:?} prediction_cands={:?} dict_cands={:?} llm_cands={:?}",
             hiragana,
             if self.dict_store.is_some() {
                 "Some"
@@ -1228,24 +1777,175 @@ impl RakunEngine {
                 "None"
             },
             user_cands,
+            user_low_cands,
             learn_cands,
+            prediction_cands,
             dict_cands,
             llm_candidates
         );
+        debug!(
+            "engine::merge: dict_symbol_cands={:?} n_fix_cands={:?}",
+            dict_symbol_cands, n_fix_cands
+        );
 
+        let additional_dict: Vec<String> = user_low_cands.iter()
+            .chain(n_fix_cands.iter())
+            .chain(dict_cands.iter().filter(|c| c.as_str() != hiragana))
+            .cloned().collect();
         let merged = merge_candidate_lists(
             &learn_cands,
             &user_cands,
-            &dict_cands,
+            &additional_dict,
             llm_candidates,
             limit,
         );
         let mut merged = place_symbol_candidates(merged, symbol_cands, emoji_cands);
 
-        // 候補不足時は元の読みを末尾に追加（変換せず確定する退避路）
-        let desired_visible = self.config.num_candidates.min(limit);
-        if merged.len() < desired_visible && !merged.iter().any(|c| c == hiragana) {
+        // 5.4 外来語っぽい読みで辞書が空振りしたら、カタカナを先頭に出す。
+        //
+        //     `でもりっしゃー` のような未登録の外来語は、辞書に無く LLM も漢字に
+        //     割ろうとするので「変換できない」ように見える。Google 日本語入力は
+        //     未知語でもカタカナを上位に置くので、それに合わせる。
+        //
+        //     条件は「辞書（ユーザー / 学習 / MOZC）に完全一致が 1 件も無い」
+        //     AND「読みが外来語シグナルを持つ」の AND。片方だけだと
+        //     `らーめん`（辞書にある）や `まいめ`（シグナル無し）を巻き込む。
+        //     記号だけの辞書ヒットは語ではないので、空振り判定には数えない。
+        //
+        //     🔴 **先頭ではなく 2 番目に置く**。rakukan は区読点でしかブロック分割
+        //     しないので、ここへ来る読みは「語」とは限らず「外来語＋助詞／活用」
+        //     （`れーるがんだ` `こーひーを` `れーるがんつくれない`）でありうる。
+        //     それを先頭に置くと日常的な入力が軒並みカタカナに化ける
+        //     （2026-08-31 に実害。長さ上限だけでは助詞・活用が防げなかった）。
+        //     助詞リストで弾く案も、動詞が続く形が残るので不十分。
+        //     **文節分割を入れるまで先頭は LLM に譲り、2 番目で確実に選べる状態に
+        //     とどめる**。一度選べば学習履歴が先頭へ上げるので 2 回目以降は一発になる。
+        //
+        //     🔴 実候補が 0 件のときは入れない。`1.min(len)` は空リストで 0＝先頭に
+        //     なり、ライブ変換の preview を奪う（このセッションで 3 回踏んだ穴）。
+        let dict_miss = user_cands.is_empty()
+            && user_low_cands.is_empty()
+            && learn_cands.is_empty()
+            && dict_cands.is_empty();
+        if dict_miss && !merged.is_empty() && is_loanword_reading(hiragana) {
+            let kata = hiragana_to_katakana(hiragana);
+            if !kata.is_empty() && kata != hiragana {
+                merged.retain(|c| c != &kata);
+                merged.insert(1.min(merged.len()), kata);
+            }
+        }
+
+        // 5.5 記号だけの辞書候補。表示スロットを奪わないよう LLM の後ろに置く。
+        for c in &dict_symbol_cands {
+            if merged.len() >= limit {
+                break;
+            }
+            if !merged.contains(c) {
+                merged.push(c.clone());
+            }
+        }
+
+        // 6. 短文予測（Google 日本語入力相当）: 読みが前方一致する学習済みの長い
+        //    フレーズを、実候補の直後に差し込む。先頭を奪わないのは、ライブ変換の
+        //    preview が先頭の実候補を採用するため（打鍵途中に長文が出続けるのを避ける）。
+        //
+        //    🔴 挿入位置は固定の 1 番目ではなく「**読みと異なる最初の候補**の直後」。
+        //    ライブ変換の preview は `merge_candidates_for_reading(reading, .., 40)` の
+        //    結果から `find(|c| c != reading)` で先頭の実候補を採る。MOZC はひらがな
+        //    表記を先頭に返すことが多く（`たしかに → ["たしかに", "たし蟹", ..]`）、
+        //    固定で 1 番目に入れると候補 0 番が読みそのものだったときに予測が
+        //    preview へ昇格し、打鍵の途中で過去の長文が composition に出てしまう
+        //    （2026-08-31 に「たしかに」→「確かに、なんか」で実害）。
+        //
+        //    🔴 読みと異なる候補が 1 件も無いときは予測を入れない。merged が
+        //    空、あるいは読みしか無い状態で予測を足すと、それが preview に昇格して
+        //    「打っている途中で過去の長文が勝手に確定される」事故になる。予測はあくまで
+        //    「実候補の隣に並べる」もので、単独で preview に立たせない。Space 変換では
+        //    LLM 候補が入るので、この条件で予測が落ちることは実質起きない。
+        if let Some(first_real) = merged
+            .iter()
+            .position(|c| c != hiragana)
+            .filter(|_| !prediction_cands.is_empty())
+        {
+            // 重複した予測は挿入しないので、挿入位置は「実際に入れた数」で進める
+            // （enumerate の添字で進めると len を超えて insert が panic する）。
+            let mut at = first_real + 1;
+            let mut inserted: Vec<(String, String)> = Vec::new();
+            for (key, c) in &prediction_cands {
+                // 既に merged にある = この読みからも直接引ける表記なので、
+                // 予測由来としては記録しない（学習を振り直す必要が無い）。
+                if merged.contains(c) {
+                    continue;
+                }
+                merged.insert(at, c.clone());
+                inserted.push((key.clone(), c.clone()));
+                at += 1;
+            }
+            merged.truncate(limit.max(1));
+            self.remember_predictions(hiragana, inserted);
+        }
+
+        // 7. 英数候補（先頭）: 入力したローマ字をそのまま出す。
+        //
+        //    ここに来るのは読みに ASCII 英字が残っている場合だけなので、先頭に置く。
+        //    ローマ字がかなに変換しきれていない = 日本語の語として読む余地が無い、
+        //    という判定であり、`つづけて` のような普通の読みはそもそも
+        //    `romaji_literal_candidates` が None を返して届かない。
+        if let Some((half, full)) = self.romaji_literal_candidates(hiragana) {
+            let ordered = match self.config.alpha_width {
+                AlphaWidth::Halfwidth => [half, full],
+                AlphaWidth::Fullwidth => [full, half],
+            };
+            let mut at = 0usize;
+            for c in ordered {
+                // 既にリストにある場合は取り除いてから入れ直す。読みそのものが
+                // 半角英数（"xy"）だと後段の文字種候補と重複するので、
+                // skip すると全角だけが前に出て alpha_width の指定と逆になる。
+                merged.retain(|existing| existing != &c);
+                at = at.min(merged.len());
+                merged.insert(at, c);
+                at += 1;
+            }
+        }
+        merged.truncate(limit.max(1));
+
+        // 8. 文字種候補（末尾）: ひらがな → カタカナ → 半角英数 → 全角英数。
+        //
+        //    Google 日本語入力と同じく、通常候補を出し切った後ろに常に添える。
+        //    F6〜F10 を押さなくても候補リストから選べるようにするのが目的で、
+        //    「候補が足りないときに読みを末尾へ足す」退避路もここへ統合した。
+        //
+        //    🔴 必ず他のすべての候補を積んだ *後* に push すること。Space 直後の
+        //    同期パスは LLM 未完了で merged が 0 件になりうるので、insert で前へ
+        //    差し込むとライブ変換の preview と composition が化ける（候補 0 番が
+        //    プリエディットに採用されるため）。
+        //
+        //    truncate も済ませた後に足すので、返る件数は limit + 4 まで伸びうる。
+        //    候補ウィンドウはページャを持っており、表示ページ数（num_candidates）
+        //    とは無関係なので問題ない。
+        //
+        //    🔴 実候補が 1 件も無いときは読みだけを足して打ち切る。TSF のライブ変換は
+        //    `merge_candidates_for_reading(reading, vec![], 40)` に「読み以外の候補が
+        //    あるか」を尋ねて preview を出すか決めており（`start_live_bg_if_ready` /
+        //    `has_immediate_live_preview_candidate` / `on_live_timer`）、候補 0 件の
+        //    状態でカタカナを足すと打鍵のたびに preview がカタカナに化ける。
+        if merged.is_empty() {
             merged.push(hiragana.to_string());
+        } else {
+            let mut char_type_cands: Vec<String> =
+                vec![hiragana.to_string(), hiragana_to_katakana(hiragana)];
+            if let Some((half, full)) = self.romaji_alnum_candidates(hiragana) {
+                match self.config.alpha_width {
+                    AlphaWidth::Halfwidth => char_type_cands.extend([half, full]),
+                    AlphaWidth::Fullwidth => char_type_cands.extend([full, half]),
+                }
+            }
+            for c in char_type_cands {
+                if c.is_empty() || merged.contains(&c) {
+                    continue;
+                }
+                merged.push(c);
+            }
         }
 
         if merged.is_empty() {
@@ -1285,6 +1985,7 @@ impl RakunEngine {
 
         let hiragana = self.hiragana_buf.clone();
         let conv_reading = self.conv_reading();
+        let dict_prefix = self.dict_prefix_split(&conv_reading);
         let committed = self.committed.clone();
         if hiragana.is_empty() {
             return false;
@@ -1297,6 +1998,7 @@ impl RakunEngine {
             match conv_cache::start(
                 hiragana,
                 conv_reading,
+                dict_prefix,
                 committed,
                 conv,
                 n_cands,
@@ -1330,7 +2032,27 @@ impl RakunEngine {
     /// `conv_cache::reclaim_nonblocking()` が Done state から converter を
     /// 回収するため、converter を engine.kanji に戻す手間は不要。
     pub fn bg_peek_top_candidate(&self, key: &str) -> Option<String> {
-        conv_cache::peek_top_candidate(key)
+        // ライブ変換の preview はここの 1 件だけを見るので、並べ替えも
+        // ここで済ませる（先頭を見る前に n-best 全体を評価する）。
+        let cands = conv_cache::peek_candidates(key)?;
+        self.rescore_llm_candidates(key, cands).into_iter().next()
+    }
+
+    /// LLM の n-best を辞書との整合で並べ替える。候補の集合は変えない。
+    fn rescore_llm_candidates(&self, reading: &str, candidates: Vec<String>) -> Vec<String> {
+        if !self.config.rescore_enabled {
+            return candidates;
+        }
+        let Some(store) = self.dict_store.as_ref() else {
+            return candidates;
+        };
+        rescore::promote_dict_agreeing(
+            store,
+            reading,
+            candidates,
+            self.config.rescore_min_reading_chars,
+            self.config.rescore_min_gain,
+        )
     }
 
     /// key が一致する BG 変換結果を取得し、converter を engine に戻す。
@@ -1341,6 +2063,7 @@ impl RakunEngine {
     pub fn bg_take_candidates(&mut self, key: &str) -> Option<Vec<String>> {
         let (conv, cands) = conv_cache::take_ready(key)?;
         self.kanji = Some(conv);
+        let cands = self.rescore_llm_candidates(key, cands);
         let user_cands: Vec<String> = self
             .dict_store
             .as_ref()
@@ -1570,6 +2293,186 @@ mod symbol_input_tests {
     }
 
     #[test]
+    fn three_maru_collapse_to_midline_ellipsis() {
+        let mut e = RakunEngine::new(crate::EngineConfig::default());
+        e.push_char('.');
+        e.push_char('.');
+        assert_eq!(e.hiragana_text(), "。。");
+        e.push_char('.');
+        assert_eq!(e.hiragana_text(), "⋯");
+        // 6 連で 2 つ
+        for _ in 0..3 {
+            e.push_char('.');
+        }
+        assert_eq!(e.hiragana_text(), "⋯⋯");
+    }
+
+    #[test]
+    fn backspace_reclaims_passthrough_consonant() {
+        // kt → BS → a = か（kあ ではない）
+        let mut e = RakunEngine::new(crate::EngineConfig::default());
+        e.push_char('k');
+        e.push_char('t');
+        assert_eq!(e.current_preedit().display(), "kt");
+        assert!(e.backspace());
+        assert_eq!(e.current_preedit().display(), "k");
+        e.push_char('a');
+        assert_eq!(e.current_preedit().display(), "か");
+        assert_eq!(e.hiragana_text(), "か");
+    }
+
+    #[test]
+    fn backspace_reclaims_sokuon_and_hatsuon() {
+        // tt → BS → a = た
+        let mut e = RakunEngine::new(crate::EngineConfig::default());
+        e.push_char('t');
+        e.push_char('t');
+        assert_eq!(e.current_preedit().display(), "っt");
+        assert!(e.backspace());
+        e.push_char('a');
+        assert_eq!(e.current_preedit().display(), "た");
+        // nt → BS → a = な
+        let mut e = RakunEngine::new(crate::EngineConfig::default());
+        e.push_char('n');
+        e.push_char('t');
+        assert_eq!(e.current_preedit().display(), "んt");
+        assert!(e.backspace());
+        e.push_char('a');
+        assert_eq!(e.current_preedit().display(), "な");
+    }
+
+    #[test]
+    fn backspace_keeps_deliberate_nn_and_plain_kana() {
+        // nn は意図した ん なので戻さない
+        let mut e = RakunEngine::new(crate::EngineConfig::default());
+        for c in "nnk".chars() {
+            e.push_char(c);
+        }
+        assert!(e.backspace());
+        assert_eq!(e.current_preedit().display(), "ん");
+        e.push_char('a');
+        assert_eq!(e.current_preedit().display(), "んあ");
+        // kanakq → BS = かなk（従来どおり）
+        let mut e = RakunEngine::new(crate::EngineConfig::default());
+        for c in "kanakq".chars() {
+            e.push_char(c);
+        }
+        assert!(e.backspace());
+        assert_eq!(e.current_preedit().display(), "かなk");
+        e.push_char('a');
+        assert_eq!(e.current_preedit().display(), "かなか");
+    }
+
+    #[test]
+    fn backspace_keeps_confirmed_consonant_after_output_removal() {
+        // Step 10: 確定済みの出力を削る経路では残りの d を未確定へ戻さない。
+        let mut e = RakunEngine::new(crate::EngineConfig::default());
+        for c in "seedream".chars() {
+            e.push_char(c);
+        }
+        assert_eq!(e.current_preedit().display(), "せえdれあm");
+        assert!(e.backspace()); // m
+        assert!(e.backspace()); // あ
+        assert!(e.backspace()); // れ
+        assert_eq!(e.current_preedit().display(), "せえd");
+        assert_eq!(e.hiragana_text(), "せえd");
+        e.push_char('a');
+        assert_eq!(e.current_preedit().display(), "せえdあ");
+    }
+
+    #[test]
+    fn push_raw_repeat_collapses_and_backspaces_as_one() {
+        // TSF の on_punctuate 経路（ローマ字変換を通らない）
+        let mut e = RakunEngine::new(crate::EngineConfig::default());
+        for c in "sou".chars() {
+            e.push_char(c);
+        }
+        for _ in 0..3 {
+            e.push_raw('。');
+        }
+        assert_eq!(e.hiragana_text(), "そう⋯");
+        assert!(e.backspace());
+        assert_eq!(e.hiragana_text(), "そう");
+        assert_eq!(e.hiragana_from_romaji_log(), "そう");
+    }
+
+    #[test]
+    fn nakaten_touten_and_western_period_repeat_collapse() {
+        assert_eq!(push("・・", '/'), "⋯");
+        assert_eq!(push("、、", ','), "⋯");
+        // 英字直後の `.` は `．` になる経路（alpha_width=fullwidth 既定）
+        assert_eq!(push("ａ．．", '.'), "ａ⋯");
+        // 半角設定なら `...` のまま積まれてから畳まれる
+        let config = crate::EngineConfig {
+            alpha_width: crate::AlphaWidth::Halfwidth,
+            symbol_width: crate::SymbolWidth::Halfwidth,
+            ..Default::default()
+        };
+        let mut e = RakunEngine::new(config);
+        e.push_fullwidth_alpha('A');
+        for _ in 0..3 {
+            e.push_char('.');
+        }
+        assert_eq!(e.hiragana_text(), "A⋯");
+    }
+
+    #[test]
+    fn ellipsis_then_period_is_japanese_maru() {
+        // `⋯` は英字・記号扱いにならないので直後の `.` は `。`
+        assert_eq!(push("⋯", '.'), "⋯。");
+    }
+
+    #[test]
+    fn ellipsis_backspace_removes_whole_symbol() {
+        let mut e = RakunEngine::new(crate::EngineConfig::default());
+        for c in "sou...".chars() {
+            e.push_char(c);
+        }
+        assert_eq!(e.hiragana_text(), "そう⋯");
+        assert!(e.backspace());
+        assert_eq!(e.hiragana_text(), "そう");
+        assert!(e.backspace());
+        assert_eq!(e.hiragana_text(), "そ");
+    }
+
+    #[test]
+    fn symbol_fold_keeps_log_when_tail_is_not_typed_symbols() {
+        // TSF の `on_punctuate` は候補選択中に `force_preedit`（prefix + 変換対象）
+        // で読みを差し替えてから記号を積む。このとき打鍵ログの末尾は remainder の
+        // 打鍵なので、畳み込みで truncate してはいけない。
+        let mut e = RakunEngine::new(crate::EngineConfig::default());
+        for c in "sou..ka".chars() {
+            e.push_char(c);
+        }
+        assert_eq!(e.hiragana_text(), "そう。。か");
+        let before = e.input_log.clone();
+        e.force_preedit("そう。。".to_string());
+        e.push_raw('。');
+        assert_eq!(e.hiragana_text(), "そう⋯");
+        // 既存のエントリ（remainder の `ka` を含む）はそのまま残る
+        assert_eq!(&e.input_log[..before.len()], &before[..]);
+    }
+
+    #[test]
+    fn ellipsis_survives_romaji_log_restore() {
+        let mut e = RakunEngine::new(crate::EngineConfig::default());
+        for c in "a...".chars() {
+            e.push_char(c);
+        }
+        assert_eq!(e.hiragana_text(), "あ⋯");
+        assert_eq!(e.hiragana_from_romaji_log(), "あ⋯");
+    }
+
+    #[test]
+    fn force_preedit_tail_is_not_collapsed_by_unrelated_key() {
+        // force_preedit で置かれた `。。。` は、読みを伸ばさない打鍵では畳まない
+        let mut e = RakunEngine::new(crate::EngineConfig::default());
+        e.force_preedit("。。。".to_string());
+        e.push_char('k'); // pending に留まる
+        assert_eq!(e.hiragana_text(), "。。。");
+    }
+
+    #[test]
     fn slash_to_nakaten() {
         assert!(push("", '/').ends_with('・'));
     }
@@ -1614,6 +2517,25 @@ mod symbol_input_tests {
         let mut e = RakunEngine::new(config);
         e.push_char('@');
         assert_eq!(e.hiragana_text(), "@");
+    }
+
+    /// Shift+英字が未確定のローマ字を追い越さないこと。
+    /// 追い越すと `ComfyUI` の読みが `CおmUIfy` になり、打った順序が壊れる。
+    #[test]
+    fn fullwidth_alpha_flushes_pending_romaji_first() {
+        let config = crate::EngineConfig {
+            alpha_width: crate::AlphaWidth::Halfwidth,
+            ..Default::default()
+        };
+        let mut e = RakunEngine::new(config);
+        for c in "ComfyUI".chars() {
+            if c.is_ascii_uppercase() {
+                e.push_fullwidth_alpha(c);
+            } else {
+                e.push_char(c);
+            }
+        }
+        assert_eq!(e.hiragana_text(), "CおmfyUI");
     }
 
     #[test]
@@ -1770,13 +2692,89 @@ mod digit_width_tests {
 }
 
 #[cfg(test)]
+mod dict_prefix_split_tests {
+    use super::{EngineConfig, RakunEngine};
+    use rakukan_dict::DictStore;
+
+    /// `tempfile::TempDir` は drop でディレクトリごと消える。DictStore は
+    /// ホットリロードでファイルを見に行くので、消すと辞書が空になる。
+    /// テストが終わるまで生かしておく必要があるので一緒に返す。
+    fn engine_with_dict() -> (RakunEngine, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let user_path = dir.path().join("user_dict.toml");
+        std::fs::write(
+            &user_path,
+            r#"
+[[entries]]
+reading = "とらぶる"
+surfaces = ["To LOVEる"]
+
+[[entries]]
+reading = "みき"
+surfaces = ["美樹"]
+
+[[entries]]
+reading = "このすば"
+surfaces = ["この素晴らしい世界に祝福を"]
+"#,
+        )
+        .unwrap();
+        let store = DictStore::load(Some(&user_path), None, None).unwrap();
+        let mut engine = RakunEngine::new(EngineConfig::default());
+        engine.set_dict_store(store);
+        (engine, dir)
+    }
+
+    #[test]
+    fn splits_at_user_dict_word() {
+        let (e, _dir) = engine_with_dict();
+        assert_eq!(
+            e.dict_prefix_split("とらぶると"),
+            Some(("To LOVEる".to_string(), "と".to_string()))
+        );
+    }
+
+    #[test]
+    fn ignores_exact_match() {
+        // 完全一致は merge_candidates_for_reading の担当
+        let (e, _dir) = engine_with_dict();
+        assert_eq!(e.dict_prefix_split("とらぶる"), None);
+    }
+
+    #[test]
+    fn ignores_short_word_to_avoid_false_positives() {
+        // 「みき → 美樹」が 2 文字なので「みきわめる」に噛ませない
+        let (e, _dir) = engine_with_dict();
+        assert_eq!(e.dict_prefix_split("みきわめる"), None);
+    }
+
+    #[test]
+    fn ignores_reading_without_any_match() {
+        let (e, _dir) = engine_with_dict();
+        assert_eq!(e.dict_prefix_split("ひかくすると"), None);
+    }
+
+    #[test]
+    fn prefers_the_longest_match() {
+        let (e, _dir) = engine_with_dict();
+        assert_eq!(
+            e.dict_prefix_split("このすばが"),
+            Some((
+                "この素晴らしい世界に祝福を".to_string(),
+                "が".to_string()
+            ))
+        );
+    }
+}
+
+#[cfg(test)]
 mod candidate_merge_tests {
     use super::{EngineConfig, RakunEngine};
     use rakukan_dict::DictStore;
     use std::fs;
 
     #[test]
-    fn merge_candidates_pads_short_list_with_original_reading() {
+    fn merge_candidates_appends_hiragana_and_katakana_at_tail() {
         let mut engine = RakunEngine::new(EngineConfig {
             num_candidates: 9,
             ..Default::default()
@@ -1786,8 +2784,22 @@ mod candidate_merge_tests {
         let llm_candidates = (1..=8).map(|n| format!("候補{n}")).collect();
         let merged = engine.merge_candidates(llm_candidates, 40);
 
-        assert_eq!(merged.len(), 9);
-        assert_eq!(merged.last().map(String::as_str), Some("てすと"));
+        // 通常候補を出し切った後ろに、ひらがな → カタカナ が常に付く。
+        assert_eq!(merged.len(), 10, "merged={merged:?}");
+        assert_eq!(merged[8], "てすと");
+        assert_eq!(merged[9], "テスト");
+    }
+
+    #[test]
+    fn merge_candidates_keeps_only_reading_when_no_candidates() {
+        // 候補 0 件（Space 直後の同期パス / ライブ変換の打鍵途中）では読みだけ。
+        // ここでカタカナまで足すと、TSF 側の「読み以外の候補があるか」判定が
+        // 常に真になり、打鍵のたびに preview がカタカナに化ける。
+        let mut engine = RakunEngine::new(EngineConfig::default());
+        engine.force_preedit("てすと".to_string());
+
+        let merged = engine.merge_candidates(vec![], 40);
+        assert_eq!(merged, vec!["てすと".to_string()]);
     }
 
     #[test]
@@ -1996,6 +3008,261 @@ surfaces = ["』"]
         assert!(merged.iter().any(|candidate| candidate == "かっことじ"));
         assert!(!merged.iter().any(|candidate| candidate == "べつのよみ"));
     }
+
+    #[test]
+    fn merge_candidates_places_low_priority_user_dict_after_learn_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_path = dir.path().join("user_dict.toml");
+        fs::write(
+            &user_path,
+            r#"
+[[entries]]
+reading = "みどり"
+surfaces = ["ミドリ"]
+priority = "low"
+"#,
+        )
+        .unwrap();
+
+        let store = DictStore::load(Some(&user_path), None, None).unwrap();
+        let mut engine = RakunEngine::new(EngineConfig {
+            num_candidates: 9,
+            ..Default::default()
+        });
+        engine.set_dict_store(store);
+
+        // 学習前: 低優先エントリしか無いので先頭に出る
+        let merged = engine.merge_candidates_for_reading("みどり", vec!["翠".to_string()], 40);
+        assert_eq!(merged.first().map(String::as_str), Some("ミドリ"));
+
+        // 「緑」を一度選んだことにすると、学習履歴が低優先エントリを追い越す
+        engine.learn_force("みどり", "緑");
+        let merged = engine.merge_candidates_for_reading("みどり", vec!["翠".to_string()], 40);
+        let pos_learn = merged.iter().position(|c| c == "緑").unwrap();
+        let pos_low = merged.iter().position(|c| c == "ミドリ").unwrap();
+        let pos_llm = merged.iter().position(|c| c == "翠").unwrap();
+        assert!(
+            pos_learn < pos_low,
+            "学習履歴は低優先ユーザー辞書より前: {merged:?}"
+        );
+        assert!(
+            pos_low < pos_llm,
+            "低優先ユーザー辞書は LLM 候補より前: {merged:?}"
+        );
+    }
+
+    #[test]
+    fn loanword_reading_detection() {
+        use super::is_loanword_reading;
+
+        // 長音符
+        assert!(is_loanword_reading("でもりっしゃー"));
+        assert!(is_loanword_reading("ぶーめらん"));
+        // 外来語専用の拗音
+        assert!(is_loanword_reading("ふぁいる"));
+        assert!(is_loanword_reading("うぃんどう"));
+        assert!(is_loanword_reading("ちぇんじ"));
+
+        // 普通の和語・漢語は該当しない
+        assert!(!is_loanword_reading("まいめ"));
+        assert!(!is_loanword_reading("つづけて"));
+        assert!(!is_loanword_reading("かんじへんかん"));
+        // 短すぎる読み
+        assert!(!is_loanword_reading("かー"));
+        // 文まるごと（区読点が無いと文全体が 1 つの読みで渡ってくる）
+        assert!(!is_loanword_reading("れーるがんいますぐにつくれない"));
+        assert!(!is_loanword_reading("こーひーをのみながらかんがえる"));
+        // 語 1 個ぶんの長い外来語は通す
+        assert!(is_loanword_reading("こみゅにけーしょん"));
+        // かな以外が混ざる読みは他のレイヤーの担当
+        assert!(!is_loanword_reading("まc"));
+        assert!(!is_loanword_reading("4まい"));
+    }
+
+    #[test]
+    fn katakana_is_promoted_for_unknown_loanwords() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_path = dir.path().join("user_dict.toml");
+        fs::write(&user_path, "").unwrap();
+        let store = DictStore::load(Some(&user_path), None, None).unwrap();
+
+        let mut engine = RakunEngine::new(EngineConfig::default());
+        engine.set_dict_store(store);
+
+        // 辞書が空振り + 外来語シグナル → カタカナは 2 番目。
+        // 先頭は LLM に譲る（`れーるがんだ` のような外来語＋助詞を壊さないため）。
+        let merged = engine.merge_candidates_for_reading(
+            "でもりっしゃー",
+            vec!["出モリッシャー".to_string()],
+            40,
+        );
+        assert_eq!(merged.first().map(String::as_str), Some("出モリッシャー"));
+        assert_eq!(merged.get(1).map(String::as_str), Some("デモリッシャー"));
+
+        // 外来語＋助詞・活用も先頭は LLM のまま
+        for (reading, top) in [
+            ("れーるがんだ", "レールガンだ"),
+            ("れーるがんいますぐにつくれない", "レールガン今すぐに作れない"),
+        ] {
+            let merged =
+                engine.merge_candidates_for_reading(reading, vec![top.to_string()], 40);
+            assert_eq!(merged.first().map(String::as_str), Some(top), "{reading}");
+        }
+
+        // 実候補が 0 件のときは入れない（ライブ変換の preview を奪わない）
+        let merged = engine.merge_candidates_for_reading("でもりっしゃー", vec![], 40);
+        assert_eq!(merged.first().map(String::as_str), Some("でもりっしゃー"));
+
+        // 一度選べば学習履歴が先頭へ上げる = 2 回目以降は一発
+        engine.learn_force("でもりっしゃー", "デモリッシャー");
+        let merged = engine.merge_candidates_for_reading(
+            "でもりっしゃー",
+            vec!["出モリッシャー".to_string()],
+            40,
+        );
+        assert_eq!(merged.first().map(String::as_str), Some("デモリッシャー"));
+
+        // シグナルが無い読みは昇格しない（末尾の文字種候補には出る）
+        let merged = engine.merge_candidates_for_reading("まいめ", vec!["毎目".to_string()], 40);
+        assert_eq!(merged.first().map(String::as_str), Some("毎目"));
+        assert!(merged.iter().any(|c| c == "マイメ"), "merged={merged:?}");
+
+        // 辞書に当たる読みは昇格しない
+        fs::write(
+            &user_path,
+            "[[entries]]\nreading = \"らーめん\"\nsurfaces = [\"拉麺\"]\n",
+        )
+        .unwrap();
+        let store = DictStore::load(Some(&user_path), None, None).unwrap();
+        let mut engine = RakunEngine::new(EngineConfig::default());
+        engine.set_dict_store(store);
+        let merged = engine.merge_candidates_for_reading("らーめん", vec![], 40);
+        assert_eq!(merged.first().map(String::as_str), Some("拉麺"));
+    }
+
+    #[test]
+    fn prediction_never_becomes_the_first_candidate() {
+        // 短文予測が候補 0 番に立つと、ライブ変換の preview がその長文になり、
+        // 打鍵の途中で Enter を押した瞬間に過去のフレーズが確定されてしまう。
+        // TSF は preview 判定に llm_candidates 無しで merge を呼ぶため、辞書が
+        // 引けない読みでは実候補が 0 件になりうる。そこで予測を出さない。
+        let dir = tempfile::tempdir().unwrap();
+        let user_path = dir.path().join("user_dict.toml");
+        fs::write(&user_path, "").unwrap();
+        let store = DictStore::load(Some(&user_path), None, None).unwrap();
+
+        let mut engine = RakunEngine::new(EngineConfig::default());
+        engine.set_dict_store(store);
+        engine.learn_force("またつうじょうのこうほ", "また通常の候補");
+
+        // 実候補が 0 件 → 予測は出さず、読みだけを返す
+        let merged = engine.merge_candidates_for_reading("またつうじょう", vec![], 40);
+        assert_eq!(merged, vec!["またつうじょう".to_string()]);
+
+        // 実候補があるときは 2 番目に並べる（従来どおり）
+        let merged =
+            engine.merge_candidates_for_reading("またつうじょう", vec!["また通常".to_string()], 40);
+        assert_eq!(merged.first().map(String::as_str), Some("また通常"));
+        assert_eq!(merged.get(1).map(String::as_str), Some("また通常の候補"));
+
+        // 候補 0 番が読みそのもの（MOZC はひらがな表記を先頭に返しがち）でも、
+        // 予測はその次ではなく「読みと異なる最初の候補」の後ろに入る。
+        // ライブ変換の preview は `find(|c| c != reading)` で採るので、ここで
+        // 1 番目に入れると打鍵の途中で予測が composition に出てしまう。
+        let merged = engine.merge_candidates_for_reading(
+            "またつうじょう",
+            vec!["またつうじょう".to_string(), "また通常".to_string()],
+            40,
+        );
+        assert_eq!(merged.first().map(String::as_str), Some("またつうじょう"));
+        assert_eq!(merged.get(1).map(String::as_str), Some("また通常"));
+        assert_eq!(merged.get(2).map(String::as_str), Some("また通常の候補"));
+        assert_eq!(
+            merged
+                .iter()
+                .find(|c| c.as_str() != "またつうじょう")
+                .map(String::as_str),
+            Some("また通常"),
+            "ライブ変換の preview が予測を拾ってはいけない: {merged:?}"
+        );
+    }
+
+    #[test]
+    fn short_reading_does_not_pull_long_predictions_into_conversion() {
+        // 2 文字の読みから 12 文字のフレーズを引いて実候補の直後に差し込むと、
+        // 上位 2 枠が読みと無関係な過去の長文で埋まる（2026-09-08 の実害:
+        // `はじ` の候補列で「端」が 8 番目まで沈んだ）。
+        let dir = tempfile::tempdir().unwrap();
+        let user_path = dir.path().join("user_dict.toml");
+        fs::write(&user_path, "").unwrap();
+        let store = DictStore::load(Some(&user_path), None, None).unwrap();
+
+        let mut engine = RakunEngine::new(EngineConfig::default());
+        engine.set_dict_store(store);
+        engine.learn_force("はじめておじゃまするもの", "初めてお邪魔するもの");
+
+        // 被覆率 2/12 → 変換候補リストには入れない
+        let merged = engine.merge_candidates_for_reading(
+            "はじ",
+            vec!["恥".to_string(), "端".to_string()],
+            40,
+        );
+        assert_eq!(merged.first().map(String::as_str), Some("恥"));
+        assert_eq!(
+            merged.get(1).map(String::as_str),
+            Some("端"),
+            "短い読みの予測が実候補を押し下げてはいけない: {merged:?}"
+        );
+
+        // 読みの大半を打ち終えれば従来どおり実候補の直後に並ぶ（被覆率 7/12）
+        let merged = engine.merge_candidates_for_reading(
+            "はじめておじゃ",
+            vec!["初めてお邪".to_string()],
+            40,
+        );
+        assert!(
+            merged.iter().any(|c| c == "初めてお邪魔するもの"),
+            "補完として意味がある長さの予測は残すこと: {merged:?}"
+        );
+
+        // 予測ウィンドウ側は短い読みでも従来どおり出す
+        assert!(
+            engine
+                .predict("はじ", 4)
+                .contains(&"初めてお邪魔するもの".to_string()),
+            "予測ウィンドウの挙動は変えない"
+        );
+    }
+
+    #[test]
+    fn merge_candidates_learn_history_overrides_normal_priority() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_path = dir.path().join("user_dict.toml");
+        fs::write(
+            &user_path,
+            r#"
+[[entries]]
+reading = "りんぜ"
+surfaces = ["凛世"]
+"#,
+        )
+        .unwrap();
+
+        let store = DictStore::load(Some(&user_path), None, None).unwrap();
+        let mut engine = RakunEngine::new(EngineConfig {
+            num_candidates: 9,
+            ..Default::default()
+        });
+        engine.set_dict_store(store);
+        engine.learn_force("りんぜ", "臨済");
+
+        let merged = engine.merge_candidates_for_reading("りんぜ", vec![], 40);
+        assert_eq!(
+            merged.first().map(String::as_str),
+            Some("臨済"),
+            "Step 12 の学習履歴優先を維持: {merged:?}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2039,6 +3306,231 @@ mod passthrough_sync_tests {
         let log = e.romaji_log_str();
         let pending = e.current_preedit().pending_romaji.clone();
         assert_eq!(format!("{}{}", log, pending), "qwrty");
+    }
+
+    fn engine_with_alpha_width(width: crate::AlphaWidth) -> RakunEngine {
+        RakunEngine::new(EngineConfig {
+            num_candidates: 9,
+            alpha_width: width,
+            ..Default::default()
+        })
+    }
+
+    fn type_romaji(engine: &mut RakunEngine, romaji: &str) {
+        for c in romaji.chars() {
+            engine.push_char(c);
+        }
+    }
+
+    #[test]
+    fn romaji_literal_candidate_leads_when_reading_keeps_ascii() {
+        let mut engine = engine_with_alpha_width(crate::AlphaWidth::Halfwidth);
+        type_romaji(&mut engine, "claude");
+
+        // "cl" はローマ字表に無いので 'c' が素通しになり、読みに ASCII が残る。
+        let reading = engine.hiragana_text().to_string();
+        assert!(
+            reading.chars().any(|c| c.is_ascii_alphabetic()),
+            "reading={reading:?}"
+        );
+
+        let merged = engine.merge_candidates(vec!["cぁうで".to_string()], 40);
+        assert_eq!(merged.first().map(String::as_str), Some("claude"));
+        assert_eq!(merged.get(1).map(String::as_str), Some("ｃｌａｕｄｅ"));
+    }
+
+    #[test]
+    fn romaji_literal_candidate_leads_when_reading_is_all_ascii() {
+        let mut engine = engine_with_alpha_width(crate::AlphaWidth::Halfwidth);
+        type_romaji(&mut engine, "xyz");
+
+        let reading = engine.hiragana_text().to_string();
+        assert!(
+            !reading.is_empty() && reading.chars().all(|c| c.is_ascii()),
+            "reading={reading:?}"
+        );
+
+        // 先頭候補は「打鍵したローマ字ぜんぶ」。かなに落ちなかった末尾が
+        // pending に残っていても、画面のプリエディットは "xyz" なので
+        // ここで reading（pending を含まない）を出すと末尾が落ちる。
+        let merged = engine.merge_candidates(vec![], 40);
+        assert_eq!(merged.first().map(String::as_str), Some("xyz"));
+        assert_eq!(merged.get(1).map(String::as_str), Some("\u{FF58}\u{FF59}\u{FF5A}"));
+    }
+
+    #[test]
+    fn romaji_literal_candidate_order_follows_alpha_width() {
+        let mut engine = engine_with_alpha_width(crate::AlphaWidth::Fullwidth);
+        type_romaji(&mut engine, "claude");
+
+        let merged = engine.merge_candidates(vec!["cぁうで".to_string()], 40);
+        assert_eq!(merged.first().map(String::as_str), Some("ｃｌａｕｄｅ"));
+        assert_eq!(merged.get(1).map(String::as_str), Some("claude"));
+    }
+
+    #[test]
+    fn romaji_literal_candidate_uses_preedit_display_as_reading() {
+        // "mac" は 'm','a' が「ま」になり 'c' が pending に残る。Space 変換の
+        // 経路（on_convert）はエンジンへ preedit_display()＝「まc」を読みとして
+        // 渡すので、hiragana_buf「ま」としか比べないと英数候補が落ちる。
+        let mut engine = engine_with_alpha_width(crate::AlphaWidth::Halfwidth);
+        type_romaji(&mut engine, "mac");
+        assert_eq!(engine.hiragana_text(), "ま");
+
+        for reading in ["まc", "ま"] {
+            let merged =
+                engine.merge_candidates_for_reading(reading, vec!["真".to_string()], 40);
+            assert!(
+                merged.iter().any(|c| c == "mac"),
+                "reading={reading:?} merged={merged:?}"
+            );
+            assert!(
+                merged.iter().any(|c| c == "ｍａｃ"),
+                "reading={reading:?} merged={merged:?}"
+            );
+        }
+
+        // 読みに ASCII が残っている「まc」では先頭に出す（普通の語ではない）
+        let merged = engine.merge_candidates_for_reading("まc", vec!["真".to_string()], 40);
+        assert_eq!(merged.first().map(String::as_str), Some("mac"));
+    }
+
+    #[test]
+    fn romaji_literal_candidate_is_not_promoted_for_normal_readings() {
+        let mut engine = engine_with_alpha_width(crate::AlphaWidth::Halfwidth);
+        type_romaji(&mut engine, "tudukete");
+        assert_eq!(engine.hiragana_text(), "つづけて");
+
+        // 読みに ASCII が残っていない普通の語では、英数候補は末尾の文字種候補
+        // としてだけ出す。Space 直後は LLM がまだ返らず候補が空になりうるので、
+        // 先頭に置くとライブ変換の preview を英字が奪う。
+        // 候補 0 件のときは読みだけ（先頭を英字に奪われない）
+        assert_eq!(engine.merge_candidates(vec![], 40), vec!["つづけて".to_string()]);
+
+        // 通常候補があるときは、その後ろに文字種候補として並ぶ
+        let merged = engine.merge_candidates(vec!["続けて".to_string()], 40);
+        let expected: Vec<String> = ["続けて", "つづけて", "ツヅケテ", "tudukete", "ｔｕｄｕｋｅｔｅ"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(merged, expected);
+    }
+
+    #[test]
+    fn char_type_candidates_follow_alpha_width_at_tail() {
+        let mut engine = engine_with_alpha_width(crate::AlphaWidth::Fullwidth);
+        type_romaji(&mut engine, "tudukete");
+
+        let merged = engine.merge_candidates(vec!["続けて".to_string()], 40);
+        let expected: Vec<String> = ["続けて", "つづけて", "ツヅケテ", "ｔｕｄｕｋｅｔｅ", "tudukete"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(merged, expected);
+    }
+
+    #[test]
+    fn pending_romaji_is_included_in_char_type_candidates() {
+        // "mac" は 'm','a' が「ま」になり 'c' が pending に残る。ログだけ見ると
+        // "ma" になってしまい "mac" がどこにも出てこなかった。
+        let mut engine = engine_with_alpha_width(crate::AlphaWidth::Halfwidth);
+        type_romaji(&mut engine, "mac");
+        assert_eq!(engine.hiragana_text(), "ま");
+
+        let merged = engine.merge_candidates(vec!["真".to_string()], 40);
+        assert!(merged.iter().any(|c| c == "mac"), "merged={merged:?}");
+        assert!(
+            merged.iter().any(|c| c == "\u{FF4D}\u{FF41}\u{FF43}"),
+            "merged={merged:?}"
+        );
+    }
+
+    #[test]
+    fn romaji_literal_candidate_is_skipped_for_partial_readings() {
+        let mut engine = engine_with_alpha_width(crate::AlphaWidth::Halfwidth);
+        type_romaji(&mut engine, "claude");
+
+        // 文節分割された部分読みに対して、プリエディット全体のローマ字を出さない
+        let merged =
+            engine.merge_candidates_for_reading("べつのよみ", vec!["別の読み".to_string()], 40);
+        assert!(
+            !merged.iter().any(|c| c == "claude"),
+            "merged={merged:?}"
+        );
+    }
+
+    #[test]
+    fn symbol_only_candidate_classification() {
+        for s in ["¢", "£", "€", "°", "‰", "″", "°C", "「」", "→"] {
+            assert!(crate::is_symbol_only_candidate(s), "{s:?} は記号扱いのはず");
+        }
+        for s in ["単位", "矢印", "カンイ", "たんい", "PC", "R18", "A"] {
+            assert!(!crate::is_symbol_only_candidate(s), "{s:?} は語扱いのはず");
+        }
+        assert!(!crate::is_symbol_only_candidate(""));
+    }
+
+    #[test]
+    fn n_insertion_opens_na_row_kana() {
+        assert_eq!(crate::n_insertion_readings("げにん"), vec!["げんいん"]);
+        assert_eq!(crate::n_insertion_readings("ふにき"), vec!["ふんいき"]);
+        assert_eq!(crate::n_insertion_readings("れない"), vec!["れんあい"]);
+        assert_eq!(crate::n_insertion_readings("せねん"), vec!["せんえん"]);
+        // 拗音は 2 文字まとめて開く
+        assert_eq!(crate::n_insertion_readings("きにょう"), vec!["きんよう"]);
+    }
+
+    #[test]
+    fn n_insertion_skips_short_readings_and_leading_kana() {
+        // 「たに → たんい」は踏み込みすぎなので 2 文字は対象外
+        assert!(crate::n_insertion_readings("たに").is_empty());
+        assert!(crate::n_insertion_readings("かに").is_empty());
+        // 先頭のかなは開かない（「ん」で始まる読みを作らない）。
+        // 「ないよう」の な は先頭なので候補が出ない。
+        assert!(crate::n_insertion_readings("ないよう").is_empty());
+        // な行が無ければ何も出さない
+        assert!(crate::n_insertion_readings("かぎかっこ").is_empty());
+    }
+
+    #[test]
+    fn n_insertion_enumerates_each_position() {
+        // 「の」と「に」の両方をそれぞれ開いた読みが出る
+        let out = crate::n_insertion_readings("このに");
+        assert!(out.contains(&"こんおに".to_string()), "{out:?}");
+        assert!(out.contains(&"このんい".to_string()), "{out:?}");
+    }
+
+    #[test]
+    fn merge_adds_n_insertion_candidates_from_dictionary() {
+        use crate::DictStore;
+        use std::fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let user_path = dir.path().join("user_dict.toml");
+        fs::write(
+            &user_path,
+            r#"
+[[entries]]
+reading = "げんいん"
+surfaces = ["原因"]
+"#,
+        )
+        .unwrap();
+
+        let store = DictStore::load(Some(&user_path), None, None).unwrap();
+        let mut engine = RakunEngine::new(EngineConfig {
+            num_candidates: 9,
+            ..Default::default()
+        });
+        engine.set_dict_store(store);
+
+        // n を 1 回しか打っていない読みでも、開いた読みの辞書候補が出る
+        let merged = engine.merge_candidates_for_reading("げにん", vec!["下人".to_string()], 40);
+        assert!(merged.iter().any(|c| c == "原因"), "merged={merged:?}");
+        // 元の読みの正当な変換（LLM）を押しのけない
+        let pos_llm = merged.iter().position(|c| c == "下人").unwrap();
+        let pos_fix = merged.iter().position(|c| c == "原因").unwrap();
+        assert!(pos_fix < pos_llm, "merged={merged:?}");
     }
 }
 

@@ -792,8 +792,9 @@ pub fn to_half_katakana(s: &str) -> String {
 /// これらは LLM に渡さない delimiter として扱う。
 #[inline]
 pub fn is_kuten(c: char) -> bool {
-    // 日本語区読点（FF01-FF5E 外）
-    if matches!(c, '、' | '。') {
+    // 日本語区読点（FF01-FF5E 外）。リーダー類は engine が `。。。` 等を
+    // 畳んで作る記号で、句点と同じく変換対象から外す。
+    if matches!(c, '、' | '。' | '⋯' | '…' | '‥') {
         return true;
     }
     let n = c as u32;
@@ -851,6 +852,38 @@ pub fn split_by_punctuation(s: &str) -> Vec<(String, Option<char>)> {
     blocks
 }
 
+/// ライブ変換の preview を、読みと同じ区読点構造でブロックに割る。
+///
+/// Space でブロック分割変換へ移るとき、各ブロックを **単独で** 変換し直すと
+/// 文全体の文脈が消える。`いや、なになになに` の `いや` を 2 文字だけで引くと
+/// 辞書順の `嫌` が第 1 候補になり、ライブ変換が正しく出していた `いや` が
+/// 捨てられる（2026-09-07 に実害）。preview は文脈込みで変換済みなので、
+/// 構造が一致するならそれをブロックの第 1 候補として使う。
+///
+/// 🔴 構造が一致しないときは `None` を返す。`is_kuten` は `、` `。` だけでなく
+/// `「` `（` `～` `！` なども区切りとして扱うため、変換でそれらが増減すると
+/// ブロックの位置対応が崩れる。ブロック数・区読点の並び・空ブロックの位置が
+/// 完全に一致したときだけ採用し、それ以外は従来どおりブロック単独変換に落とす。
+pub fn split_preview_by_punctuation(reading: &str, preview: &str) -> Option<Vec<String>> {
+    // preview が読みと同じでも採用する。ライブ変換が「かなのままが答え」と
+    // 判断した結果（`いや、なになになに`）がまさにそれで、ここで弾くと
+    // ブロック単独変換に落ちて `嫌` に化ける。
+    if preview.is_empty() {
+        return None;
+    }
+    let reading_blocks = split_by_punctuation(reading);
+    let preview_blocks = split_by_punctuation(preview);
+    if reading_blocks.len() != preview_blocks.len() {
+        return None;
+    }
+    for (r, p) in reading_blocks.iter().zip(preview_blocks.iter()) {
+        if r.1 != p.1 || r.0.is_empty() != p.0.is_empty() {
+            return None;
+        }
+    }
+    Some(preview_blocks.into_iter().map(|(s, _)| s).collect())
+}
+
 /// 先頭・末尾の記号を変換対象外 affix として分離する。
 ///
 /// `「かっことじ」` は `("「", "かっことじ", "」")` を返す。
@@ -879,6 +912,27 @@ pub(crate) fn split_symbol_affixes(s: &str) -> Option<(String, String, String)> 
     }
 
     Some((prefix.to_string(), target.to_string(), suffix.to_string()))
+}
+
+/// engine の読みが `before` → `after` へ変わったときの末尾差分。
+///
+/// 戻り値 `(removed, added)`: `before` の末尾から `removed` 文字を消して
+/// `added` を足すと `after` になる。`on_punctuate` は記号を engine に積んだ
+/// あと session 側の表示文字列を自前で組み立てるので、engine が末尾を
+/// 畳んだ（`。。。` → `⋯`）ときに同じ操作を表示側にも当てるために使う。
+pub(crate) fn tail_delta(before: &str, after: &str) -> (usize, String) {
+    let b: Vec<char> = before.chars().collect();
+    let a: Vec<char> = after.chars().collect();
+    let common = b.iter().zip(a.iter()).take_while(|(x, y)| x == y).count();
+    (b.len() - common, a[common..].iter().collect())
+}
+
+/// [`tail_delta`] の結果を別の文字列の末尾に当てる。
+pub(crate) fn apply_tail_delta(s: &mut String, removed: usize, added: &str) {
+    for _ in 0..removed {
+        s.pop();
+    }
+    s.push_str(added);
 }
 
 /// 文字列が区読点を含むかどうか。
@@ -1065,6 +1119,30 @@ mod tests {
         assert_eq!(romaji_to_halfwidth_latin("、。・-"), ",./-");
     }
 
+    // ─── tail_delta ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn tail_delta_plain_append() {
+        assert_eq!(tail_delta("そう。。", "そう。。。"), (0, "。".to_string()));
+    }
+
+    #[test]
+    fn tail_delta_collapse() {
+        assert_eq!(tail_delta("そう。。", "そう⋯"), (2, "⋯".to_string()));
+        let mut preview = "騒。。".to_string();
+        apply_tail_delta(&mut preview, 2, "⋯");
+        assert_eq!(preview, "騒⋯");
+    }
+
+    #[test]
+    fn ellipsis_is_kuten() {
+        assert!(is_kuten('⋯'));
+        assert_eq!(
+            split_symbol_affixes("そうか⋯"),
+            Some(("".to_string(), "そうか".to_string(), "⋯".to_string()))
+        );
+    }
+
     // ─── split_by_punctuation ─────────────────────────────────────────────────
 
     #[test]
@@ -1177,6 +1255,54 @@ mod tests {
                 ("そうだ".to_string(), Some('？')),
             ]
         );
+    }
+
+    #[test]
+    fn split_preview_keeps_kana_block_from_live_conversion() {
+        // 実害ケース: ライブ変換が「いや、」をかなのまま出しているのに、
+        // ブロック単独変換に落とすと辞書順の「嫌」に化ける。
+        let got = split_preview_by_punctuation("いや、なになになに", "いや、なになになに");
+        assert_eq!(
+            got,
+            Some(vec!["いや".to_string(), "なになになに".to_string()])
+        );
+    }
+
+    #[test]
+    fn split_preview_splits_converted_surface() {
+        let got = split_preview_by_punctuation("きょうは、いいてんきですね", "今日は、いい天気ですね");
+        assert_eq!(
+            got,
+            Some(vec!["今日は".to_string(), "いい天気ですね".to_string()])
+        );
+    }
+
+    #[test]
+    fn split_preview_keeps_trailing_punctuation_block() {
+        let got = split_preview_by_punctuation("おわり。", "終わり。");
+        assert_eq!(got, Some(vec!["終わり".to_string()]));
+    }
+
+    #[test]
+    fn split_preview_rejects_when_punctuation_count_differs() {
+        // 変換で区読点クラスの記号が増えた → 位置対応が崩れるので採用しない
+        assert_eq!(
+            split_preview_by_punctuation("かっこはじめここ", "「ここ"),
+            None
+        );
+        // 区読点の種類が変わった場合も不一致
+        assert_eq!(split_preview_by_punctuation("おわり。", "終わり！"), None);
+    }
+
+    #[test]
+    fn split_preview_rejects_empty_preview() {
+        assert_eq!(split_preview_by_punctuation("いや、なに", ""), None);
+    }
+
+    #[test]
+    fn split_preview_rejects_when_empty_block_position_differs() {
+        // 文頭の区読点（空ブロック）の位置がずれたら採用しない
+        assert_eq!(split_preview_by_punctuation("、あめ", "あめ、"), None);
     }
 
     #[test]

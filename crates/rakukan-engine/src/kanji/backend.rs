@@ -100,6 +100,46 @@ fn split_sentences(text: &str) -> impl Iterator<Item = &str> {
     })
 }
 
+/// 読み長に応じたエコー run の最小長。
+///
+/// 🔴 固定 8 文字だと、**読み自体が 8 文字未満のときは原理的に検出できない**。
+///    エコー源は確定された読みそのものなので run 長は読み長と同じにしかならず、
+///    `たもたれている`（7 文字）の実害を取りこぼした（2026-09-09）。読みが短い
+///    ときだけ条件を読み長まで下げ、`ECHO_RUN_MIN_CHARS_FLOOR` で誤爆側の
+///    下限を残す（「のことなら」= 5 文字への偶然一致は従来どおり削らない）。
+const ECHO_RUN_MIN_CHARS_FLOOR: usize = 6;
+
+fn echo_run_min_chars(reading_chars: usize) -> usize {
+    ECHO_RUN_MIN_CHARS
+        .min(reading_chars)
+        .max(ECHO_RUN_MIN_CHARS_FLOOR)
+}
+
+/// かな列に紛れ込んだ単独の ASCII 英字を落とした文字列を返す（変化が無ければ `None`）。
+///
+/// 🔴 ローマ字入力の打ち間違いで `たもたsれている` のように英字が 1 文字だけ
+///    残ったまま確定されることがある。この形は読みのプレフィックスと一致せず、
+///    かな run も英字で分断されるので、**エコー源として二重に検出をすり抜ける**
+///    （2026-09-09 に実害）。前後がかなの単独英字だけを落とすので、`AI` のような
+///    正当な英単語は残り、かな run が不当に連結されることもない。
+fn drop_stray_ascii_in_kana(text: &str) -> Option<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    let mut dropped = false;
+    for (i, &c) in chars.iter().enumerate() {
+        let stray = c.is_ascii_alphabetic()
+            && i > 0
+            && is_kana_or_prolonged(chars[i - 1])
+            && chars.get(i + 1).copied().is_some_and(is_kana_or_prolonged);
+        if stray {
+            dropped = true;
+        } else {
+            out.push(c);
+        }
+    }
+    if dropped { Some(out) } else { None }
+}
+
 /// 文中に「ひらがな needle と一致し、かつ長さ `ECHO_RUN_MIN_CHARS` 以上の かな連続 run に
 /// 含まれる」箇所があるか判定する。
 ///
@@ -110,7 +150,7 @@ fn split_sentences(text: &str) -> impl Iterator<Item = &str> {
 /// 候補側の `is_kana_prefix_echo` が棄却するため、カタカナ一致は echo 源とみなさない
 /// （0.10.1 の commit 時除外がカタカナのみのテキストを対象外にしたのと同じ理屈）。
 /// F7 等でカタカナ確定した長い文が context に残るケースも、同じ理由で除去しない。
-fn sentence_has_echo_run(sentence: &str, needle: &str) -> bool {
+fn sentence_has_echo_run(sentence: &str, needle: &str, min_run: usize) -> bool {
     let mut search_from = 0;
     while let Some(rel) = sentence[search_from..].find(needle) {
         let pos = search_from + rel;
@@ -126,7 +166,7 @@ fn sentence_has_echo_run(sentence: &str, needle: &str) -> bool {
             .chars()
             .take_while(|c| is_kana_or_prolonged(*c))
             .count();
-        if run_len >= ECHO_RUN_MIN_CHARS {
+        if run_len >= min_run {
             return true;
         }
         search_from = pos + needle.len();
@@ -155,11 +195,17 @@ fn strip_echo_context<'a>(context: &'a str, reading: &str) -> std::borrow::Cow<'
         return Cow::Borrowed(context);
     }
     let needle: String = reading.chars().take(ECHO_NEEDLE_CHARS).collect();
+    let min_run = echo_run_min_chars(reading_chars);
 
     let mut kept = String::new();
     let mut removed = false;
     for sentence in split_sentences(context) {
-        if sentence_has_echo_run(sentence, &needle) {
+        // 打ち間違いの英字が挟まった形も、落としたうえで一度見る。
+        let has_echo = sentence_has_echo_run(sentence, &needle, min_run)
+            || drop_stray_ascii_in_kana(sentence).is_some_and(|s| {
+                sentence_has_echo_run(&s, &needle, min_run)
+            });
+        if has_echo {
             tracing::info!(
                 needle = %needle,
                 dropped_head = %sentence.chars().take(20).collect::<String>(),
@@ -194,6 +240,95 @@ fn is_kana_prefix_echo(candidate: &str, reading: &str) -> bool {
         return false;
     }
     reading.starts_with(&hira)
+}
+
+/// 句読点・感嘆符を正規化する（半角/全角と「…」「‥」を同一視する）。
+/// ASCII の `.` `,` は英数字混じりの出力（`0.5` 等）を巻き込むため対象外。
+fn normalize_punct(c: char) -> Option<char> {
+    match c {
+        '。' | '｡' | '．' => Some('。'),
+        '、' | '､' | '，' => Some('、'),
+        '！' | '!' => Some('！'),
+        '？' | '?' => Some('？'),
+        '…' | '‥' => Some('…'),
+        _ => None,
+    }
+}
+
+/// 読みに存在しない句読点を候補が持ち込んでいるかを判定する。
+///
+/// jinen の出力は読みの表記化であり、句読点はユーザーが打鍵した分しか
+/// 現れないはずなので、読みに無い「。」「、」が付いた候補は幻覚とみなす。
+/// 実例: 読み「あんっ」→ 候補「あん。」（学習データに乏しい喘ぎ声の類で、
+/// モデルが末尾の促音を文末と誤認して句点を打つ）。
+///
+/// 純粋関数。llama 非依存で単体テスト可能。
+fn introduces_punctuation(candidate: &str, reading: &str) -> bool {
+    candidate.chars().any(|c| match normalize_punct(c) {
+        Some(p) => !reading.chars().any(|r| normalize_punct(r) == Some(p)),
+        None => false,
+    })
+}
+
+/// 同一かなの連打とみなす最小の長さ（文字数）。「ああ」は「嗚呼」等の
+/// 正当な変換先があるため対象外にし、3 文字以上を連打とする。
+const REPEATED_KANA_MIN_CHARS: usize = 3;
+
+/// 読みが同一かなの連打（「あああああ」「みみみみみみみみ」「んんんっ」ではなく
+/// 「んんん」）かを判定する。
+///
+/// この形の読みをモデルに投げても、モーラ数の合わない候補しか返らない
+/// （実ログ: 「みみみみみみみみ」→「ミミミミミミミミミ」9 個・「耳耳耳耳耳耳」
+/// ＝ 12 モーラ）。打鍵したかな列そのものが唯一の正解なので変換しない。
+///
+/// 純粋関数。llama 非依存で単体テスト可能。
+fn is_repeated_kana_run(reading: &str) -> bool {
+    let mut chars = reading.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !is_kana_or_prolonged(first) {
+        return false;
+    }
+    let mut n = 1;
+    for c in chars {
+        if c != first {
+            return false;
+        }
+        n += 1;
+    }
+    n >= REPEATED_KANA_MIN_CHARS
+}
+
+/// かなだけで構成されているのに読みと一致しない候補を検出する。
+///
+/// 表記が全部かななら「変換していない」のと同じであり、読みと 1 文字でも
+/// 違えば変換ではなく言い換え・幻覚である。実例: 読み「あんっ」→「あんる」、
+/// 「ふんふんっ」→「ふぁんふぁん」、「おまんこきゅって」→「おまんきゅって」。
+/// `is_kana_prefix_echo`（途中切れのみ）を一般化したもの。
+///
+/// ただし長音符・中点が絡む場合は「ちいず → チーズ」のような正当な長音表記
+/// まで落としてしまうため判定しない（保守側に倒す）。
+///
+/// 純粋関数。llama 非依存で単体テスト可能。
+fn is_kana_rewrite(candidate: &str, reading: &str) -> bool {
+    if candidate.is_empty() {
+        return false;
+    }
+    let hira = katakana_to_hiragana(candidate);
+    if hira == reading {
+        return false;
+    }
+    if !hira.chars().all(is_kana_or_prolonged) {
+        return false;
+    }
+    if [candidate, reading]
+        .iter()
+        .any(|s| s.contains('ー') || s.contains('ｰ') || s.contains('・'))
+    {
+        return false;
+    }
+    true
 }
 
 /// 候補長の上限安全網。かな→漢字変換で文字数は通常縮むため、読みの
@@ -455,6 +590,13 @@ impl KanaKanjiConverter {
                 "forced inference failure (diagnostics.force_inference_failure)".into(),
             ));
         }
+        // 同一かなの連打は打鍵したまま以外に正解が無いので、モデルに投げない。
+        // 投げるとモーラ数の合わない候補で候補列が埋まる（`is_repeated_kana_run`）。
+        if is_repeated_kana_run(reading) {
+            tracing::debug!(reading = %reading, "skipped conversion for repeated kana run");
+            return Ok(vec![reading.to_string()]);
+        }
+
         let max_new_tokens = generation_budget(reading, self.config.max_new_tokens);
 
         // context 汚染対策: 読みのエコー源（長いかな run）を含む文を context から除去。
@@ -508,6 +650,14 @@ impl KanaKanjiConverter {
                 }
                 if is_kana_prefix_echo(c, reading) {
                     tracing::debug!(reading = %reading, candidate = %c, "dropped kana prefix echo candidate (greedy)");
+                    return false;
+                }
+                if is_kana_rewrite(c, reading) {
+                    tracing::debug!(reading = %reading, candidate = %c, "dropped kana rewrite candidate (greedy)");
+                    return false;
+                }
+                if introduces_punctuation(c, reading) {
+                    tracing::debug!(reading = %reading, candidate = %c, "dropped hallucinated punctuation candidate (greedy)");
                     return false;
                 }
                 true
@@ -572,6 +722,14 @@ impl KanaKanjiConverter {
             }
             if is_kana_prefix_echo(c, reading) {
                 tracing::debug!(reading = %reading, candidate = %c, "dropped kana prefix echo candidate (beam)");
+                return false;
+            }
+            if is_kana_rewrite(c, reading) {
+                tracing::debug!(reading = %reading, candidate = %c, "dropped kana rewrite candidate (beam)");
+                return false;
+            }
+            if introduces_punctuation(c, reading) {
+                tracing::debug!(reading = %reading, candidate = %c, "dropped hallucinated punctuation candidate (beam)");
                 return false;
             }
             true
@@ -775,6 +933,27 @@ mod tests {
     }
 
     #[test]
+    fn strip_echo_context_drops_echo_with_stray_romaji() {
+        // 実機事例（2026-09-09）: 打ち間違いで `たもたsれている` と未変換確定され、
+        // 次に同じ読みを変換すると全ビームがそれをコピーして `保たれている` が
+        // 候補から消えた。英字が挟まっていても落として検出する。
+        let context = "セーラー襟の背中側が持ち上がっている。が、形と長さはたもたsれている";
+        let reading = "たもたれている";
+        assert_eq!(
+            strip_echo_context(context, reading),
+            "セーラー襟の背中側が持ち上がっている。"
+        );
+    }
+
+    #[test]
+    fn strip_echo_context_keeps_multiletter_ascii_words() {
+        // 単独英字だけを落とすので、`AI` のような語でかな run が連結されない。
+        let context = "それはAIのことなら得意だ。";
+        let reading = "のことなら";
+        assert_eq!(strip_echo_context(context, reading), context);
+    }
+
+    #[test]
     fn strip_echo_context_requires_prefix_match() {
         // 読みプレフィックス（6 文字）が丸ごと一致しない限り切らない。
         // 「ということだ。」は reading「ということで」と 5 文字しか一致しない。
@@ -811,6 +990,81 @@ mod tests {
         assert!(!is_kana_prefix_echo("コーヒー", "こーひー"));
         // プレフィックスでないかな候補は対象外
         assert!(!is_kana_prefix_echo("だじゅん", reading));
+    }
+
+    #[test]
+    fn kana_rewrite_rejects_rewritten_kana() {
+        // 実ログの喘ぎ声・オノマトペ（2026-09-04 報告）
+        assert!(is_kana_rewrite("あんる", "あんっ"));
+        assert!(is_kana_rewrite("ふぁんふぁん", "ふんふんっ"));
+        assert!(is_kana_rewrite("おまんきゅって", "おまんこきゅって"));
+        assert!(is_kana_rewrite("いって", "いっちゃ"));
+        // カタカナ化した言い換えも対象
+        assert!(is_kana_rewrite("フンフんふぁん", "ふんふんっ"));
+        // 尻切れ・尻伸ばしも「かなのまま違う」なので棄却
+        assert!(is_kana_rewrite("たっち", "あにめたっち"));
+        assert!(is_kana_rewrite("できたか", "できた"));
+    }
+
+    #[test]
+    fn kana_rewrite_keeps_legitimate_candidates() {
+        // 読みそのまま（無変換フォールバック）
+        assert!(!is_kana_rewrite("あんっ", "あんっ"));
+        // 読み全体のカタカナ変換（F7 相当）
+        assert!(!is_kana_rewrite("アンッ", "あんっ"));
+        // 漢字・英数字を含む候補は対象外
+        assert!(!is_kana_rewrite("餡っ", "あんっ"));
+        assert!(!is_kana_rewrite("Mac", "まっく"));
+        // 長音符が絡む表記ゆれは巻き込まない
+        assert!(!is_kana_rewrite("チーズ", "ちいず"));
+        assert!(!is_kana_rewrite("コーヒー", "こうひい"));
+        assert!(!is_kana_rewrite("だからー", "だから"));
+        assert!(!is_kana_rewrite("", "あんっ"));
+    }
+
+    #[test]
+    fn repeated_kana_run_is_detected() {
+        // 実ログの連打（喘ぎ声・キー押しっぱなし）
+        assert!(is_repeated_kana_run("みみみみみみみみ"));
+        assert!(is_repeated_kana_run("あああああ"));
+        assert!(is_repeated_kana_run("んんん"));
+        assert!(is_repeated_kana_run("ーーー"));
+        assert!(is_repeated_kana_run("ッッッ"));
+    }
+
+    #[test]
+    fn repeated_kana_run_keeps_convertible_readings() {
+        // 2 文字は「嗚呼」等の正当な変換先があるので対象外
+        assert!(!is_repeated_kana_run("ああ"));
+        // 連打の途中に別のかなが混ざれば通常の変換に回す
+        assert!(!is_repeated_kana_run("あああっ"));
+        assert!(!is_repeated_kana_run("みみみみみみみみと"));
+        // かな以外・空文字は対象外
+        assert!(!is_repeated_kana_run("aaa"));
+        assert!(!is_repeated_kana_run("111"));
+        assert!(!is_repeated_kana_run(""));
+    }
+
+    #[test]
+    fn punctuation_hallucination_is_detected() {
+        // 読みに無い句読点は幻覚（実ログ: あんっ → あん。）
+        assert!(introduces_punctuation("あん。", "あんっ"));
+        assert!(introduces_punctuation("見て、", "みて"));
+        assert!(introduces_punctuation("つまり、文が伸びたときに", "つまり"));
+        assert!(introduces_punctuation("…", "あまり"));
+    }
+
+    #[test]
+    fn punctuation_present_in_reading_is_kept() {
+        // ユーザーが打鍵した句読点は通す（半角/全角は同一視）
+        assert!(!introduces_punctuation("晴れ。", "はれ。"));
+        assert!(!introduces_punctuation("晴れ。", "はれ｡"));
+        assert!(!introduces_punctuation("本当！？", "ほんとう！？"));
+        // 句読点を含まない候補は常に通す
+        assert!(!introduces_punctuation("餡っ", "あんっ"));
+        // ASCII のピリオド・カンマは対象外（英数字混じり出力の巻き込み回避）
+        assert!(!introduces_punctuation("0.5", "0.5"));
+        assert!(!introduces_punctuation("Ver1.0", "ばーじょん1.0"));
     }
 
     #[test]

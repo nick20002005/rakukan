@@ -38,6 +38,8 @@ pub enum UserAction {
     CandidatePageDown,   // PageDown
     CandidatePageUp,     // PageUp
     CandidateSelect(u8), // 数字 1–9
+    /// 選択中の候補を学習履歴から削除（Ctrl+Delete）
+    CandidateForget,
 
     // ─── IME オン/オフ ───────────────────────────────────────────────────
     /// IME をオフにする（直接入力）
@@ -50,12 +52,14 @@ pub enum UserAction {
     // ─── カーソル移動（プリエディット内）────────────────────────────────
     CursorLeft,
     CursorRight,
-    /// Home: 未確定文字列がある間はアプリへ渡さず IME 内で処理する（Issue #11）。
-    /// RangeSelect では選択範囲の右端を先頭へ移す。他の状態では消費して何もしない
-    /// （rakukan は preedit 内キャレットを持たない）。
+    /// Home: 変換中は先頭の文節へ。プリエディット中は消費するだけ
     CursorHome,
-    /// End: `CursorHome` の末尾版。RangeSelect では選択範囲を全体へ広げる。
+    /// End: 変換中は末尾の文節へ。プリエディット中は消費するだけ
     CursorEnd,
+    /// Delete: 変換中は読みに戻す。プリエディット中は消費するだけ
+    /// （キャレットは常に末尾なので消す文字がない。アプリへ流すと
+    /// composition の外の文字が消える）
+    Delete,
 
     // ─── 文節伸縮（候補選択中）──────────────────────────────────────────
     /// Shift+Left: 文節を1文字縮めて再変換

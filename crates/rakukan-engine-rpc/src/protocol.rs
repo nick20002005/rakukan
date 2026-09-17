@@ -17,7 +17,7 @@ pub const PIPE_BASE_NAME: &str = "rakukan-engine";
 /// - v4: `MergeCandidatesForReading` を追加
 /// - (v4 のまま) `MergeCandidates` を廃止して `_ReservedMergeCandidates` に。
 ///   ホストは `Error` を返す（TSF 側の呼び出しは同時に削除済み）
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// `InputChar` バッチ RPC で指定する入力モード。
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -143,9 +143,6 @@ pub enum Request {
     // ─── 診断 ─────────────────────────────────────────────
     LastError,
     DictStatus,
-    /// ホストの健全性（Issue #43）。`ok` / `recovering` / `unrecoverable` を返す。
-    /// 復帰の判断はホストが持ち、TSF は文言を決めるためだけに問い合わせる。
-    EngineHealth,
 
     // ─── ライフサイクル ────────────────────────────────────
     /// クライアント側が切断を宣言する。ホストは該当セッションを破棄する。
@@ -235,6 +232,37 @@ pub enum Request {
     ShutdownIfConfigDiffers {
         config_json: Option<String>,
     },
+
+    // ─── 学習履歴の削除 (v5) ───────────────────────────────
+    /// 候補ウィンドウでの明示削除（Ctrl+Delete）。`reading` に**前方一致**する
+    /// キーもまとめて対象にするため、短文予測で出た候補も消せる。
+    ///
+    /// postcard の discriminant は宣言順なので、この variant も末尾に追加する。
+    Forget {
+        reading: String,
+        surface: String,
+    },
+
+    // ─── 入力中の予測候補 (v6) ─────────────────────────────
+    /// 学習履歴だけを引く軽量な予測。打鍵ごとに呼ばれるため LLM も MOZC も触らない。
+    /// postcard の discriminant は宣言順なので、この variant も末尾に追加する。
+    Predict {
+        reading: String,
+        limit: u32,
+    },
+
+    // ─── 辞書の直接引き (v7) ───────────────────────────────
+    /// 読みに対する辞書候補だけを返す（短文予測も LLM も引かない）。
+    /// 文節境界の探索（`Shift+←/→`）が読みの前方を切り詰めながら問い合わせる。
+    /// postcard の discriminant は宣言順なので、この variant も末尾に追加する。
+    DictLookup {
+        reading: String,
+        limit: u32,
+    },
+    /// ホストの健全性（Issue #43）。`ok` / `recovering` / `unrecoverable` を返す。
+    /// 復帰の判断はホストが持ち、TSF は文言を決めるためだけに問い合わせる。
+    EngineHealth,
+
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

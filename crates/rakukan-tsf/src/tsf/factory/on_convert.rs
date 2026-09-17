@@ -15,7 +15,8 @@ use crate::tsf::candidate_window;
 
 use super::{
     commit_text, commit_then_start_composition, end_composition, engine_convert_sync_multi,
-    update_caret_rect, update_composition, update_composition_candidate_parts,
+    update_caret_rect, update_composition, update_composition_at,
+    update_composition_block_parts, update_composition_candidate_parts,
 };
 
 /// Convert 1 回ぶんの RPC 回数と合計時間を、どの経路で抜けても 1 行残す
@@ -212,6 +213,29 @@ fn is_weak_merge(merged: &[String], reading: &str, preedit: &str) -> bool {
     }
 }
 
+/// TSF 側が握ったままの「モデル未ロード」を解く。
+///
+/// エンジンホストが再起動すると、その瞬間に `is_kanji_ready=false` を掴んだ
+/// プロセスは自分から poll し直さない。復帰を試みるのが `on_convert[new]` の
+/// 中だけだったため、区読点を含む文（BlockSelecting 経路）はホスト再起動後
+/// ずっと変換できず生かなが返り続けた（2026-09-10）。
+fn ensure_model_ready(engine: &mut crate::engine::state::DynEngine) -> bool {
+    if engine.is_kanji_ready() {
+        return true;
+    }
+    let err = engine.last_error();
+    tracing::warn!("on_convert: kanji not ready, engine status={:?}", err);
+    if err == "model load complete" && engine.poll_model_ready() {
+        let ready = engine.is_kanji_ready();
+        tracing::info!(
+            "on_convert: model load complete was pending injection, kanji_ready={}",
+            ready
+        );
+        return ready;
+    }
+    false
+}
+
 /// 辞書・学習履歴だけで即時に出せる候補を返す（LLM 完了前の先行表示用）。
 ///
 /// 辞書検索の reading は `hiragana_text()`（未確定ローマ字を含まない読み）。
@@ -346,6 +370,10 @@ impl super::TextServiceFactory_Impl {
             }
         }
 
+        // 分岐に入る前にモデル未ロードのラッチを解く。区読点分割（Block）
+        // 経路はこの復帰を通らないので、ここで解かないと生かなのまま返る。
+        let _ = ensure_model_ready(engine);
+
         // ── LiveConv（ライブ変換表示中）: Space → reading で通常変換へ ──────
         // engine の hiragana_buf は LiveConv 遷移後も変化していないため、
         // session を Preedit に戻すだけで通常の on_convert フローに乗れる。
@@ -387,6 +415,9 @@ impl super::TextServiceFactory_Impl {
                 if selected.is_empty() {
                     return Ok(true);
                 }
+                // 予測ウィンドウを出したまま Space に入った場合、候補ウィンドウの
+                // 表示側が「上」のまま引き継がれるので既定へ戻す。
+                candidate_window::set_placement_below();
                 // Preedit に遷移して通常変換フローへ
                 // engine の hiragana_buf を選択範囲に設定
                 engine.bg_reclaim();
@@ -570,6 +601,10 @@ impl super::TextServiceFactory_Impl {
 
                     let bg_done = engine.bg_status() == "done";
                     tracing::debug!("on_convert[llm_pending]: after wait bg_done={}", bg_done);
+                    if bg_done {
+                        // 推論が通った = デバイスは生きている
+                        crate::engine::state::bg_timeout_watchdog(false);
+                    }
                     const DICT_LIMIT: usize = 40;
 
                     if bg_done {
@@ -847,22 +882,37 @@ impl super::TextServiceFactory_Impl {
         {
             let mut sess = session_get()?;
             if sess.is_block_selecting() {
+                // 遅延展開: 文節分割で作ったブロックは候補を 1 件しか持たないので、
+                // Space が押された時点でその文節の読みだけ変換し直す。
+                // 分割時に全文節ぶん変換すると、その場で数百 ms × 文節数かかる。
+                if !sess.block_selecting_current_expanded() {
+                    let reading = sess.block_selecting_current_reading().unwrap_or_default();
+                    drop(sess);
+                    if !reading.is_empty() {
+                        const BLOCK_DICT_LIMIT: usize = 9;
+                        let llm_limit = crate::engine::state::get_num_candidates();
+                        engine.force_preedit(reading.clone());
+                        let cands =
+                            engine_convert_sync_multi(engine, llm_limit, BLOCK_DICT_LIMIT, &reading, &reading);
+                        tracing::debug!(
+                            "on_convert[block]: 遅延展開 {:?} → {} 件",
+                            reading,
+                            cands.len()
+                        );
+                        session_get()?.block_selecting_set_candidates(cands);
+                    }
+                    sess = session_get()?;
+                }
                 sess.block_selecting_next();
-                let page_cands = sess.block_selecting_page_candidates();
-                let page_sel = sess.block_selecting_page_selected();
-                let (prefix, cand_text, remainder) =
-                    sess.block_selecting_composition_parts().unwrap_or_default();
-                // caret_rect_get() は commit_then_start_composition セッション内で
-                // 更新されるため、Enter 確定後も現在ブロックの正確な位置を返す。
-                let caret = caret_rect_get();
                 drop(sess);
                 drop(guard);
-                candidate_window::update_selection(page_sel, "");
-                candidate_window::show(&page_cands, page_sel, "", caret.left, caret.bottom);
-                update_composition_candidate_parts(ctx, tid, sink, prefix, cand_text, remainder)?;
-                return Ok(true);
+                return self.redraw_block_selecting(ctx, tid, sink);
             }
         }
+
+        // ここから先は Preedit からの新しい変換。予測ウィンドウを出したまま
+        // Space を押した場合に「上」が引き継がれないよう、表示側を既定へ戻す。
+        candidate_window::set_placement_below();
 
         // ── 区読点分割変換（BlockSelecting 遷移） ─────────────────────────────
         // preedit が区読点を含む場合、ブロック分割してそれぞれを sync 変換し
@@ -930,8 +980,27 @@ impl super::TextServiceFactory_Impl {
             }
             const BLOCK_DICT_LIMIT: usize = 9; // 1ブロックあたり最大候補数
             let llm_limit_b = crate::engine::state::get_num_candidates();
+
+            // ライブ変換の preview があれば、ブロック単独の再変換より優先する。
+            //
+            // 🔴 ブロックごとに読みだけで引き直すと **文全体の文脈が消える**。
+            //    `いや、なになになに` は preview では `いや、なになになに` と
+            //    正しく出ているのに、`いや` を 2 文字だけで引くと辞書順の
+            //    `嫌` が第 1 候補になり、そのまま Enter すると学習まで載って
+            //    以後ずっと `嫌、` になる（2026-09-07 に実害）。
+            //    preview は画面に出ている文字列そのものなので、Space は
+            //    「見えているものを固定して文節選択に入る」動きになる。
+            let preview_blocks = space_live_candidate.as_ref().and_then(|candidate| {
+                crate::engine::text_util::split_preview_by_punctuation(&preedit, &candidate.text)
+            });
+            tracing::debug!(
+                "on_convert[block]: live preview seed={:?} preedit={:?}",
+                preview_blocks,
+                preedit
+            );
+
             let mut blocks: Vec<ConversionBlock> = Vec::new();
-            for (reading, trailing_punct) in blocks_raw {
+            for (block_index, (reading, trailing_punct)) in blocks_raw.into_iter().enumerate() {
                 if reading.is_empty() {
                     // 区読点のみのブロック（文頭の区読点など）は候補なしで残す
                     blocks.push(ConversionBlock {
@@ -939,24 +1008,74 @@ impl super::TextServiceFactory_Impl {
                         trailing_punct,
                         candidates: Vec::new(),
                         selected: 0,
+                        expanded: true,
                     });
                     continue;
                 }
-                // engine のプリエディットをこのブロックの読みに差し替えて sync 変換
-                engine.force_preedit(reading.clone());
-                let candidates = engine_convert_sync_multi(
-                    engine,
-                    llm_limit_b,
-                    BLOCK_DICT_LIMIT,
-                    &reading,
-                    &reading,
-                );
-                blocks.push(ConversionBlock {
-                    reading,
-                    trailing_punct,
-                    candidates,
-                    selected: 0,
-                });
+                // preview があればそれを第 1 候補にし、無い時だけ engine の
+                // プリエディットをこのブロックの読みに差し替えて sync 変換する。
+                let preview_top = preview_blocks
+                    .as_ref()
+                    .and_then(|v| v.get(block_index))
+                    .filter(|s| !s.is_empty())
+                    .cloned();
+                let seeded_from_preview = preview_top.is_some();
+                let candidates = match preview_top {
+                    Some(top) => vec![top],
+                    None => {
+                        engine.force_preedit(reading.clone());
+                        engine_convert_sync_multi(
+                            engine,
+                            llm_limit_b,
+                            BLOCK_DICT_LIMIT,
+                            &reading,
+                            &reading,
+                        )
+                    }
+                };
+
+                // 文節分割: 変換結果（第 1 候補）を文字種で区切り、読みを逆算する。
+                //
+                // 読み側を辞書で割るのではなく **変換後の surface から割る** ので、
+                // 第 1 候補は文全体を一発変換した結果そのままになる。文全体の文脈が
+                // 効いたままで「文節移動」「部分確定」「語単位の候補」が手に入る。
+                // 割れなければ（アンカーが合わない・1 文節）従来どおり 1 ブロック。
+                let split = candidates
+                    .first()
+                    .and_then(|top| crate::engine::clause::split_into_clauses(&reading, top));
+                match split {
+                    Some(clauses) => {
+                        tracing::debug!(
+                            "on_convert: 文節分割 {:?} → {:?}",
+                            reading,
+                            clauses.iter().map(|c| &c.surface).collect::<Vec<_>>()
+                        );
+                        let last = clauses.len() - 1;
+                        for (i, c) in clauses.into_iter().enumerate() {
+                            blocks.push(ConversionBlock {
+                                reading: c.reading,
+                                // 区読点は元のブロックの末尾に付いていたものなので
+                                // 最後の文節にだけ引き継ぐ
+                                trailing_punct: if i == last { trailing_punct } else { None },
+                                candidates: vec![c.surface],
+                                selected: 0,
+                                // 候補は文全体の変換から取った 1 件だけ。Space が
+                                // 押されたときにその文節の読みで引き直す
+                                expanded: false,
+                            });
+                        }
+                    }
+                    None => blocks.push(ConversionBlock {
+                        reading,
+                        trailing_punct,
+                        candidates,
+                        selected: 0,
+                        // preview 由来のときは候補が 1 件しか無いので、Space で
+                        // 遅延展開させる（expanded=true にすると Space が
+                        // 1 件の中を回るだけになり、候補が出せなくなる）。
+                        expanded: !seeded_from_preview,
+                    }),
+                }
             }
             // engine のプリエディットを最初の（非空）ブロックの読みに戻す
             if let Some(first_non_empty) = blocks.iter().find(|b| !b.reading.is_empty()) {
@@ -969,7 +1088,7 @@ impl super::TextServiceFactory_Impl {
             let comp_parts: (String, String, String);
             {
                 let mut sess = session_get()?;
-                sess.set_block_selecting(blocks, full_reading);
+                sess.set_block_selecting(blocks, full_reading, caret.left, caret.bottom);
                 page_cands = sess.block_selecting_page_candidates();
                 page_sel = sess.block_selecting_page_selected();
                 comp_parts = sess.block_selecting_composition_parts().unwrap_or_default();
@@ -978,7 +1097,7 @@ impl super::TextServiceFactory_Impl {
             candidate_window::stop_waiting_timer();
             candidate_window::show(&page_cands, page_sel, "", caret.left, caret.bottom);
             let (prefix, cand_text, remainder) = comp_parts;
-            update_composition_candidate_parts(ctx, tid, sink, prefix, cand_text, remainder)?;
+            update_composition_block_parts(ctx, tid, sink, prefix, cand_text, remainder)?;
             return Ok(true);
         }
 
@@ -1010,15 +1129,7 @@ impl super::TextServiceFactory_Impl {
             engine.bg_status()
         );
         if !kanji_ready {
-            let err = engine.last_error();
-            tracing::warn!("on_convert: kanji not ready, engine status={:?}", err);
-            if err == "model load complete" && engine.poll_model_ready() {
-                kanji_ready = engine.is_kanji_ready();
-                tracing::info!(
-                    "on_convert: model load complete was pending injection, kanji_ready={}",
-                    kanji_ready
-                );
-            }
+            kanji_ready = ensure_model_ready(engine);
         }
         // ready 判定（読み込み完了の注入を含む）の後で bg_start する。注入で ready に
         // 変わった直後に起動しないと、llm_pending のまま bg=idle で「⏳ 変換中...」が
@@ -1682,16 +1793,20 @@ impl super::TextServiceFactory_Impl {
                 if preview.is_empty() {
                     return Ok(false);
                 }
+                let converted_len = sess.live_conv_converted_len().unwrap_or(0);
                 sess.set_idle();
                 drop(sess);
                 candidate_window::hide();
                 candidate_window::stop_live_timer();
-                let (preview, unconverged) = catch_up_live_preview(engine, &reading, preview);
+                let (preview, unconverged) =
+                    catch_up_live_preview(engine, &reading, preview, converted_len);
                 if preview != reading
                     && !unconverged
                     && crate::engine::state::is_auto_learn_enabled()
                 {
-                    engine.learn(&reading, &preview);
+                    // ライブ変換の preview 全体を読み全体に紐づけて学習する。
+                    // これが短文予測（「かんたん」→「簡単な言葉で分析」）の供給源。
+                    engine.learn_force(&reading, &preview);
                 }
                 engine.commit(&preview);
                 engine.reset_preedit();
@@ -1743,18 +1858,18 @@ impl super::TextServiceFactory_Impl {
             // ── BlockSelecting（区読点分割変換）: Enter → 全ブロックまとめて確定 ──
             //
             // Enter は composition 全体を確定する（MS-IME / Google 日本語入力と同じ）。
+            // 文節ごとの選び直しは ← / → で移動して Space、が入口。
             //
-            // 以前は「現在ブロックだけ確定して次へ進む」実装だったため、読点を含む文を
+            // 以前は「現在ブロックだけ確定して次へ進む」実装だったが、読点を含む文を
             // Space で変換すると必ずブロック数ぶんの Enter が要り、そのたびに断片が
-            // アプリへ書き込まれていた（ライブ変換のまま Enter なら一文が一度に入るのに、
-            // 途中で Space を挟んだ時だけ細切れになる）。
-            //
-            // 部分確定の経路が無くなったので composition には常に全ブロックが載っている
-            // （`update_composition_candidate_parts` の prefix ＝ current_index より前の
-            // ブロック）。`end_composition` にも全体を渡すこと。
+            // アプリへ書き込まれた（実害 2026-09-01: ライブ変換のまま Enter なら一文が
+            // 一度に入るのに、Space を挟むと同じ文が細切れで入る）。
             if sess.is_block_selecting() {
                 let full_text = sess.block_selecting_full_text().unwrap_or_default();
                 let full_reading = sess.block_selecting_full_reading().unwrap_or_default();
+                // ドキュメントへ書き戻すのは composition に載っている範囲だけ
+                // （先行実装で確定済みのブロックがあれば既にアプリ側にある）。
+                let pending_text = sess.block_selecting_pending_text().unwrap_or_default();
                 sess.set_idle();
                 drop(sess);
                 candidate_window::hide();
@@ -1762,16 +1877,20 @@ impl super::TextServiceFactory_Impl {
                     && full_text != full_reading
                     && !full_reading.is_empty()
                 {
-                    engine.learn(&full_reading, &full_text);
+                    engine.learn_force(&full_reading, &full_text);
                 }
                 engine.commit(&full_text);
                 engine.reset_preedit();
                 drop(guard);
-                tracing::info!("on_commit_raw[BlockSelecting]: commit full={:?}", full_text);
+                tracing::info!(
+                    "on_commit_raw[BlockSelecting]: commit pending={:?} full={:?}",
+                    pending_text,
+                    full_text
+                );
                 diag::event(DiagEvent::CommitRaw {
                     preedit: full_text.clone(),
                 });
-                end_composition(ctx, tid, full_text)?;
+                end_composition(ctx, tid, pending_text)?;
                 return Ok(true);
             }
             // ── Waiting（⏳変換中）: ひらがなのままコミット ──
@@ -1924,11 +2043,15 @@ impl super::TextServiceFactory_Impl {
                     if let Ok(mut sess2) = session_get() {
                         sess2.sync_preedit_reading(&hira);
                     }
+                    let hira_owned = hira.to_string();
+                    let suggestions = crate::tsf::suggestion::fetch(engine2, &hira_owned);
                     drop(guard);
                     if preedit.is_empty() {
+                        crate::tsf::suggestion::clear();
                         end_composition(ctx, tid, String::new())?;
                     } else {
                         update_composition(ctx, tid, sink, preedit)?;
+                        crate::tsf::suggestion::show(&hira_owned, suggestions);
                     }
                 }
                 return Ok(consumed);
@@ -1950,16 +2073,18 @@ impl super::TextServiceFactory_Impl {
                 update_composition(ctx, tid, sink, preview)?;
                 return Ok(true);
             }
-            // BlockSelecting → Backspace → ESC と同様、元のひらがなに戻す
+            // BlockSelecting → Backspace → ESC と同様、元のひらがなに戻す。
+            // 戻すのは未確定ブロックの読みだけ（Enter で確定済みのブロックまで
+            // 戻すと、アプリに残っている確定テキストの後ろに同じ読みが入る）。
             if sess.is_block_selecting() {
-                let full_reading = sess.block_selecting_full_reading().unwrap_or_default();
-                sess.set_preedit(full_reading.clone());
+                let pending_reading = sess.block_selecting_pending_reading().unwrap_or_default();
+                sess.set_preedit(pending_reading.clone());
                 drop(sess);
                 candidate_window::hide();
                 engine.bg_reclaim();
-                engine.force_preedit(full_reading.clone());
+                engine.force_preedit(pending_reading.clone());
                 drop(guard);
-                update_composition(ctx, tid, sink, full_reading)?;
+                update_composition(ctx, tid, sink, pending_reading)?;
                 return Ok(true);
             }
             if sess.is_selecting() {
@@ -1982,7 +2107,13 @@ impl super::TextServiceFactory_Impl {
                 candidate_window::hide();
             }
         }
+        let caret_editing = !crate::engine::state::caret_tail_is_empty();
         let consumed = engine.backspace();
+        if !consumed && caret_editing {
+            // キャレットが先頭（engine 側が空）: 消す文字は無いがキーは食う。
+            // 透過させるとアプリが composition の手前の文字を消してしまう。
+            return Ok(true);
+        }
         if consumed {
             engine.bg_reclaim();
             let preedit = engine.preedit_display();
@@ -1990,17 +2121,29 @@ impl super::TextServiceFactory_Impl {
             // 古いまま残る（実ログ: Preedit("いまわのきわ") のまま hira="いまは"）。
             // 削除後の読みに追随させ、空になったら Idle へ戻す。
             let hira = engine.hiragana_text();
+            let full_reading = crate::engine::state::caret_full_reading(engine);
             if let Ok(mut sess) = session_get() {
-                sess.sync_preedit_reading(&hira);
+                sess.sync_preedit_reading(&full_reading);
+            }
+            if caret_editing {
+                let (display, caret) = crate::engine::state::caret_display(engine);
+                drop(guard);
+                crate::tsf::suggestion::clear();
+                update_composition_at(ctx, tid, sink, display, caret)?;
+                return Ok(true);
             }
             diag::event(DiagEvent::Backspace {
                 preedit_after: preedit.clone(),
             });
+            let hira_owned = hira.to_string();
+            let suggestions = crate::tsf::suggestion::fetch(engine, &hira_owned);
             drop(guard);
             if preedit.is_empty() {
+                crate::tsf::suggestion::clear();
                 end_composition(ctx, tid, String::new())?;
             } else {
                 update_composition(ctx, tid, sink, preedit)?;
+                crate::tsf::suggestion::show(&hira_owned, suggestions);
             }
         }
         Ok(consumed)
@@ -2034,17 +2177,17 @@ impl super::TextServiceFactory_Impl {
                 update_composition(ctx, tid, sink, reading)?;
                 return Ok(true);
             }
-            // BlockSelecting → ESC → 元のひらがなに戻す
+            // BlockSelecting → ESC → 元のひらがなに戻す（未確定ブロックのみ）
             if sess.is_block_selecting() {
-                let full_reading = sess.block_selecting_full_reading().unwrap_or_default();
-                sess.set_preedit(full_reading.clone());
+                let pending_reading = sess.block_selecting_pending_reading().unwrap_or_default();
+                sess.set_preedit(pending_reading.clone());
                 drop(sess);
                 candidate_window::hide();
                 engine.bg_reclaim();
-                // engine のプリエディットを元の全体読みに復元
-                engine.force_preedit(full_reading.clone());
+                // engine のプリエディットを未確定ぶんの読みに復元
+                engine.force_preedit(pending_reading.clone());
                 drop(guard);
-                update_composition(ctx, tid, sink, full_reading)?;
+                update_composition(ctx, tid, sink, pending_reading)?;
                 return Ok(true);
             }
             // RangeSelect → ESC → LiveConv に戻る（元の preview を復元）
@@ -2138,6 +2281,75 @@ impl super::TextServiceFactory_Impl {
 ///
 /// Enter の体感を変えないため、待つのは「現在の読みに対する変換結果がまだ
 /// 存在しない」ときだけ。通常はここに入らず即座に確定する。
+#[cfg(test)]
+mod tests {
+    use super::{is_weak_merge, live_preview_confirmed_head};
+
+    fn v(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn confirmed_head_strips_unconverted_tail() {
+        // 2026-09-09 のログ: `がへんかんでき`(7) まで変換して `が変換でき` を得た
+        // あと、`なかった` を打ち足した状態で Enter。
+        assert_eq!(
+            live_preview_confirmed_head("がへんかんできなかった", "が変換できなかった", 7),
+            Some("が変換でき")
+        );
+    }
+
+    #[test]
+    fn confirmed_head_covers_whole_preview_when_fully_converted() {
+        assert_eq!(
+            live_preview_confirmed_head("へんかん", "変換", 4),
+            Some("変換")
+        );
+    }
+
+    #[test]
+    fn confirmed_head_is_none_without_any_conversion() {
+        assert_eq!(
+            live_preview_confirmed_head("たもたれている", "たもたれている", 0),
+            None
+        );
+    }
+
+    #[test]
+    fn confirmed_head_is_none_when_preview_shape_is_unexpected() {
+        // 記号の畳み込み等で「変換済み＋読みの残り」の形になっていない場合。
+        assert_eq!(live_preview_confirmed_head("あいうえお", "アイウ", 2), None);
+    }
+
+    #[test]
+    fn weak_merge_when_empty() {
+        assert!(is_weak_merge(&[], "た", "た"));
+    }
+
+    #[test]
+    fn weak_merge_when_only_reading_echo() {
+        // merge_candidates_for_reading は候補が無いと reading 自身で埋める
+        assert!(is_weak_merge(&v(&["た"]), "た", "た"));
+    }
+
+    #[test]
+    fn weak_merge_when_only_preedit_echo_with_pending_romaji() {
+        // preedit（表示文字列）は未確定ローマ字を含み reading と異なることがある
+        assert!(is_weak_merge(&v(&["たt"]), "た", "たt"));
+        assert!(is_weak_merge(&v(&["た"]), "た", "たt"));
+    }
+
+    #[test]
+    fn not_weak_when_real_candidate_present() {
+        assert!(!is_weak_merge(&v(&["田"]), "た", "た"));
+        assert!(!is_weak_merge(&v(&["た", "田"]), "た", "た"));
+        assert!(!is_weak_merge(&v(&["田", "多"]), "た", "たt"));
+    }
+}
+/// ライブ変換の preview が現在の読みに追いつくのを待つ上限。
+///
+/// Enter の体感を変えないため、待つのは「現在の読みに対する変換結果がまだ
+/// 存在しない」ときだけ。通常はここに入らず即座に確定する。
 const LIVE_COMMIT_CATCHUP_MS: u64 = 400;
 
 /// bg をこの場で起動し直した場合の待ち上限。先頭から変換するぶん長く見る
@@ -2153,13 +2365,13 @@ const LIVE_COMMIT_RESTART_CATCHUP_MS: u64 = 1_000;
 ///
 /// 現在の読みに対する変換結果が無い場合だけ短時間待って拾い直し、結果が既に
 /// ある場合も含めて、必ず `merge_candidates_for_reading` を通した値を返す。
-/// 待つのは bg が走っているときだけでなく、走っていない場合はその読みで bg を
-/// 起動してから待つ（打鍵が速いと `on_live_timer` が FIRED しないまま Enter が
-/// 来るため、bg=done のまま「一度も変換されていない読み」が確定していた）。
 /// 「結果があるなら preview はそれを反映済み」とは限らないためで、ライブ
 /// タイマーは `pass_debounce()` で最終打鍵から `debounce_ms` 経過するまで
 /// 発火せず、その猶予の内に Enter が来ると伸ばしたままの preview が残る
 /// （`RequestEditSession` に失敗して `LIVE_PREVIEW_QUEUE` へ積んだ場合も同じ）。
+/// 待つ相手は、bg が走っていればその完了、走っていなければその読みで起動した
+/// bg（打鍵が速いと on_live_timer が FIRED しないまま Enter が来るため、bg=done の
+/// まま「一度も変換されていない読み」が確定していた）。
 ///
 /// 待っても取れなければ preview はそのまま返し、`true` (=未収束) を返す。
 /// 未収束の preview を学習に流すと、同じ読みで同じ壊れ方が再生産されるため、
@@ -2168,6 +2380,7 @@ fn catch_up_live_preview(
     engine: &mut crate::engine::state::DynEngine,
     reading: &str,
     preview: String,
+    converted_len: usize,
 ) -> (String, bool) {
     let top = match engine.bg_peek_top_candidate(reading) {
         Some(top) => top,
@@ -2220,6 +2433,18 @@ fn catch_up_live_preview(
     match merged {
         Some(merged) => {
             if merged != preview {
+                if let Some(confirmed) =
+                    live_preview_confirmed_head(reading, &preview, converted_len)
+                    && !merged.starts_with(confirmed)
+                {
+                    tracing::info!(
+                        "[Live] commit catch-up: keep displayed {:?} (catch-up said {:?}, confirmed={:?})",
+                        preview,
+                        merged,
+                        confirmed
+                    );
+                    return (preview, false);
+                }
                 tracing::info!("[Live] commit catch-up: {:?} → {:?}", preview, merged);
             }
             (merged, false)
@@ -2228,36 +2453,35 @@ fn catch_up_live_preview(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::is_weak_merge;
-
-    fn v(items: &[&str]) -> Vec<String> {
-        items.iter().map(|s| s.to_string()).collect()
+/// preview のうち「BG 変換で確定していて、画面にもその形で出ていた」先頭部分を
+/// 返す。追いつき変換の結果を採ってよいかの判定に使う。
+///
+/// 🔴 追いつき変換は読み全体を一度に変換し直すので、ライブ変換が数文字ずつ
+///    積み上げた結果と食い違うことがある。実例（2026-09-09 のログ）: 画面には
+///    `が変換できなかった` と出ていたのに `が返還できなかった` が確定した。
+///    ライブ側は `がへんかんでき` の時点で `が変換でき` を得ていたが、追いつき
+///    側は `がへんかんできなかった` を頭から変換して `返還` を選んだ。
+///
+/// preview は「先頭 `converted_len` 文字ぶんの変換 ＋ 残りの生かな」の形なので、
+/// 末尾から読みの未変換ぶんを剥がせば確定済みの頭が取れる。これが追いつきの
+/// 結果の接頭辞になっていれば「preview の続きを変換しただけ」なので採ってよく、
+/// そうでなければ既に見えていた部分まで書き換えているので却下する。
+///
+/// 判定材料が無い場合（読み全体が未変換 / preview が想定の形でない）は `None` を
+/// 返し、従来どおり追いつきの結果に任せる。
+fn live_preview_confirmed_head<'a>(
+    reading: &str,
+    preview: &'a str,
+    converted_len: usize,
+) -> Option<&'a str> {
+    if converted_len == 0 {
+        return None;
     }
-
-    #[test]
-    fn weak_merge_when_empty() {
-        assert!(is_weak_merge(&[], "た", "た"));
-    }
-
-    #[test]
-    fn weak_merge_when_only_reading_echo() {
-        // merge_candidates_for_reading は候補が無いと reading 自身で埋める
-        assert!(is_weak_merge(&v(&["た"]), "た", "た"));
-    }
-
-    #[test]
-    fn weak_merge_when_only_preedit_echo_with_pending_romaji() {
-        // preedit（表示文字列）は未確定ローマ字を含み reading と異なることがある
-        assert!(is_weak_merge(&v(&["たt"]), "た", "たt"));
-        assert!(is_weak_merge(&v(&["た"]), "た", "たt"));
-    }
-
-    #[test]
-    fn not_weak_when_real_candidate_present() {
-        assert!(!is_weak_merge(&v(&["田"]), "た", "た"));
-        assert!(!is_weak_merge(&v(&["た", "田"]), "た", "た"));
-        assert!(!is_weak_merge(&v(&["田", "多"]), "た", "たt"));
+    let unconverted: String = reading.chars().skip(converted_len).collect();
+    let confirmed = preview.strip_suffix(&unconverted)?;
+    if confirmed.is_empty() {
+        None
+    } else {
+        Some(confirmed)
     }
 }

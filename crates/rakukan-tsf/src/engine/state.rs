@@ -663,6 +663,12 @@ fn build_engine_config_json() -> String {
     };
     let live_conv_beam_size = cfg.live_conversion.beam_size.clamp(1, 9);
     let convert_beam_size = cfg.conversion.beam_size.clamp(1, 30);
+    let rescore_enabled = cfg.conversion.rescore_enabled;
+    let rescore_min_reading_chars = cfg.conversion.rescore_min_reading_chars.max(1);
+    let rescore_min_gain = cfg.conversion.rescore_min_gain.max(0.0);
+    let prediction_enabled = cfg.prediction.enabled;
+    let prediction_max_candidates = cfg.prediction.max_candidates.clamp(0, 9);
+    let prediction_min_reading_chars = cfg.prediction.min_reading_chars.max(1);
     let digit_separator_auto = cfg.input.digit_separator_auto;
     let digit_candidates_order = cfg
         .input
@@ -679,7 +685,7 @@ fn build_engine_config_json() -> String {
         .join(",");
 
     tracing::info!(
-        "engine config: num_candidates={num_candidates} n_gpu_layers={n_gpu_layers} main_gpu={main_gpu} model_variant={model_variant:?} digit_width={digit_width} alpha_width={alpha_width} symbol_width={symbol_width} digit_separator_auto={digit_separator_auto} digit_candidates_order=[{digit_candidates_order}] live_conv_beam_size={live_conv_beam_size} convert_beam_size={convert_beam_size}"
+        "engine config: num_candidates={num_candidates} n_gpu_layers={n_gpu_layers} main_gpu={main_gpu} model_variant={model_variant:?} digit_width={digit_width} alpha_width={alpha_width} symbol_width={symbol_width} digit_separator_auto={digit_separator_auto} digit_candidates_order=[{digit_candidates_order}] live_conv_beam_size={live_conv_beam_size} convert_beam_size={convert_beam_size} prediction_enabled={prediction_enabled} prediction_max_candidates={prediction_max_candidates} prediction_min_reading_chars={prediction_min_reading_chars} rescore_enabled={rescore_enabled} rescore_min_reading_chars={rescore_min_reading_chars} rescore_min_gain={rescore_min_gain}"
     );
     // 診断用の強制失敗（Issue #43）。既定 false なので通常は JSON に載らない。
     let force_inference_failure = cfg.diagnostics.force_inference_failure;
@@ -693,7 +699,7 @@ fn build_engine_config_json() -> String {
         None => String::new(),
     };
     format!(
-        r#"{{"num_candidates":{num_candidates},"n_gpu_layers":{n_gpu_layers},"main_gpu":{main_gpu},"n_threads":0,"digit_width":"{digit_width}","alpha_width":"{alpha_width}","symbol_width":"{symbol_width}","digit_separator_auto":{digit_separator_auto},"digit_candidates_order":[{digit_candidates_order}],"live_conv_beam_size":{live_conv_beam_size},"convert_beam_size":{convert_beam_size},"force_inference_failure":{force_inference_failure}{mv_json}}}"#
+        r#"{{"num_candidates":{num_candidates},"n_gpu_layers":{n_gpu_layers},"main_gpu":{main_gpu},"n_threads":0,"digit_width":"{digit_width}","alpha_width":"{alpha_width}","symbol_width":"{symbol_width}","digit_separator_auto":{digit_separator_auto},"digit_candidates_order":[{digit_candidates_order}],"live_conv_beam_size":{live_conv_beam_size},"convert_beam_size":{convert_beam_size},"prediction_enabled":{prediction_enabled},"prediction_max_candidates":{prediction_max_candidates},"prediction_min_reading_chars":{prediction_min_reading_chars},"rescore_enabled":{rescore_enabled},"rescore_min_reading_chars":{rescore_min_reading_chars},"rescore_min_gain":{rescore_min_gain},"force_inference_failure":{force_inference_failure}{mv_json}}}"#
     )
 }
 
@@ -1147,7 +1153,16 @@ pub struct ConversionBlock {
     pub trailing_punct: Option<char>,
     pub candidates: Vec<String>,
     pub selected: usize,
+    /// この文節の候補一覧を引き済みか。
+    ///
+    /// 文節分割で作ったブロックは、文全体の変換結果から取った surface 1 件しか
+    /// 持たない（分割のために全文節ぶんの変換を走らせるとその場で数百 ms×文節数
+    /// かかる）。Space が押された時点でその文節の読みだけ変換し直す＝遅延展開。
+    pub expanded: bool,
 }
+
+/// 文節変換の候補ウィンドウ 1 ページの件数
+pub const BLOCK_PAGE_SIZE: usize = 9;
 
 impl ConversionBlock {
     /// 選択中の候補テキストを返す（候補が空なら reading を返す）。
@@ -1283,6 +1298,19 @@ pub enum SessionState {
         blocks: Vec<ConversionBlock>,
         current_index: usize,
         full_reading: String,
+        /// Enter で1ブロックずつ確定した際に積算するコミット済みテキスト。
+        /// 学習・最終コミット時に全体テキストとして使う。
+        #[allow(dead_code)]
+        committed_prefix: String,
+        /// Enter で **ドキュメントへ物理コミット済み** のブロック数。
+        ///
+        /// ← の戻り先の下限。既にアプリへ書き込んだブロックへ戻ると、
+        /// composition の prefix として再描画されて二重に入るため。
+        committed_blocks: usize,
+        #[allow(dead_code)]
+        pos_x: i32,
+        #[allow(dead_code)]
+        pos_y: i32,
     },
     /// ライブ変換表示中。
     ///
@@ -1315,6 +1343,84 @@ pub static SESSION_STATE: LazyLock<Mutex<SessionState>> =
 
 pub static SESSION_SELECTING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
+
+// ─── 未確定中のキャレット編集 ────────────────────────────────────────────
+//
+// ← で読みの途中へ戻ると、キャレットより右側の読みを engine から外して
+// ここへ退避する（engine の hiragana_buf には挿入点の概念が無く、末尾にしか
+// 積めないため）。engine が持つのはキャレットより左側だけで、表示は
+// `engine.preedit_display() + CARET_TAIL`、キャレット位置は前者の長さ。
+// 退避が非空なのは `Preedit` 状態のときだけで、他の状態へ遷移する `set_*` は
+// 必ず `caret_tail_clear()` する。キャレットを意識しないアクション（Space /
+// Enter / F6〜F10 / IME 切替…）は dispatch が `caret_merge_into_engine` で
+// 退避分を engine の末尾へ戻してから処理する。
+static CARET_TAIL: Mutex<String> = Mutex::new(String::new());
+static CARET_TAIL_NONEMPTY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// キャレットより右側に退避している読みが無い（＝キャレットは末尾）。
+#[inline]
+pub fn caret_tail_is_empty() -> bool {
+    !CARET_TAIL_NONEMPTY.load(std::sync::atomic::Ordering::Acquire)
+}
+
+pub fn caret_tail_get() -> String {
+    CARET_TAIL
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_else(|p| p.into_inner().clone())
+}
+
+pub fn caret_tail_set(tail: String) {
+    CARET_TAIL_NONEMPTY.store(!tail.is_empty(), std::sync::atomic::Ordering::Release);
+    match CARET_TAIL.lock() {
+        Ok(mut g) => *g = tail,
+        Err(p) => *p.into_inner() = tail,
+    }
+}
+
+pub fn caret_tail_take() -> String {
+    let tail = caret_tail_get();
+    caret_tail_set(String::new());
+    tail
+}
+
+pub fn caret_tail_clear() {
+    if !caret_tail_is_empty() {
+        caret_tail_set(String::new());
+    }
+}
+
+/// 退避している右側の読みを engine の末尾へ戻す（キャレットを末尾へ）。
+/// 未確定のローマ字はそのまま文字として確定する（`k` は `k` のまま）。
+pub fn caret_merge_into_engine(engine: &mut DynEngine) {
+    if caret_tail_is_empty() {
+        return;
+    }
+    let tail = caret_tail_take();
+    let head = engine.preedit_display();
+    tracing::debug!("caret: merge head={:?} tail={:?}", head, tail);
+    engine.force_preedit(format!("{head}{tail}"));
+}
+
+/// composition に出す文字列と、キャレット位置（UTF-16 単位。末尾なら `None`）。
+pub fn caret_display(engine: &DynEngine) -> (String, Option<i32>) {
+    let head = engine.preedit_display();
+    if caret_tail_is_empty() {
+        return (head, None);
+    }
+    let caret = head.encode_utf16().count() as i32;
+    (format!("{head}{}", caret_tail_get()), Some(caret))
+}
+
+/// 読み全体（engine の読み＋退避分）。`Preedit` 状態のテキストに使う。
+pub fn caret_full_reading(engine: &DynEngine) -> String {
+    let mut reading = engine.hiragana_text();
+    if !caret_tail_is_empty() {
+        reading.push_str(&caret_tail_get());
+    }
+    reading
+}
 
 // ─── Phase 1B キュー / SUPPRESS / LIVE_CONV_GEN / session_nonce ───────────────
 //
@@ -1355,11 +1461,22 @@ fn candidate_views_from_strings(
 impl SessionState {
     // ── BlockSelecting ──────────────────────────────────────────────────────
 
-    pub fn set_block_selecting(&mut self, blocks: Vec<ConversionBlock>, full_reading: String) {
+    pub fn set_block_selecting(
+        &mut self,
+        blocks: Vec<ConversionBlock>,
+        full_reading: String,
+        pos_x: i32,
+        pos_y: i32,
+    ) {
+        caret_tail_clear();
         *self = SessionState::BlockSelecting {
             blocks,
             current_index: 0,
             full_reading,
+            committed_prefix: String::new(),
+            committed_blocks: 0,
+            pos_x,
+            pos_y,
         };
         SESSION_SELECTING.store(true, std::sync::atomic::Ordering::Release);
     }
@@ -1383,7 +1500,20 @@ impl SessionState {
         }
     }
 
-    /// BlockSelecting: 現在ブロックの候補一覧（最大 9 件）を返す。
+    /// BlockSelecting: 候補ウィンドウに出す一覧（最大 9 件）を返す。
+    ///
+    /// 🔴 **候補を引く前（`expanded == false`）のブロックでは、その文節ではなく
+    /// composition 全体（`block_selecting_pending_text()`）を 1 件だけ返す。**
+    ///
+    /// 文節分割の直後、各ブロックは「文全体の変換結果を文字種で割った 1 件」しか
+    /// 持たない。ここで文節を出すと、Enter が composition 全体を確定するのに対して
+    /// 候補ウィンドウは先頭文節しか見せないことになり、**表示と確定される中身が
+    /// 食い違う**（実害 2026-09-01: `だいぶいいと思う、今回の男の顔のテイストは` を
+    /// Space で変換すると、窓には `だいぶいいと` の 1 件だけが出るのに Enter は
+    /// 全文を入れる）。選択肢が 1 件しかない以上この窓は「選ぶ場所」ではなく
+    /// 「確定されるものを見せる場所」なので、全文を出す。
+    ///
+    /// Space で展開したあとは本物の文節候補一覧なので、そのまま文節の候補を返す。
     pub fn block_selecting_page_candidates(&self) -> Vec<String> {
         if let SessionState::BlockSelecting {
             blocks,
@@ -1391,12 +1521,180 @@ impl SessionState {
             ..
         } = self
         {
+            if !blocks.get(*current_index).is_some_and(|b| b.expanded) {
+                return match self.block_selecting_pending_text() {
+                    Some(text) if !text.is_empty() => vec![text],
+                    _ => Vec::new(),
+                };
+            }
             blocks
                 .get(*current_index)
-                .map(|b| b.candidates.iter().take(9).cloned().collect())
+                .map(|b| {
+                    let start = (b.selected / BLOCK_PAGE_SIZE) * BLOCK_PAGE_SIZE;
+                    b.candidates
+                        .iter()
+                        .skip(start)
+                        .take(BLOCK_PAGE_SIZE)
+                        .cloned()
+                        .collect()
+                })
                 .unwrap_or_default()
         } else {
             Vec::new()
+        }
+    }
+
+    /// 文節変換の候補ウィンドウ用ページ表示（`2/3`）。1 ページに収まるなら空。
+    pub fn block_selecting_page_info(&self) -> String {
+        if let SessionState::BlockSelecting {
+            blocks,
+            current_index,
+            ..
+        } = self
+        {
+            let Some(b) = blocks.get(*current_index) else {
+                return String::new();
+            };
+            let total = b.candidates.len().div_ceil(BLOCK_PAGE_SIZE);
+            if !b.expanded || total <= 1 {
+                return String::new();
+            }
+            format!("{}/{}", b.selected / BLOCK_PAGE_SIZE + 1, total)
+        } else {
+            String::new()
+        }
+    }
+
+    /// PageDown / PageUp: 次（前）のページの先頭へ。端では反対側へ回る。
+    pub fn block_selecting_page_move(&mut self, forward: bool) {
+        if let SessionState::BlockSelecting {
+            blocks,
+            current_index,
+            ..
+        } = self
+        {
+            let Some(b) = blocks.get_mut(*current_index) else {
+                return;
+            };
+            let len = b.candidates.len();
+            if len <= BLOCK_PAGE_SIZE {
+                return;
+            }
+            let pages = len.div_ceil(BLOCK_PAGE_SIZE);
+            let page = b.selected / BLOCK_PAGE_SIZE;
+            let next = if forward {
+                (page + 1) % pages
+            } else {
+                (page + pages - 1) % pages
+            };
+            b.selected = next * BLOCK_PAGE_SIZE;
+        }
+    }
+
+    /// Home / End: 未確定の先頭（末尾）の文節へ移動する。動いたら true。
+    pub fn block_selecting_move_to_edge(&mut self, last: bool) -> bool {
+        if let SessionState::BlockSelecting {
+            blocks,
+            current_index,
+            committed_blocks,
+            ..
+        } = self
+        {
+            let target = if last {
+                blocks.iter().rposition(|b| !b.reading.is_empty())
+            } else {
+                blocks
+                    .iter()
+                    .enumerate()
+                    .skip(*committed_blocks)
+                    .find(|(_, b)| !b.reading.is_empty())
+                    .map(|(i, _)| i)
+            };
+            if let Some(t) = target {
+                if t != *current_index && t >= *committed_blocks {
+                    *current_index = t;
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Shift+← / Shift+→: 選択中の文節の右端を 1 文字動かす。
+    ///
+    /// 選択中の文節から「区読点を持つ最初のブロック」までを 1 つの組として
+    /// 扱い、組の後続ブロックは呼び出し側が再変換して差し直す
+    /// ([`Self::block_selecting_apply_resize`])。戻り値は
+    /// `(新しい文節の読み, 後続の読み, 組の末尾の区読点)`。動かせなければ `None`。
+    pub fn block_selecting_resize(&mut self, grow: bool) -> Option<(String, String, Option<char>)> {
+        if let SessionState::BlockSelecting {
+            blocks,
+            current_index,
+            ..
+        } = self
+        {
+            let idx = *current_index;
+            if idx >= blocks.len() {
+                return None;
+            }
+            let mut end = idx;
+            while end + 1 < blocks.len() && blocks[end].trailing_punct.is_none() {
+                end += 1;
+            }
+            let group_punct = blocks[end].trailing_punct;
+            let mut cur: Vec<char> = blocks[idx].reading.chars().collect();
+            let mut tail: Vec<char> = blocks[idx + 1..=end]
+                .iter()
+                .flat_map(|b| b.reading.chars())
+                .collect();
+            if grow {
+                if tail.is_empty() {
+                    return None;
+                }
+                cur.push(tail.remove(0));
+            } else {
+                if cur.len() <= 1 {
+                    return None;
+                }
+                tail.insert(0, cur.pop()?);
+            }
+            blocks.drain(idx + 1..=end);
+            let b = &mut blocks[idx];
+            b.reading = cur.iter().collect();
+            let tail_reading: String = tail.iter().collect();
+            b.trailing_punct = if tail.is_empty() { group_punct } else { None };
+            let tail_punct = if tail.is_empty() { None } else { group_punct };
+            return Some((b.reading.clone(), tail_reading, tail_punct));
+        }
+        None
+    }
+
+    /// [`Self::block_selecting_resize`] の後、再変換した候補と後続ブロックを差し直す。
+    pub fn block_selecting_apply_resize(
+        &mut self,
+        cur_candidates: Vec<String>,
+        tail_blocks: Vec<ConversionBlock>,
+    ) {
+        if let SessionState::BlockSelecting {
+            blocks,
+            current_index,
+            ..
+        } = self
+        {
+            let idx = *current_index;
+            if let Some(b) = blocks.get_mut(idx) {
+                b.candidates = if cur_candidates.is_empty() {
+                    vec![b.reading.clone()]
+                } else {
+                    cur_candidates
+                };
+                b.selected = 0;
+                b.expanded = true;
+            }
+            let at = (idx + 1).min(blocks.len());
+            for (i, tb) in tail_blocks.into_iter().enumerate() {
+                blocks.insert(at + i, tb);
+            }
         }
     }
 
@@ -1410,7 +1708,7 @@ impl SessionState {
         {
             blocks
                 .get(*current_index)
-                .map(|b| b.selected.min(8))
+                .map(|b| b.selected % BLOCK_PAGE_SIZE)
                 .unwrap_or(0)
         } else {
             0
@@ -1455,13 +1753,21 @@ impl SessionState {
 
     /// BlockSelecting: composition 表示用の (prefix, cand_text, remainder) を返す。
     ///
-    /// - `prefix`   : current_index より前のブロックのテキスト（composition に載る）
+    /// - `prefix`   : current_index より前で、**まだドキュメントへ物理コミット
+    ///   していない**ブロックのテキスト（`blocks[committed_blocks..current_index]`）
     /// - `cand_text`: 現在ブロックの選択候補
     /// - `remainder`: current_index より後のブロックのテキスト（区読点含む）+ 現在の区読点
+    ///
+    /// 🔴 `committed_blocks` より前のブロックを prefix に含めてはいけない。
+    /// Enter で確定したブロックは `commit_then_start_composition` で既にアプリへ
+    /// 書き込まれ、composition から外れている。そこを prefix として再描画すると
+    /// **確定済みテキストがアプリへ二重に入る**（実害 2026-09-01: 読点入りの文を
+    /// Enter で途中確定したあと Space で候補を回すと先頭文節がダブった）。
     pub fn block_selecting_composition_parts(&self) -> Option<(String, String, String)> {
         if let SessionState::BlockSelecting {
             blocks,
             current_index,
+            committed_blocks,
             ..
         } = self
         {
@@ -1475,8 +1781,11 @@ impl SessionState {
                     .map(|c| c.to_string())
                     .unwrap_or_default();
                 if i < *current_index {
-                    prefix.push_str(cand);
-                    prefix.push_str(&punct);
+                    // 物理コミット済みのブロックは composition の外にある
+                    if i >= *committed_blocks {
+                        prefix.push_str(cand);
+                        prefix.push_str(&punct);
+                    }
                 } else if i == *current_index {
                     cand_text = cand.to_string();
                     // 現在ブロックの区読点は remainder の先頭に
@@ -1508,6 +1817,62 @@ impl SessionState {
         }
     }
 
+    /// BlockSelecting: **まだドキュメントへ物理コミットしていない**ブロック
+    /// （`blocks[committed_blocks..]`）のテキストを返す。
+    ///
+    /// composition に載っているのはこの範囲だけなので、composition を書き換える
+    /// 経路（文字入力・記号入力での確定など）は `block_selecting_full_text()`
+    /// ではなくこちらを使う。全ブロックを書き戻すと Enter で確定済みのブロックが
+    /// アプリへ二重に入る。学習・`engine.commit()` は文全体が正しい単位なので
+    /// `block_selecting_full_text()` のままでよい。
+    pub fn block_selecting_pending_text(&self) -> Option<String> {
+        if let SessionState::BlockSelecting {
+            blocks,
+            committed_blocks,
+            ..
+        } = self
+        {
+            let mut text = String::new();
+            for block in blocks.iter().skip(*committed_blocks) {
+                text.push_str(block.current_candidate());
+                if let Some(p) = block.trailing_punct {
+                    text.push(p);
+                }
+            }
+            Some(text)
+        } else {
+            None
+        }
+    }
+
+    /// BlockSelecting: `block_selecting_pending_text()` の読み版（ESC の復元用）。
+    ///
+    /// 1 ブロックも確定していなければ `full_reading` をそのまま返す
+    /// （分割前の読みと 1 文字も違わないことを保証するため）。
+    pub fn block_selecting_pending_reading(&self) -> Option<String> {
+        if let SessionState::BlockSelecting {
+            blocks,
+            full_reading,
+            committed_blocks,
+            ..
+        } = self
+        {
+            if *committed_blocks == 0 {
+                return Some(full_reading.clone());
+            }
+            let mut reading = String::new();
+            for block in blocks.iter().skip(*committed_blocks) {
+                reading.push_str(&block.reading);
+                if let Some(p) = block.trailing_punct {
+                    reading.push(p);
+                }
+            }
+            Some(reading)
+        } else {
+            None
+        }
+    }
+
     /// BlockSelecting: 現在ブロックのインデックスと総ブロック数を返す。
     #[allow(dead_code)]
     pub fn block_selecting_index_of(&self) -> Option<(usize, usize)> {
@@ -1518,6 +1883,17 @@ impl SessionState {
         } = self
         {
             Some((*current_index, blocks.len()))
+        } else {
+            None
+        }
+    }
+
+    /// BlockSelecting: pos_x, pos_y を返す。
+    // NOTE: Enter が全ブロックまとめて確定になったため現在は未使用（文節ごとの部分確定を戻す時のために残す）。
+    #[allow(dead_code)]
+    pub fn block_selecting_pos(&self) -> Option<(i32, i32)> {
+        if let SessionState::BlockSelecting { pos_x, pos_y, .. } = self {
+            Some((*pos_x, *pos_y))
         } else {
             None
         }
@@ -1534,6 +1910,15 @@ impl SessionState {
 
     /// BlockSelecting: 現在ブロックを n 番目（1-origin）の候補に変更する。
     #[allow(dead_code)]
+    pub fn block_selecting_move_next(&mut self) -> bool {
+        self.block_selecting_move(true)
+    }
+
+    #[cfg(test)]
+    pub fn block_selecting_move_prev(&mut self) -> bool {
+        self.block_selecting_move(false)
+    }
+
     pub fn block_selecting_select_nth(&mut self, n: usize) -> bool {
         if n < 1 {
             return false;
@@ -1543,48 +1928,203 @@ impl SessionState {
             current_index,
             ..
         } = self
-            && let Some(block) = blocks.get_mut(*current_index)
         {
-            let idx = n - 1;
-            if idx < block.candidates.len() {
-                block.selected = idx;
+            if let Some(block) = blocks.get_mut(*current_index) {
+                let idx = (block.selected / BLOCK_PAGE_SIZE) * BLOCK_PAGE_SIZE + (n - 1);
+                if idx < block.candidates.len() {
+                    block.selected = idx;
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// BlockSelecting: 次のブロックへ進む（Enter 押下時）。
+    /// 最終ブロックの場合は false を返す（呼び出し元は全確定処理を行う）。
+    /// BlockSelecting: 現在ブロックの読みを返す。
+    ///
+    /// ← / → で移動したあと、エンジンのプリエディットをそのブロックの読みへ
+    /// 揃えるために使う（`set_block_selecting` の初期化と同じ状態にする）。
+    pub fn block_selecting_current_reading(&self) -> Option<String> {
+        if let SessionState::BlockSelecting {
+            blocks,
+            current_index,
+            ..
+        } = self
+        {
+            blocks.get(*current_index).map(|b| b.reading.clone())
+        } else {
+            None
+        }
+    }
+
+    /// BlockSelecting: 現在ブロックの候補一覧を引き済みか。
+    pub fn block_selecting_current_expanded(&self) -> bool {
+        if let SessionState::BlockSelecting {
+            blocks,
+            current_index,
+            ..
+        } = self
+        {
+            blocks.get(*current_index).is_some_and(|b| b.expanded)
+        } else {
+            true
+        }
+    }
+
+    /// BlockSelecting: 現在ブロックの候補一覧を差し替える（遅延展開）。
+    ///
+    /// 表示中の候補を先頭に置いたうえで `selected = 0` に戻す。こうしないと
+    /// 展開した瞬間に composition の文字が別の候補へ飛ぶ。呼び出し側は展開の
+    /// 直後に `block_selecting_next()` を呼ぶので、ユーザーから見ると
+    /// 「Space を押したら 2 番目の候補に進んだ」という自然な動きになる。
+    pub fn block_selecting_set_candidates(&mut self, candidates: Vec<String>) {
+        if let SessionState::BlockSelecting {
+            blocks,
+            current_index,
+            ..
+        } = self
+        {
+            let Some(block) = blocks.get_mut(*current_index) else {
+                return;
+            };
+            let shown = block.current_candidate().to_string();
+            let mut merged = vec![shown.clone()];
+            for c in candidates {
+                if c != shown && !merged.contains(&c) {
+                    merged.push(c);
+                }
+            }
+            block.candidates = merged;
+            block.selected = 0;
+            block.expanded = true;
+        }
+    }
+
+    /// BlockSelecting: ← / → で文節（ブロック）を移動する。確定はしない。
+    ///
+    /// `advance()` と違って:
+    /// - 逆方向へも動ける（← で選び直しに戻れる）
+    /// - 読みが空のブロック（区読点だけのブロック）は飛ばす。候補が無く、
+    ///   止まっても候補ウィンドウが空になるだけなので
+    /// - Enter で **ドキュメントへ書き込み済み** のブロックより手前へは戻さない。
+    ///   戻ると composition の prefix として再描画され、アプリ側に二重に入る
+    ///
+    /// 戻り値は実際に移動したかどうか。端では `false`（呼び出し側はキーを
+    /// 食うだけにして、アプリへ矢印キーを漏らさない）。
+    pub fn block_selecting_move(&mut self, forward: bool) -> bool {
+        if let SessionState::BlockSelecting {
+            blocks,
+            current_index,
+            committed_blocks,
+            ..
+        } = self
+        {
+            let floor = *committed_blocks;
+            let mut i = *current_index;
+            loop {
+                if forward {
+                    if i + 1 >= blocks.len() {
+                        return false;
+                    }
+                    i += 1;
+                } else {
+                    if i == 0 || i <= floor {
+                        return false;
+                    }
+                    i -= 1;
+                }
+                if blocks.get(i).is_some_and(|b| !b.reading.is_empty()) {
+                    *current_index = i;
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    // NOTE: Enter が全ブロックまとめて確定になったため現在は未使用（文節ごとの部分確定を戻す時のために残す）。
+    #[allow(dead_code)]
+    pub fn block_selecting_advance(&mut self) -> bool {
+        if let SessionState::BlockSelecting {
+            blocks,
+            current_index,
+            ..
+        } = self
+        {
+            if *current_index + 1 < blocks.len() {
+                *current_index += 1;
                 return true;
             }
         }
         false
     }
 
-    /// BlockSelecting: フォーカスを次のブロックへ移す（→ 押下時）。
-    /// 最終ブロックで呼ぶと移動せず false を返す。
-    pub fn block_selecting_move_next(&mut self) -> bool {
+    /// BlockSelecting: 未コミットのブロックから現在ブロックまで
+    /// （`blocks[committed_blocks..=current_index]`）のテキストを
+    /// `committed_prefix` に積算し、そのテキストを返す。
+    ///
+    /// Enter でブロックを1つずつ確定する際に呼ぶ。`advance()` の前に呼ぶこと。
+    ///
+    /// 🔴 現在ブロック**だけ**を返してはいけない。→ で先の文節へ移動してから
+    /// Enter を押すと、飛ばした手前の文節が composition に載ったまま
+    /// `committed_prefix` にも入らず、`end_composition` が composition 全体を
+    /// 現在ブロックだけで置き換えて**手前の文節が消える**。
+    // NOTE: Enter が全ブロックまとめて確定になったため現在は未使用（文節ごとの部分確定を戻す時のために残す）。
+    #[allow(dead_code)]
+    pub fn block_selecting_commit_current(&mut self) -> Option<String> {
         if let SessionState::BlockSelecting {
             blocks,
             current_index,
+            committed_prefix,
+            committed_blocks,
             ..
         } = self
-            && *current_index + 1 < blocks.len()
         {
-            *current_index += 1;
-            return true;
+            if *current_index >= blocks.len() {
+                return None;
+            }
+            let mut text = String::new();
+            for block in blocks
+                .iter()
+                .take(*current_index + 1)
+                .skip(*committed_blocks)
+            {
+                text.push_str(block.current_candidate());
+                if let Some(p) = block.trailing_punct {
+                    text.push(p);
+                }
+            }
+            committed_prefix.push_str(&text);
+            *committed_blocks = (*current_index + 1).max(*committed_blocks);
+            Some(text)
+        } else {
+            None
         }
-        false
     }
 
-    /// BlockSelecting: フォーカスを前のブロックへ移す（← 押下時）。
-    /// 先頭ブロックで呼ぶと移動せず false を返す。
-    pub fn block_selecting_move_prev(&mut self) -> bool {
-        if let SessionState::BlockSelecting { current_index, .. } = self
-            && *current_index > 0
+    /// BlockSelecting: 積算済みコミット済みテキスト（`committed_prefix`）を返す。
+    ///
+    /// 最終ブロック確定時に `block_selecting_commit_current()` を呼んだ後に参照すると
+    /// 全ブロックのテキストが得られる（学習・engine.commit 用）。
+    // NOTE: Enter が全ブロックまとめて確定になったため現在は未使用（文節ごとの部分確定を戻す時のために残す）。
+    #[allow(dead_code)]
+    pub fn block_selecting_accumulated_text(&self) -> Option<String> {
+        if let SessionState::BlockSelecting {
+            committed_prefix, ..
+        } = self
         {
-            *current_index -= 1;
-            return true;
+            Some(committed_prefix.clone())
+        } else {
+            None
         }
-        false
     }
 
     // ── 共通 ────────────────────────────────────────────────────────────────
 
     pub fn set_idle(&mut self) {
+        caret_tail_clear();
         *self = SessionState::Idle;
         SESSION_SELECTING.store(false, std::sync::atomic::Ordering::Release);
     }
@@ -1616,6 +2156,7 @@ impl SessionState {
     /// preview + かな接尾辞）、`preview_for` = その preview を生成した reading。
     /// preview が reading 全体に対応する場合は `preview_for == reading` を渡す。
     pub fn set_live_conv(&mut self, reading: String, preview: String, preview_for: String) {
+        caret_tail_clear();
         *self = SessionState::LiveConv {
             reading,
             preview,
@@ -1641,6 +2182,16 @@ impl SessionState {
     }
 
     /// LiveConv の preview を生成した reading（`preview_for`）を返す。
+    pub fn live_conv_converted_len(&self) -> Option<usize> {
+        self.live_conv_parts().map(|(reading, preview)| {
+            if reading == preview {
+                0
+            } else {
+                self.live_conv_preview_for().unwrap_or("").chars().count()
+            }
+        })
+    }
+
     pub fn live_conv_preview_for(&self) -> Option<&str> {
         if let SessionState::LiveConv { preview_for, .. } = self {
             Some(preview_for.as_str())
@@ -1655,6 +2206,7 @@ impl SessionState {
         select_end: usize,
         original_preview: String,
     ) {
+        caret_tail_clear();
         *self = SessionState::RangeSelect {
             full_reading,
             select_end,
@@ -1769,6 +2321,7 @@ impl SessionState {
         remainder: String,
         remainder_reading: String,
     ) {
+        caret_tail_clear();
         *self = SessionState::Waiting {
             text,
             pos_x,
@@ -1798,6 +2351,7 @@ impl SessionState {
             &remainder,
             CandidateViewSource::Bg,
         );
+        caret_tail_clear();
         *self = SessionState::Selecting {
             original_preedit,
             candidates,
@@ -2055,6 +2609,8 @@ impl SessionState {
         }
     }
 
+    /// 候補選択中に、先頭以外の候補を選んでいるか（＝ユーザーの明示的な選択）。
+
     pub fn page_selected(&self) -> usize {
         match self {
             SessionState::Selecting {
@@ -2175,6 +2731,36 @@ impl SessionState {
                 }
             }
             _ => false,
+        }
+    }
+
+    /// 選択中の候補を候補リストから取り除く（学習履歴の削除に伴う UI 更新用）。
+    ///
+    /// 戻り値: 取り除いた候補テキスト。`Selecting` 以外、または候補が空なら `None`。
+    /// 取り除いた結果 `selected` が末尾を超える場合は末尾に寄せる。
+    pub fn remove_current_candidate(&mut self) -> Option<String> {
+        if let SessionState::Selecting {
+            candidates,
+            candidate_views,
+            selected,
+            ..
+        } = self
+        {
+            if *selected >= candidate_views.len() {
+                return None;
+            }
+            let removed = candidate_views.remove(*selected).text;
+            if *selected < candidates.len() {
+                candidates.remove(*selected);
+            }
+            if candidate_views.is_empty() {
+                *selected = 0;
+            } else if *selected >= candidate_views.len() {
+                *selected = candidate_views.len() - 1;
+            }
+            Some(removed)
+        } else {
+            None
         }
     }
 
@@ -2587,6 +3173,7 @@ mod tests {
             trailing_punct: punct,
             candidates: vec![candidate.to_string()],
             selected: 0,
+            expanded: true,
         }
     }
 
@@ -2598,6 +3185,8 @@ mod tests {
                 conv_block("さいごまで", "最後まで", None),
             ],
             "いちどにできるときと、さいごまで".to_string(),
+            0,
+            0,
         );
         sess
     }
@@ -2644,6 +3233,131 @@ mod tests {
         // composition の表示（prefix + cand + remainder）とも一致する
         let (prefix, cand, remainder) = sess.block_selecting_composition_parts().unwrap();
         assert_eq!(Some(format!("{prefix}{cand}{remainder}")), expected);
+    }
+
+
+
+
+    fn block(reading: &str, surface: &str, punct: Option<char>) -> ConversionBlock {
+        ConversionBlock {
+            reading: reading.to_string(),
+            trailing_punct: punct,
+            candidates: vec![surface.to_string()],
+            selected: 0,
+            expanded: false,
+        }
+    }
+
+    fn block_session(blocks: Vec<ConversionBlock>) -> SessionState {
+        let reading: String = blocks
+            .iter()
+            .map(|b| {
+                let mut r = b.reading.clone();
+                if let Some(p) = b.trailing_punct {
+                    r.push(p);
+                }
+                r
+            })
+            .collect();
+        let mut s = SessionState::Idle;
+        s.set_block_selecting(blocks, reading, 0, 0);
+        s
+    }
+
+
+    #[test]
+    fn block_resize_shrink_moves_char_to_tail_and_keeps_group_punct() {
+        // 今日は / 晴れ。 / 明日
+        let mut s = block_session(vec![
+            block("きょうは", "今日は", None),
+            block("はれ", "晴れ", Some('。')),
+            block("あした", "明日", None),
+        ]);
+        let (cur, tail, punct) = s.block_selecting_resize(false).unwrap();
+        assert_eq!(cur, "きょう");
+        assert_eq!(tail, "ははれ");
+        assert_eq!(punct, Some('。'));
+        // 後続の組（はれ。）は取り除かれ、あした は残る
+        if let SessionState::BlockSelecting { blocks, .. } = &s {
+            assert_eq!(blocks.len(), 2);
+            assert_eq!(blocks[0].reading, "きょう");
+            assert_eq!(blocks[0].trailing_punct, None);
+            assert_eq!(blocks[1].reading, "あした");
+        } else {
+            panic!("not block selecting");
+        }
+        s.block_selecting_apply_resize(
+            vec!["今日".into(), "京".into()],
+            vec![block("は", "は", None), block("はれ", "晴れ", Some('。'))],
+        );
+        assert_eq!(s.block_selecting_full_text().unwrap(), "今日は晴れ。明日");
+        assert_eq!(s.block_selecting_current_candidate(), Some("今日"));
+        assert!(s.block_selecting_current_expanded());
+    }
+
+    #[test]
+    fn block_resize_grow_takes_char_from_next_and_absorbs_punct_when_tail_empty() {
+        let mut s = block_session(vec![
+            block("きょう", "今日", None),
+            block("は", "は", Some('、')),
+            block("あした", "明日", None),
+        ]);
+        let (cur, tail, punct) = s.block_selecting_resize(true).unwrap();
+        assert_eq!(cur, "きょうは");
+        assert_eq!(tail, "");
+        assert_eq!(punct, None);
+        if let SessionState::BlockSelecting { blocks, .. } = &s {
+            // 区読点は現在の文節に移る
+            assert_eq!(blocks[0].trailing_punct, Some('、'));
+            assert_eq!(blocks.len(), 2);
+        }
+        // 端では動かない
+        let mut last = block_session(vec![block("あ", "あ", None)]);
+        assert!(last.block_selecting_resize(true).is_none());
+        assert!(last.block_selecting_resize(false).is_none());
+    }
+
+    #[test]
+    fn block_candidate_paging_and_nth_select() {
+        let mut s = block_session(vec![block("あ", "亜", None)]);
+        let cands: Vec<String> = (0..20).map(|i| format!("c{i}")).collect();
+        s.block_selecting_set_candidates(cands);
+        // 表示中の「亜」が先頭に残り、以降 c0.. が続く（21 件 = 3 ページ）
+        assert_eq!(s.block_selecting_page_candidates().len(), BLOCK_PAGE_SIZE);
+        assert_eq!(s.block_selecting_page_info(), "1/3");
+        s.block_selecting_page_move(true);
+        assert_eq!(s.block_selecting_page_info(), "2/3");
+        assert_eq!(s.block_selecting_page_selected(), 0);
+        assert_eq!(s.block_selecting_page_candidates()[0], "c8");
+        assert!(s.block_selecting_select_nth(3));
+        assert_eq!(s.block_selecting_current_candidate(), Some("c10"));
+        assert_eq!(s.block_selecting_page_selected(), 2);
+        s.block_selecting_page_move(true);
+        s.block_selecting_page_move(true);
+        assert_eq!(s.block_selecting_page_info(), "1/3");
+        s.block_selecting_page_move(false);
+        assert_eq!(s.block_selecting_page_info(), "3/3");
+        assert_eq!(s.block_selecting_page_candidates().len(), 3);
+        assert!(!s.block_selecting_select_nth(5));
+    }
+
+    #[test]
+    fn block_move_to_edge_respects_committed_blocks() {
+        let mut s = block_session(vec![
+            block("あ", "亜", None),
+            block("い", "以", None),
+            block("う", "宇", None),
+        ]);
+        assert!(s.block_selecting_move_to_edge(true));
+        assert_eq!(s.block_selecting_current_reading().as_deref(), Some("う"));
+        assert!(s.block_selecting_move_to_edge(false));
+        assert_eq!(s.block_selecting_current_reading().as_deref(), Some("あ"));
+        assert!(!s.block_selecting_move_to_edge(false));
+        // 先頭を確定した後は Home で確定済みブロックへ戻らない
+        s.block_selecting_commit_current();
+        s.block_selecting_move_to_edge(true);
+        assert!(s.block_selecting_move_to_edge(false));
+        assert_eq!(s.block_selecting_current_reading().as_deref(), Some("い"));
     }
 
     #[test]
@@ -2872,5 +3586,73 @@ mod tests {
 
         assert_eq!(state.current_candidate(), Some("更新1"));
         assert_eq!(state.page_selected(), 0);
+    }
+
+    fn block_selecting_sample() -> SessionState {
+        // `だいぶいいとおもう、こんかいのおとこ` を Space で変換し、文全体の
+        // 変換結果を文字種で文節に割った直後の状態（どの文節もまだ未展開）。
+        let mut state = SessionState::Idle;
+        state.set_block_selecting(
+            vec![
+                ConversionBlock {
+                    reading: "だいぶいいと".into(),
+                    trailing_punct: None,
+                    candidates: vec!["だいぶいいと".into()],
+                    selected: 0,
+                    expanded: false,
+                },
+                ConversionBlock {
+                    reading: "おもう".into(),
+                    trailing_punct: Some('、'),
+                    candidates: vec!["思う".into()],
+                    selected: 0,
+                    expanded: false,
+                },
+                ConversionBlock {
+                    reading: "こんかいのおとこ".into(),
+                    trailing_punct: None,
+                    candidates: vec!["今回の男".into()],
+                    selected: 0,
+                    expanded: false,
+                },
+            ],
+            "だいぶいいとおもう、こんかいのおとこ".into(),
+            0,
+            0,
+        );
+        state
+    }
+
+    #[test]
+    fn block_selecting_shows_full_text_before_expansion() {
+        // Enter は composition 全体を確定するので、選択肢が無いうちの候補ウィンドウは
+        // 先頭文節ではなく確定される全文を見せる。
+        let state = block_selecting_sample();
+        assert_eq!(
+            state.block_selecting_page_candidates(),
+            vec!["だいぶいいと思う、今回の男".to_string()]
+        );
+        assert_eq!(state.block_selecting_page_selected(), 0);
+    }
+
+    #[test]
+    fn block_selecting_shows_clause_candidates_after_expansion() {
+        // Space で展開したら本物の文節候補一覧になる。
+        let mut state = block_selecting_sample();
+        state.block_selecting_set_candidates(vec!["だいぶいいと".into(), "大分良いと".into()]);
+        assert_eq!(
+            state.block_selecting_page_candidates(),
+            vec!["だいぶいいと".to_string(), "大分良いと".to_string()]
+        );
+    }
+
+    #[test]
+    fn block_selecting_full_text_stays_untouched_by_display_rule() {
+        // 表示だけの変更であること（確定に使う全文は文節のままであること）の担保。
+        let state = block_selecting_sample();
+        assert_eq!(
+            state.block_selecting_full_text().as_deref(),
+            Some("だいぶいいと思う、今回の男")
+        );
     }
 }

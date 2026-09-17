@@ -16,7 +16,7 @@ use crate::tsf::candidate_window;
 
 use super::{
     commit_text, commit_then_start_composition, end_composition, loading_indicator_symbol,
-    update_composition,
+    update_composition, update_composition_at,
 };
 
 /// LiveConv 中の追加入力で表示する文字列を決める。
@@ -199,6 +199,9 @@ impl super::TextServiceFactory_Impl {
             if sess.is_block_selecting() {
                 let full_text = sess.block_selecting_full_text().unwrap_or_default();
                 let full_reading = sess.block_selecting_full_reading().unwrap_or_default();
+                // ドキュメントへ書き戻すのは composition に載っている範囲だけ
+                // （Enter で確定済みのブロックは既にアプリ側にある）。
+                let pending_text = sess.block_selecting_pending_text().unwrap_or_default();
                 sess.set_idle();
                 drop(sess);
                 candidate_window::hide();
@@ -206,7 +209,7 @@ impl super::TextServiceFactory_Impl {
                     && full_text != full_reading
                     && !full_reading.is_empty()
                 {
-                    engine.learn(&full_reading, &full_text);
+                    engine.learn_force(&full_reading, &full_text);
                 }
                 engine.commit(&full_text);
                 engine.reset_preedit();
@@ -233,7 +236,7 @@ impl super::TextServiceFactory_Impl {
                 }
                 // 確定テキスト + 新規入力プリエディットを表示
                 use super::commit_then_start_composition;
-                commit_then_start_composition(ctx, tid, sink, full_text, preedit2)?;
+                commit_then_start_composition(ctx, tid, sink, pending_text, preedit2)?;
                 return Ok(true);
             }
             if sess.is_selecting() {
@@ -326,21 +329,34 @@ impl super::TextServiceFactory_Impl {
 
         // Cancel 後に残る Preedit 状態のテキストを実際の読みに追随させる
         // （放置すると確定経路が前の読みを使う）。
+        let full_reading = crate::engine::state::caret_full_reading(engine);
         if let Ok(mut sess) = session_get() {
-            sess.sync_preedit_reading(&hiragana);
+            sess.sync_preedit_reading(&full_reading);
+        }
+
+        if !crate::engine::state::caret_tail_is_empty() {
+            // キャレット編集中: 右側の読みを付けて表示し、ライブ変換と予測は止める
+            let (display, caret) = crate::engine::state::caret_display(engine);
+            drop(guard);
+            crate::tsf::suggestion::clear();
+            update_composition_at(ctx, tid, sink, display, caret)?;
+            return Ok(true);
         }
 
         if !hiragana.is_empty() {
             let live_ready = crate::engine::state::start_live_bg_if_ready(engine, &hiragana);
+            let suggestions = crate::tsf::suggestion::fetch(engine, &hiragana);
             drop(guard);
             // [Phase0] ライブ変換実験: コンテキストをキャッシュしてタイマーを起動
             if live_ready {
                 candidate_window::live_input_notify(&ctx, tid);
             }
             update_composition(ctx, tid, sink, preedit)?;
+            crate::tsf::suggestion::show(&hiragana, suggestions);
             return Ok(true);
         }
         drop(guard);
+        crate::tsf::suggestion::clear();
         update_composition(ctx, tid, sink, preedit)?;
         Ok(true)
     }
@@ -409,12 +425,14 @@ impl super::TextServiceFactory_Impl {
                 };
                 sess.set_live_conv(new_reading.clone(), display.clone(), next_preview_for);
                 let live_ready = crate::engine::state::start_live_bg_if_ready(engine, &new_reading);
+                let suggestions = crate::tsf::suggestion::fetch(engine, &new_reading);
                 drop(sess);
                 drop(guard);
                 if live_ready {
                     candidate_window::live_input_notify(&ctx, tid);
                 }
                 update_composition(ctx, tid, sink, display_shown)?;
+                crate::tsf::suggestion::show(&new_reading, suggestions);
                 return Ok(true);
             }
         }
@@ -479,6 +497,18 @@ impl super::TextServiceFactory_Impl {
             }
         }
         engine.push_raw(c);
+        if !crate::engine::state::caret_tail_is_empty() {
+            // キャレット編集中: 右側の読みを付けて表示し、ライブ変換と予測は止める
+            let full_reading = crate::engine::state::caret_full_reading(engine);
+            if let Ok(mut sess) = session_get() {
+                sess.sync_preedit_reading(&full_reading);
+            }
+            let (display, caret) = crate::engine::state::caret_display(engine);
+            drop(guard);
+            crate::tsf::suggestion::clear();
+            update_composition_at(ctx, tid, sink, display, caret)?;
+            return Ok(true);
+        }
         let preedit = engine.preedit_display();
         // ライブプレビュー用の prefetch は、3文字以上になった場合だけ開始する。
         // Space 押下時は on_convert 内で bg_reclaim + bg_start(num_candidates) により
@@ -489,11 +519,14 @@ impl super::TextServiceFactory_Impl {
             sess.sync_preedit_reading(&reading);
         }
         let live_ready = crate::engine::state::start_live_bg_if_ready(engine, &reading);
+        let suggestions = crate::tsf::suggestion::fetch(engine, &reading);
+        let reading_owned = reading.to_string();
         if live_ready {
             candidate_window::live_input_notify(&ctx, tid);
         }
         drop(guard);
         update_composition(ctx, tid, sink, preedit)?;
+        crate::tsf::suggestion::show(&reading_owned, suggestions);
         Ok(true)
     }
 

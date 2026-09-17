@@ -160,7 +160,11 @@ fn is_learnable_without_dict(c: char) -> bool {
 
 struct DictStoreInner {
     /// ユーザー辞書（手動登録のみ）。Phase 2b 以降は `learn()` で更新しない。
+    /// `priority = "normal"`（既定）のエントリだけを保持する。
     user: RwLock<HashMap<String, Vec<String>>>,
+    /// ユーザー辞書のうち `priority = "low"` のエントリ。
+    /// 学習履歴の後ろ・システム辞書の前に差し込む。
+    user_low: RwLock<HashMap<String, Vec<String>>>,
     /// ユーザー辞書ファイル。設定画面や外部エディタで編集された場合の
     /// hot reload 判定に使う。
     user_path: Option<PathBuf>,
@@ -213,16 +217,16 @@ impl DictStore {
     ) -> Result<Self> {
         let user_file_state = user_path.map(user_dict_file_state).unwrap_or_default();
         // ユーザー辞書: 失敗しても空で続行（パスエラー・パースエラー問わず）
-        let user = if let Some(p) = user_path {
+        let (user, user_low) = if let Some(p) = user_path {
             match UserDict::load(p) {
-                Ok(ud) => ud.to_map(),
+                Ok(ud) => ud.to_maps(),
                 Err(e) => {
                     warn!("user_dict load failed ({}): {}", p.display(), e);
-                    HashMap::new()
+                    (HashMap::new(), HashMap::new())
                 }
             }
         } else {
-            HashMap::new()
+            (HashMap::new(), HashMap::new())
         };
 
         // mozc辞書: 失敗しても None で続行
@@ -290,6 +294,7 @@ impl DictStore {
         Ok(Self {
             inner: Arc::new(DictStoreInner {
                 user: RwLock::new(user),
+                user_low: RwLock::new(user_low),
                 user_path: user_path.map(|p| p.to_path_buf()),
                 user_file_state: RwLock::new(user_file_state),
                 mozc,
@@ -303,6 +308,7 @@ impl DictStore {
         Self {
             inner: Arc::new(DictStoreInner {
                 user: RwLock::new(HashMap::new()),
+                user_low: RwLock::new(HashMap::new()),
                 user_path: None,
                 user_file_state: RwLock::new(UserDictFileState::default()),
                 mozc: None,
@@ -328,8 +334,8 @@ impl DictStore {
             return false;
         }
 
-        let loaded = match UserDict::load(path) {
-            Ok(ud) => ud.to_map(),
+        let (loaded, loaded_low) = match UserDict::load(path) {
+            Ok(ud) => ud.to_maps(),
             Err(e) => {
                 warn!(
                     "user_dict hot reload failed ({}): {}; keeping previous entries",
@@ -342,11 +348,17 @@ impl DictStore {
                 return false;
             }
         };
-        let count = loaded.len();
+        let count = loaded.len() + loaded_low.len();
         if let Ok(mut user) = self.inner.user.write() {
             *user = loaded;
         } else {
             warn!("user_dict hot reload failed: user lock poisoned");
+            return false;
+        }
+        if let Ok(mut user_low) = self.inner.user_low.write() {
+            *user_low = loaded_low;
+        } else {
+            warn!("user_dict hot reload failed: user_low lock poisoned");
             return false;
         }
         if let Ok(mut state) = self.inner.user_file_state.write() {
@@ -477,12 +489,178 @@ impl DictStore {
             return vec![];
         };
         let now = now_unix_secs();
-        let mut scored: Vec<(f64, String)> = entries
+        // 同じ読みの候補順は「最後に確定した表記が先頭」（MS-IME / Google 日本語
+        // 入力と同じ）。頻度は同時刻のタイブレークにだけ使う。頻度優先だと、
+        // ライブ変換の preview を Enter で流すたびに望まない表記が積み上がり、
+        // 候補から選び直しても何回も繰り返さないと先頭に来ない（実害:
+        // 「やった」→「ヤッタ」が freq 3 で居座り、ひらがなを選んでも覆らなかった）。
+        let mut scored: Vec<(u64, f64, String)> = entries
             .iter()
-            .map(|e| (e.score(now), e.surface.clone()))
+            .map(|e| (e.last_access_time, e.score(now), e.surface.clone()))
             .collect();
+        scored.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+        });
+        scored.into_iter().map(|(_, _, s)| s).collect()
+    }
+
+    /// 学習履歴から `prefix` で**始まる（かつ prefix より長い）**読みのエントリを
+    /// score 降順で返す。Google 日本語入力の「短文予測」に相当する。
+    ///
+    /// 例: 「かんたんなことばでぶんせき → 簡単な言葉で分析」を確定済みなら、
+    /// `prefix = "かんたん"` で `["簡単な言葉で分析"]` が返る。
+    ///
+    /// `prefix` と完全一致するキーは `lookup_learn` の担当なのでここでは除外する。
+    /// 走査は `learn_history` の全キー（上限 `LEARN_LRU_CAPACITY` = 30,000）に対する
+    /// 前方一致比較のみで、1 打鍵あたり数百 µs 程度に収まる。
+    pub fn lookup_learn_prefix(&self, prefix: &str, limit: usize) -> Vec<String> {
+        self.lookup_learn_prefix_keyed(prefix, limit)
+            .into_iter()
+            .map(|(_, s)| s)
+            .collect()
+    }
+
+    /// `lookup_learn_prefix` の「どのキーから出たか」つき版。
+    ///
+    /// 予測候補は**現在の読みより長いキー**に紐づいているので、それを確定した時に
+    /// 現在の読みで学習し直すと「読みに無い文字を含む表記」が完全一致エントリとして
+    /// 焼き付く（実害 2026-09-01: `せいふくのさわりかた → 制服のさわりかたの`。
+    /// 学習履歴はマージ順 2 番なので、以後その読みを打つたび最優先で出続ける）。
+    /// 呼び出し側が元のキーへ学習を振り直せるようにキーを返す。
+    pub fn lookup_learn_prefix_keyed(&self, prefix: &str, limit: usize) -> Vec<(String, String)> {
+        if prefix.is_empty() || limit == 0 {
+            return vec![];
+        }
+        let Ok(hist) = self.inner.learn_history.read() else {
+            return vec![];
+        };
+        let now = now_unix_secs();
+        let mut scored: Vec<(f64, String, String)> = Vec::new();
+        for (reading, entries) in hist.iter() {
+            if reading.len() <= prefix.len() || !reading.starts_with(prefix) {
+                continue;
+            }
+            for e in entries {
+                scored.push((e.score(now), reading.clone(), e.surface.clone()));
+            }
+        }
         scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        scored.into_iter().map(|(_, s)| s).collect()
+        let mut out: Vec<(String, String)> = Vec::new();
+        for (_, key, s) in scored {
+            if out.len() >= limit {
+                break;
+            }
+            if !out.iter().any(|(_, existing)| existing == &s) {
+                out.push((key, s));
+            }
+        }
+        out
+    }
+
+    /// 入力中の予測ウィンドウ用。`prefix` に前方一致する読み（**完全一致を含む**）の
+    /// 学習エントリを score 降順で返す。
+    ///
+    /// `lookup_learn_prefix` との違いは完全一致キーを含めること。Google 日本語入力の
+    /// 予測候補は「かんたん → 簡単 / 簡単な言葉で分析」のように、素の変換と長い
+    /// フレーズを同じリストに並べるため。
+    pub fn lookup_learn_suggest(&self, prefix: &str, limit: usize) -> Vec<String> {
+        self.lookup_learn_suggest_keyed(prefix, limit)
+            .into_iter()
+            .map(|(_, s)| s)
+            .collect()
+    }
+
+    /// `lookup_learn_suggest` の「どのキーから出たか」つき版
+    /// （理由は `lookup_learn_prefix_keyed` を参照）。完全一致キーも含むので、
+    /// 呼び出し側は `key == prefix` を「読みどおり」として扱ってよい。
+    pub fn lookup_learn_suggest_keyed(&self, prefix: &str, limit: usize) -> Vec<(String, String)> {
+        if prefix.is_empty() || limit == 0 {
+            return vec![];
+        }
+        let Ok(hist) = self.inner.learn_history.read() else {
+            return vec![];
+        };
+        let now = now_unix_secs();
+        let mut scored: Vec<(f64, String, String)> = Vec::new();
+        for (reading, entries) in hist.iter() {
+            if !reading.starts_with(prefix) {
+                continue;
+            }
+            for e in entries {
+                scored.push((e.score(now), reading.clone(), e.surface.clone()));
+            }
+        }
+        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        let mut out: Vec<(String, String)> = Vec::new();
+        for (_, key, s) in scored {
+            if out.len() >= limit {
+                break;
+            }
+            if !out.iter().any(|(_, existing)| existing == &s) {
+                out.push((key, s));
+            }
+        }
+        out
+    }
+
+    /// 学習履歴の全エントリ (reading, surface) を返す（棚卸し・掃除ツール用）。
+    pub fn learn_entries_snapshot(&self) -> Vec<(String, String)> {
+        let Ok(hist) = self.inner.learn_history.read() else {
+            return vec![];
+        };
+        let mut out: Vec<(String, String)> = Vec::new();
+        for (reading, entries) in hist.iter() {
+            for e in entries {
+                out.push((reading.clone(), e.surface.clone()));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// `reading_prefix` に前方一致する読み（完全一致を含む）に紐づく `surface` の
+    /// 学習エントリをまとめて削除する。戻り値は削除件数。
+    ///
+    /// 候補ウィンドウからの明示削除（Ctrl+Delete）用。短文予測で出てきた候補は
+    /// 「現在の読み」と「登録キー」が一致しない（`かんたん` で `かんたんな…` の
+    /// エントリが出る）ため、候補ごとの出自を持ち回らずに前方一致で消す。
+    pub fn forget_matching(&self, reading_prefix: &str, surface: &str) -> usize {
+        if reading_prefix.is_empty() || surface.is_empty() {
+            return 0;
+        }
+        let (removed, snapshot) = {
+            let Ok(mut hist) = self.inner.learn_history.write() else {
+                warn!("learn_history write lock failed in forget_matching");
+                return 0;
+            };
+            let mut removed = 0usize;
+            for (reading, entries) in hist.iter_mut() {
+                if !reading.starts_with(reading_prefix) {
+                    continue;
+                }
+                let before = entries.len();
+                entries.retain(|e| e.surface != surface);
+                removed += before - entries.len();
+            }
+            if removed > 0 {
+                hist.retain(|_, entries| !entries.is_empty());
+                (removed, Some(hist.clone()))
+            } else {
+                (0, None)
+            }
+        };
+
+        if let (Some(snapshot), Some(path)) = (snapshot, &self.inner.learn_history_path) {
+            info!(
+                "dict::store: forget_matching prefix={:?} surface={:?} removed={}",
+                reading_prefix, surface, removed
+            );
+            if let Err(e) = save_learn_history_file(path, &snapshot) {
+                warn!("learn_history save failed after forget_matching: {e}");
+            }
+        }
+        removed
     }
 
     /// `(reading, surface)` が MOZC 辞書またはユーザー辞書に存在するかを判定する。
@@ -512,13 +690,25 @@ impl DictStore {
         !surface.is_empty() && surface.chars().all(is_learnable_without_dict)
     }
 
-    /// ひらがな読みからユーザー辞書候補のみを返す（merge_candidates 用）
+    /// ひらがな読みからユーザー辞書候補（`priority = "normal"`）のみを返す
+    /// （merge_candidates 用）
     pub fn lookup_user(&self, reading: &str) -> Vec<String> {
         self.reload_user_if_changed();
         let Ok(user) = self.inner.user.read() else {
             return vec![];
         };
         user.get(reading).cloned().unwrap_or_default()
+    }
+
+    /// ひらがな読みから低優先ユーザー辞書候補（`priority = "low"`）を返す。
+    ///
+    /// `lookup_user` と違い、学習履歴より後ろに差し込むことを想定している。
+    pub fn lookup_user_low(&self, reading: &str) -> Vec<String> {
+        self.reload_user_if_changed();
+        let Ok(user_low) = self.inner.user_low.read() else {
+            return vec![];
+        };
+        user_low.get(reading).cloned().unwrap_or_default()
     }
 
     /// ひらがな読みから mozc の通常語候補を返す（ユーザー辞書・記号・絵文字を除く。
@@ -629,8 +819,11 @@ impl DictStore {
     pub fn is_mozc_loaded(&self) -> bool {
         self.inner.mozc.is_some()
     }
+    /// ユーザー辞書の読み数を返す（normal + low、テスト/診断用）
     pub fn user_entry_count(&self) -> usize {
-        self.inner.user.read().map(|u| u.len()).unwrap_or(0)
+        let normal = self.inner.user.read().map(|u| u.len()).unwrap_or(0);
+        let low = self.inner.user_low.read().map(|u| u.len()).unwrap_or(0);
+        normal + low
     }
 
     /// 学習履歴の合計エントリ数を返す（テスト/診断用）
@@ -794,6 +987,7 @@ mod tests {
         DictStore {
             inner: Arc::new(DictStoreInner {
                 user: RwLock::new(user_map),
+                user_low: RwLock::new(HashMap::new()),
                 user_path: None,
                 user_file_state: RwLock::new(UserDictFileState::default()),
                 mozc: None,
@@ -847,6 +1041,62 @@ mod tests {
     }
 
     #[test]
+    fn test_lookup_user_low_is_separated_from_normal() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_path = dir.path().join("user_dict.toml");
+        std::fs::write(
+            &user_path,
+            r#"
+[[entries]]
+reading = "りんぜ"
+surfaces = ["凛世"]
+
+[[entries]]
+reading = "みどり"
+surfaces = ["ミドリ"]
+priority = "low"
+"#,
+        )
+        .unwrap();
+
+        let store = DictStore::load(Some(&user_path), None, None).unwrap();
+
+        assert_eq!(store.lookup_user("りんぜ"), vec!["凛世"]);
+        assert!(store.lookup_user("みどり").is_empty());
+
+        assert_eq!(store.lookup_user_low("みどり"), vec!["ミドリ"]);
+        assert!(store.lookup_user_low("りんぜ").is_empty());
+
+        // normal + low の読み数を数える
+        assert_eq!(store.user_entry_count(), 2);
+    }
+
+    #[test]
+    fn test_user_dict_hot_reload_picks_up_priority_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_path = dir.path().join("user_dict.toml");
+        std::fs::write(
+            &user_path,
+            "[[entries]]\nreading = \"みどり\"\nsurfaces = [\"ミドリ\"]\n",
+        )
+        .unwrap();
+
+        let store = DictStore::load(Some(&user_path), None, None).unwrap();
+        assert_eq!(store.lookup_user("みどり"), vec!["ミドリ"]);
+        assert!(store.lookup_user_low("みどり").is_empty());
+
+        // mtime だけでは変化を拾えない環境があるのでサイズも変わる内容にする
+        std::fs::write(
+            &user_path,
+            "[[entries]]\nreading = \"みどり\"\nsurfaces = [\"ミドリ\"]\npriority = \"low\"\n",
+        )
+        .unwrap();
+
+        assert!(store.lookup_user("みどり").is_empty());
+        assert_eq!(store.lookup_user_low("みどり"), vec!["ミドリ"]);
+    }
+
+    #[test]
     fn test_user_dict_hot_reload_on_lookup() {
         let dir = tempfile::tempdir().unwrap();
         let user_path = dir.path().join("user_dict.toml");
@@ -895,6 +1145,27 @@ mod tests {
         assert_eq!(learned.len(), 2);
         assert!(learned.contains(&"表記A".to_string()));
         assert!(learned.contains(&"表記B".to_string()));
+    }
+
+    #[test]
+    fn test_learn_history_recent_choice_wins_over_freq() {
+        // 頻度が高い表記より、後から確定した表記が先頭（最後に選んだものが勝つ）。
+        let store = make_store(&[("よみ", vec!["表記A", "表記B"])]);
+        store.learn("よみ", "表記A");
+        store.learn("よみ", "表記A");
+        store.learn("よみ", "表記A"); // freq = 3
+        store.learn("よみ", "表記B"); // freq = 1、ただし後で確定
+        {
+            let mut hist = store.inner.learn_history.write().unwrap();
+            let entries = hist.get_mut("よみ").unwrap();
+            let now = now_unix_secs();
+            for e in entries.iter_mut() {
+                e.last_access_time = if e.surface == "表記B" { now } else { now - 60 };
+            }
+        }
+        let learned = store.lookup_learn("よみ");
+        assert_eq!(learned[0], "表記B", "最後に確定した表記が先頭");
+        assert_eq!(learned[1], "表記A");
     }
 
     #[test]
@@ -1676,6 +1947,112 @@ mod tests {
         let removed = store.forget("にほんご", "日本語");
         assert!(removed);
         assert!(store.lookup_learn("にほんご").is_empty());
+    }
+
+    #[test]
+    fn test_lookup_learn_prefix_returns_longer_readings() {
+        let store = make_store(&[
+            ("かんたん", vec!["簡単"]),
+            ("かんたんなことばでぶんせき", vec!["簡単な言葉で分析"]),
+            ("かんぜん", vec!["完全"]),
+        ]);
+        store.learn("かんたん", "簡単");
+        store.learn("かんたんなことばでぶんせき", "簡単な言葉で分析");
+        store.learn("かんぜん", "完全");
+
+        let pred = store.lookup_learn_prefix("かんたん", 5);
+        // 前方一致で「より長い読み」だけが返る。完全一致（簡単）と別読み（完全）は出ない。
+        assert_eq!(pred, vec!["簡単な言葉で分析"]);
+
+        // 完全一致しかない読みでは空
+        assert!(store.lookup_learn_prefix("かんぜん", 5).is_empty());
+        // 空文字・limit 0 は空
+        assert!(store.lookup_learn_prefix("", 5).is_empty());
+        assert!(store.lookup_learn_prefix("かんたん", 0).is_empty());
+    }
+
+    #[test]
+    fn test_lookup_learn_prefix_keyed_returns_source_key() {
+        let store = make_store(&[
+            ("かんたん", vec!["簡単"]),
+            ("かんたんなことばでぶんせき", vec!["簡単な言葉で分析"]),
+        ]);
+        store.learn("かんたん", "簡単");
+        store.learn("かんたんなことばでぶんせき", "簡単な言葉で分析");
+
+        // 予測候補の確定を元のキーへ振り直せるよう、登録キーを一緒に返す
+        assert_eq!(
+            store.lookup_learn_prefix_keyed("かんたん", 5),
+            vec![(
+                "かんたんなことばでぶんせき".to_string(),
+                "簡単な言葉で分析".to_string()
+            )]
+        );
+        assert_eq!(
+            store.lookup_learn_suggest_keyed("かんたん", 5),
+            vec![
+                ("かんたん".to_string(), "簡単".to_string()),
+                (
+                    "かんたんなことばでぶんせき".to_string(),
+                    "簡単な言葉で分析".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_lookup_learn_suggest_includes_exact_match() {
+        let store = make_store(&[
+            ("かんたん", vec!["簡単"]),
+            ("かんたんなことばでぶんせき", vec!["簡単な言葉で分析"]),
+        ]);
+        store.learn("かんたん", "簡単");
+        store.learn("かんたんなことばでぶんせき", "簡単な言葉で分析");
+
+        let sug = store.lookup_learn_suggest("かんたん", 5);
+        // 予測ウィンドウは完全一致（簡単）も並べる
+        assert_eq!(sug.len(), 2);
+        assert!(sug.contains(&"簡単".to_string()));
+        assert!(sug.contains(&"簡単な言葉で分析".to_string()));
+        // 前方一致しない読みは拾わない
+        assert!(store.lookup_learn_suggest("かんぜん", 5).is_empty());
+    }
+
+    #[test]
+    fn test_lookup_learn_prefix_respects_limit() {
+        let store = make_store(&[
+            ("あさごはん", vec!["朝ごはん"]),
+            ("あさごはんをたべる", vec!["朝ごはんを食べる"]),
+            ("あさごはんはパン", vec!["朝ごはんはパン"]),
+            ("あさごはんぬき", vec!["朝ごはん抜き"]),
+        ]);
+        store.learn("あさごはんをたべる", "朝ごはんを食べる");
+        store.learn("あさごはんはパン", "朝ごはんはパン");
+        store.learn("あさごはんぬき", "朝ごはん抜き");
+
+        assert_eq!(store.lookup_learn_prefix("あさごはん", 2).len(), 2);
+        assert_eq!(store.lookup_learn_prefix("あさごはん", 9).len(), 3);
+    }
+
+    #[test]
+    fn test_forget_matching_removes_prefix_keys() {
+        let store = make_store(&[
+            ("かんたん", vec!["簡単"]),
+            ("かんたんなことばでぶんせき", vec!["簡単な言葉で分析"]),
+        ]);
+        store.learn("かんたん", "簡単");
+        store.learn("かんたんなことばでぶんせき", "簡単な言葉で分析");
+
+        // 短い読みのまま、予測で出てきた長いフレーズを削除できる
+        let removed = store.forget_matching("かんたん", "簡単な言葉で分析");
+        assert_eq!(removed, 1);
+        assert!(store.lookup_learn_prefix("かんたん", 5).is_empty());
+        // 完全一致側の学習は残る
+        assert_eq!(store.lookup_learn("かんたん"), vec!["簡単"]);
+
+        // 該当なしは 0 件
+        assert_eq!(store.forget_matching("かんたん", "存在しない"), 0);
+        assert_eq!(store.forget_matching("", "簡単"), 0);
     }
 
     #[test]

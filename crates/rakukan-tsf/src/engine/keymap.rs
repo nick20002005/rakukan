@@ -42,6 +42,8 @@ pub enum KeyAction {
     CandidatePageDown, // PageDown
     CandidatePageUp,   // PageUp
     CandidateN(u8),    // 数字 1–9
+    /// 選択中の候補を学習履歴から削除（Ctrl+Delete）
+    CandidateForget,
     // IME オン/オフ（入力状態はこの 2 値だけ。旧 mode_* は別名として読む）
     /// IME オフ = 直接入力。旧 `mode_alphanumeric` を含む。
     #[serde(alias = "mode_alphanumeric")]
@@ -52,10 +54,9 @@ pub enum KeyAction {
     ImeToggle, // 全角/半角, Ctrl+Space
     CursorLeft,
     CursorRight,
-    /// Home（Issue #11: preedit 中はアプリへ渡さない）
-    CursorHome,
-    /// End（同上）
-    CursorEnd,
+    CursorHome, // Home
+    CursorEnd,  // End
+    Delete,     // Delete
     /// 文節縮小（Shift+Left）
     SegmentShrink,
     /// 文節拡大（Shift+Right）
@@ -82,6 +83,7 @@ impl KeyAction {
             Self::CandidatePageDown => UserAction::CandidatePageDown,
             Self::CandidatePageUp => UserAction::CandidatePageUp,
             Self::CandidateN(n) => UserAction::CandidateSelect(*n),
+            Self::CandidateForget => UserAction::CandidateForget,
             Self::ImeOff => UserAction::ImeOff,
             Self::ImeOn => UserAction::ImeOn,
             Self::ImeToggle => UserAction::ImeToggle,
@@ -89,6 +91,7 @@ impl KeyAction {
             Self::CursorRight => UserAction::CursorRight,
             Self::CursorHome => UserAction::CursorHome,
             Self::CursorEnd => UserAction::CursorEnd,
+            Self::Delete => UserAction::Delete,
             Self::SegmentShrink => UserAction::SegmentShrink,
             Self::SegmentExtend => UserAction::SegmentExtend,
         }
@@ -879,11 +882,13 @@ fn preset_bindings(preset: KeymapPreset) -> Vec<KeyBinding> {
             bind("Tab", KeyAction::CandidatePageDown),
             bind("Shift+Tab", KeyAction::CandidatePageUp),
             bind("PageDown", KeyAction::CandidatePageDown),
+            bind("Ctrl+Delete", KeyAction::CandidateForget),
             bind("PageUp", KeyAction::CandidatePageUp),
             bind("Left", KeyAction::CursorLeft),
             bind("Right", KeyAction::CursorRight),
             bind("Home", KeyAction::CursorHome),
             bind("End", KeyAction::CursorEnd),
+            bind("Delete", KeyAction::Delete),
             bind("Shift+Left", KeyAction::SegmentShrink),
             bind("Shift+Right", KeyAction::SegmentExtend),
         ],
@@ -906,6 +911,7 @@ fn preset_bindings(preset: KeymapPreset) -> Vec<KeyBinding> {
             bind("Tab", KeyAction::CandidatePageDown),
             bind("Shift+Tab", KeyAction::CandidatePageUp),
             bind("PageDown", KeyAction::CandidatePageDown),
+            bind("Ctrl+Delete", KeyAction::CandidateForget),
             bind("PageUp", KeyAction::CandidatePageUp),
             bind("Zenkaku", KeyAction::ImeToggle),
             bind("Ctrl+Space", KeyAction::ImeToggle),
@@ -918,6 +924,7 @@ fn preset_bindings(preset: KeymapPreset) -> Vec<KeyBinding> {
             bind("Right", KeyAction::CursorRight),
             bind("Home", KeyAction::CursorHome),
             bind("End", KeyAction::CursorEnd),
+            bind("Delete", KeyAction::Delete),
             bind("Shift+Left", KeyAction::SegmentShrink),
             bind("Shift+Right", KeyAction::SegmentExtend),
         ],

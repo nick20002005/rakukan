@@ -30,6 +30,9 @@ pub const GUID_DISPLAY_ATTRIBUTE: GUID = GUID::from_u128(0xc0ddf8b2_1f1e_4c2d_a9
 /// 未変換プリエディットのアンダーライン属性 GUID
 pub const GUID_DISPLAY_ATTRIBUTE_INPUT: GUID =
     GUID::from_u128(0xc0ddf8b3_1f1e_4c2d_a9e3_5f7b8d6e2a4c);
+/// 変換済みだが選択中でない文節（細実線）
+pub const GUID_DISPLAY_ATTRIBUTE_DONE: GUID =
+    GUID::from_u128(0xc0ddf8b4_1f1e_4c2d_a9e3_5f7b8d6e2a4c);
 
 #[allow(dead_code)]
 pub const TEXTSERVICE_LANGBARITEMSINK_COOKIE: u32 = 0x414D414B;
@@ -45,12 +48,33 @@ pub const DISPLAY_ATTRIBUTE_CONVERTED: TF_DISPLAYATTRIBUTE = TF_DISPLAYATTRIBUTE
         Anonymous: TF_DA_COLOR_0 { nIndex: 0i32 },
     },
     lsStyle: TF_LS_SOLID,
-    fBoldLine: windows::Win32::Foundation::FALSE,
+    fBoldLine: windows::Win32::Foundation::TRUE,
     crLine: TF_DA_COLOR {
         r#type: TF_CT_NONE,
         Anonymous: TF_DA_COLOR_0 { nIndex: 0i32 },
     },
     bAttr: TF_ATTR_TARGET_CONVERTED,
+};
+
+/// 変換済み・非選択の文節: 細実線アンダーライン（Google 日本語入力の
+/// 「変換済み文節」と同じ TF_ATTR_CONVERTED。選択中の文節だけが
+/// TF_ATTR_TARGET_CONVERTED＝太実線／アプリによっては反転表示になる）
+pub const DISPLAY_ATTRIBUTE_DONE: TF_DISPLAYATTRIBUTE = TF_DISPLAYATTRIBUTE {
+    crText: TF_DA_COLOR {
+        r#type: TF_CT_NONE,
+        Anonymous: TF_DA_COLOR_0 { nIndex: 0i32 },
+    },
+    crBk: TF_DA_COLOR {
+        r#type: TF_CT_NONE,
+        Anonymous: TF_DA_COLOR_0 { nIndex: 0i32 },
+    },
+    lsStyle: TF_LS_SOLID,
+    fBoldLine: windows::Win32::Foundation::FALSE,
+    crLine: TF_DA_COLOR {
+        r#type: TF_CT_NONE,
+        Anonymous: TF_DA_COLOR_0 { nIndex: 0i32 },
+    },
+    bAttr: windows::Win32::UI::TextServices::TF_ATTR_CONVERTED,
 };
 
 /// 未変換プリエディット: 点線アンダーライン

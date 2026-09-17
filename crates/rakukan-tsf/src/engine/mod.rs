@@ -1,3 +1,4 @@
+pub(super) mod clause;
 pub(super) mod client_action;
 pub(super) mod composition;
 pub(crate) mod config;

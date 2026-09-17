@@ -17,7 +17,7 @@ use crate::{EngineConfig, RakunEngine};
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::OnceLock;
 
-pub const ENGINE_ABI_VERSION: u32 = 9;
+pub const ENGINE_ABI_VERSION: u32 = 12;
 
 static LOG_INIT: OnceLock<()> = OnceLock::new();
 
@@ -433,7 +433,8 @@ pub extern "C" fn engine_merge_candidates(
     llm_json: *const c_char,
     limit: u32,
 ) -> *mut c_char {
-    let engine = unsafe { &*(handle as *const RakunEngine) };
+    let engine = unsafe { &mut *(handle as *mut RakunEngine) };
+    inject_pending_dict(engine);
     let s = unsafe { from_cstr(llm_json) };
     let llm_cands: Vec<String> = serde_json::from_str(s).unwrap_or_default();
     // 辞書検索を直接デバッグ
@@ -460,7 +461,8 @@ pub extern "C" fn engine_merge_candidates_for_reading(
     llm_json: *const c_char,
     limit: u32,
 ) -> *mut c_char {
-    let engine = unsafe { &*(handle as *const RakunEngine) };
+    let engine = unsafe { &mut *(handle as *mut RakunEngine) };
+    inject_pending_dict(engine);
     let reading = unsafe { from_cstr(reading) };
     let s = unsafe { from_cstr(llm_json) };
     let llm_cands: Vec<String> = serde_json::from_str(s).unwrap_or_default();
@@ -477,6 +479,9 @@ pub extern "C" fn engine_merge_candidates_for_reading(
 }
 
 // ─── 初期化（非同期）──────────────────────────────────────────────────────────
+/// モデルのロードが走っている間だけ true。`engine_poll_model_ready` からも
+/// 「誰もロードしていない」を判定するためにモジュール共有にしてある。
+static MODEL_LOADING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// モデル（漢字変換 LLM）のロードをバックグラウンドで開始する。
 ///
@@ -487,8 +492,6 @@ pub extern "C" fn engine_merge_candidates_for_reading(
 /// 併せて `MODEL_LOADING` ガードで並行 spawn を抑止する（`DICT_LOADING` と同形式）。
 #[unsafe(no_mangle)]
 pub extern "C" fn engine_start_load_model(handle: *mut c_void) {
-    static MODEL_LOADING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
     let engine = unsafe { &mut *(handle as *mut RakunEngine) };
     if engine.is_kanji_ready() {
         return;
@@ -582,7 +585,39 @@ pub extern "C" fn engine_poll_model_ready(handle: *mut c_void) -> bool {
             None => {}
         }
     }
+    // ここまで来た＝converter を持っておらず、注入待ちも無い。
+    //
+    // 🔴 ホスト再起動の直後に複数プロセスの Create が競合すると、モデルを
+    //    積んだ engine がそのまま差し替えられ、生き残った engine は
+    //    kanji=None・PENDING_CONVERTER 空・ロード未起動で固まる。誰も
+    //    start_load_model を呼び直さないので、辞書だけが効いて LLM 変換が
+    //    永久に返らなくなる（2026-09-10 に実害。区読点を含む文が生かなのまま）。
+    //    poll は変換のたびに来るので、ここから自分でロードを再開する。
+    if !MODEL_LOADING.load(std::sync::atomic::Ordering::Acquire)
+        && !crate::conv_cache::has_converter()
+        && auto_reload_cooldown_elapsed()
+    {
+        tracing::warn!("poll_model_ready: converter missing and no load in flight → reloading");
+        engine_start_load_model(handle);
+    }
     false
+}
+
+/// 自動再ロードの連打防止。ロードが失敗し続けるときに poll のたびに
+/// スレッドを起こさないよう、5 秒に 1 回までに絞る。
+fn auto_reload_cooldown_elapsed() -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static START: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
+    static LAST_MS: AtomicU64 = AtomicU64::new(0);
+    const COOLDOWN_MS: u64 = 5_000;
+
+    let now = START.elapsed().as_millis() as u64 + 1;
+    let last = LAST_MS.load(Ordering::Acquire);
+    if last != 0 && now.saturating_sub(last) < COOLDOWN_MS {
+        return false;
+    }
+    LAST_MS.store(now, Ordering::Release);
+    true
 }
 
 /// 辞書のロードをバックグラウンドで開始する。
@@ -634,6 +669,21 @@ static PENDING_DICT: LazyLock<Mutex<Option<crate::DictStore>>> = LazyLock::new(|
 #[unsafe(no_mangle)]
 pub extern "C" fn engine_poll_dict_ready(handle: *mut c_void) -> bool {
     let engine = unsafe { &mut *(handle as *mut RakunEngine) };
+    inject_pending_dict(engine)
+}
+
+/// `PENDING_DICT` に届いている辞書をエンジンへ注入する。戻り値 true = 今注入した。
+///
+/// 🔴 `engine_poll_dict_ready` を待つだけにしてはいけない。TSF 側の
+/// `poll_dict_ready_cached` はプロセスごとの **ラッチ** で「一度 ready になったら
+/// 二度と poll しない」実装なので、**エンジンホストだけを再起動すると**
+/// （DLL 差し替えや watchdog 復帰）ラッチが立ったままの TSF は新しいホストに
+/// 対して二度と poll せず、辞書が永久に注入されないままになる。
+/// 症状は「ユーザー辞書と学習履歴だけが丸ごと効かない」で、変換自体は
+/// LLM だけで動くので気付きにくい（`learn: dict_store not initialized` の
+/// WARN だけが手掛かりになる）。
+/// そのため辞書を実際に使う入口でも都度取りに行く。
+fn inject_pending_dict(engine: &mut RakunEngine) -> bool {
     if engine.is_dict_ready() {
         return false;
     }
@@ -703,6 +753,7 @@ pub extern "C" fn engine_learn(
     surface: *const c_char,
 ) {
     let engine = unsafe { &mut *(handle as *mut RakunEngine) };
+    inject_pending_dict(engine);
     let reading = unsafe { from_cstr(reading) }.to_string();
     let surface = unsafe { from_cstr(surface) }.to_string();
     if reading.is_empty() || surface.is_empty() {
@@ -719,12 +770,63 @@ pub extern "C" fn engine_learn_force(
     surface: *const c_char,
 ) {
     let engine = unsafe { &mut *(handle as *mut RakunEngine) };
+    inject_pending_dict(engine);
     let reading = unsafe { from_cstr(reading) }.to_string();
     let surface = unsafe { from_cstr(surface) }.to_string();
     if reading.is_empty() || surface.is_empty() {
         return;
     }
     engine.learn_force(&reading, &surface);
+}
+
+/// 入力中の予測候補を JSON 配列で返す（学習履歴のみを引く軽量経路）。
+/// `engine_free_string` で解放すること。
+#[unsafe(no_mangle)]
+pub extern "C" fn engine_predict(
+    handle: *mut c_void,
+    reading: *const c_char,
+    limit: u32,
+) -> *mut c_char {
+    let engine = unsafe { &mut *(handle as *mut RakunEngine) };
+    inject_pending_dict(engine);
+    let reading = unsafe { from_cstr(reading) };
+    let preds = engine.predict(reading, limit as usize);
+    let json = serde_json::to_string(&preds).unwrap_or_else(|_| "[]".into());
+    unsafe { to_cstr(json) }
+}
+
+/// 読みに対する辞書候補だけを JSON 配列で返す（短文予測も LLM も引かない）。
+/// 文節境界の探索が使う。`engine_free_string` で解放すること。
+#[unsafe(no_mangle)]
+pub extern "C" fn engine_dict_lookup(
+    handle: *mut c_void,
+    reading: *const c_char,
+    limit: u32,
+) -> *mut c_char {
+    let engine = unsafe { &mut *(handle as *mut RakunEngine) };
+    inject_pending_dict(engine);
+    let reading = unsafe { from_cstr(reading) };
+    let cands = engine.dict_lookup(reading, limit as usize);
+    let json = serde_json::to_string(&cands).unwrap_or_else(|_| "[]".into());
+    unsafe { to_cstr(json) }
+}
+
+/// 学習履歴から候補を削除する（候補ウィンドウでの明示削除）。
+/// `reading` に前方一致するキーも対象にするため、短文予測の候補も消せる。
+/// 戻り値: 1 件以上削除できたか。
+#[unsafe(no_mangle)]
+pub extern "C" fn engine_forget(
+    handle: *mut c_void,
+    reading: *const c_char,
+    surface: *const c_char,
+) -> bool {
+    let engine = unsafe { &mut *(handle as *mut RakunEngine) };
+    let reading = unsafe { from_cstr(reading) }.to_string();
+    let surface = unsafe { from_cstr(surface) }.to_string();
+    if reading.is_empty() || surface.is_empty() {
+        return false;
+    }
+    engine.forget(&reading, &surface)
 }
 
 // ─── 最後のエラーメッセージ（診断用）────────────────────────────────────────

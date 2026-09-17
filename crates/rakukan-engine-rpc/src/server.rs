@@ -262,6 +262,9 @@ pub(crate) fn request_label(req: &Request) -> &'static str {
         EngineHealth => "EngineHealth",
         InputChar { .. } => "InputChar",
         ShutdownIfConfigDiffers { .. } => "ShutdownIfConfigDiffers",
+        Forget { .. } => "Forget",
+        Predict { .. } => "Predict",
+        DictLookup { .. } => "DictLookup",
     }
 }
 
@@ -556,6 +559,11 @@ fn dispatch_engine(eng: &mut DynEngine, req: Request) -> Response {
             warn_if_dict_missing(eng, "LearnForce", &reading);
             eng.learn_force(&reading, &surface);
             Response::Unit
+        }
+        Forget { reading, surface } => Response::Bool(eng.forget(&reading, &surface)),
+        Predict { reading, limit } => Response::Strings(eng.predict(&reading, limit as usize)),
+        DictLookup { reading, limit } => {
+            Response::Strings(eng.dict_lookup(&reading, limit as usize))
         }
         MergeCandidatesForReading {
             reading,
