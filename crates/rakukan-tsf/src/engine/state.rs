@@ -430,7 +430,14 @@ pub fn engine_force_recreate() {
 /// このウォッチドッグは「LLM が EOS なしに max_new_tokens まで走り切る」より
 /// 長い時間かかるケース（GPU ハング等）への最終防衛線。
 /// 通常の生成遅延は engine 側の GEN_TIMEOUT_SECS (15 秒) でカバーする。
-static BG_WATCHDOG: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+///
+/// 詰まりは「連続して観測され続けている」ことを条件にする。直前の観測から
+/// `BG_WATCHDOG_EPISODE_GAP` 以上空いていたら別の待ちとみなして開始時刻を
+/// 取り直す。待ちの途中で Enter 確定・Esc 等に抜ける経路はリセットを呼ばない
+/// ことがあり、残った開始時刻で数十秒後の通常の Space が「82 秒詰まっている」
+/// と判定されてエンジンを再起動していた。
+static BG_WATCHDOG: Mutex<Option<(std::time::Instant, std::time::Instant)>> = Mutex::new(None);
+const BG_WATCHDOG_EPISODE_GAP: std::time::Duration = std::time::Duration::from_secs(20);
 
 pub fn bg_timeout_watchdog(is_stuck: bool) {
     let Ok(mut guard) = BG_WATCHDOG.try_lock() else {
@@ -443,7 +450,21 @@ pub fn bg_timeout_watchdog(is_stuck: bool) {
         }
         return;
     }
-    let since = guard.get_or_insert_with(std::time::Instant::now);
+    let now = std::time::Instant::now();
+    let since = match *guard {
+        Some((since, last_seen)) if now.duration_since(last_seen) < BG_WATCHDOG_EPISODE_GAP => {
+            since
+        }
+        Some((_, last_seen)) => {
+            tracing::debug!(
+                "bg_timeout_watchdog: previous stuck mark is stale ({}s since last seen), restart",
+                now.duration_since(last_seen).as_secs()
+            );
+            now
+        }
+        None => now,
+    };
+    *guard = Some((since, now));
     let elapsed_secs = since.elapsed().as_secs();
     tracing::debug!("bg_timeout_watchdog: conv worker stuck {elapsed_secs}s");
     // 閾値はエンジン側 GEN_TIMEOUT_SECS (15 秒) より長くすること。
