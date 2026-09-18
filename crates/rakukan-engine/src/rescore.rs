@@ -275,13 +275,38 @@ pub fn promote_dict_agreeing(
     out
 }
 
-/// 長文の途中へ差し込む学習語の、読みの最小文字数。2 文字の読み
+/// 長文の第 1 候補を学習表記で**書き換える**ための、読みの最小文字数。2 文字の読み
 /// （`いま`・`にち`・`えん`）は同音異義が多く、文脈を無視して塗り替えると壊す。
 const LEARNED_RUN_MIN_READING_CHARS: usize = 3;
 
-/// 長文の途中へ差し込む学習語の、減衰済み確定回数の下限。
+/// 長文の第 1 候補を学習表記で**書き換える**ための、減衰済み確定回数の下限。
 /// 「1 回選んだだけ」の語を文中の同音語すべてに波及させないための閾値。
 const LEARNED_RUN_MIN_FREQ: f64 = 3.0;
+
+/// 第 1 候補は変えずに、学習表記へ差し替えた候補を **2 番目に足す** ための下限。
+///
+/// 文中で出ないのはむしろ 2 文字の短い語（`ほお`→`頬`、`かわ`→`河`、`はい`→`牌`、
+/// `まい`→`枚`）で、そのたびに単独で変換し直す必要があった。学習履歴は読み全体の
+/// 完全一致で記録されるので、`ほお` の学習がある＝その読みを単独で変換して選んだ、
+/// という明示の意思表示になる。そこで 1 回（減衰込みで直近 1 か月に 1 回＝半減期
+/// 30 日）選んだ語から、Space をもう 1 回押せば届く位置に出す。
+///
+/// 第 1 候補を書き換えないのは、実ログ 1,624 文で試すと 2 文字の読みは誤爆が
+/// 多かったため（`週と同じ`→`集と…`、`以上`/`異常` の取り違え等）。ライブ変換の
+/// 表示と Space 1 回目の結果は変わらない。1 文字（`は`→`葉`）は偶然一致が多すぎる
+/// ので除く。
+const LEARNED_SOFT_MIN_READING_CHARS: usize = 2;
+const LEARNED_SOFT_MIN_FREQ: f64 = 0.5;
+
+/// 2 番目に足す差し替えを許す、直後のひらがなの先頭文字（助詞・助動詞の頭）。
+///
+/// 漢字 run の直後が活用語尾だと、その run は語幹であって単独の語ではない。
+/// 実ログでは `入って`→`牌って`、`含んで`→`服んで`、`同じ`→`オナじ`、
+/// `話しかけ`→`花しかけ`、`可愛い`→`河い` がこれで出た。助詞で切れている
+/// ときだけ差し替える。
+const SOFT_FOLLOWING_HEADS: &[char] = &[
+    'が', 'を', 'に', 'は', 'の', 'で', 'と', 'も', 'へ', 'や', 'か', 'ね', 'よ', 'だ', 'ご',
+];
 
 /// 漢字かカタカナを含むか。学習表記が記号（`かっこ` → `「」`、`みぎ` → `→`）や
 /// ひらがな・英字だけのときは、文中の語を置き換えない。
@@ -290,12 +315,47 @@ fn has_kanji_or_katakana(s: &str) -> bool {
         .any(|c| matches!(c, 'ァ'..='ヶ' | '一'..='鿿' | '㐀'..='䶿' | '々'))
 }
 
-/// 表層 run 1 つを学習表記へ置き換えるべきなら、その表記を返す。
-fn learned_replacement(store: &DictStore, run: &AlignedRun) -> Option<String> {
+/// 学習表記への差し替えの強さ。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Strength {
+    /// 第 1 候補を書き換える。
+    Strong,
+    /// 第 1 候補は残し、差し替えた候補を 2 番目に足す。
+    Soft,
+}
+
+/// run の前後が、語の切れ目として差し替えてよい形か（Soft 用）。
+fn soft_boundary_ok(prev: Option<&AlignedRun>, next: Option<&AlignedRun>) -> bool {
+    // 直前が接頭辞 `お`・`ご`（`お腹`・`ご飯`）なら語の途中。
+    if let Some(p) = prev
+        && p.kind == RunKind::Hiragana
+        && p.surface.ends_with(['お', 'ご'])
+    {
+        return false;
+    }
+    match next {
+        None => true,
+        Some(n) if n.kind == RunKind::Hiragana => n
+            .surface
+            .chars()
+            .next()
+            .is_some_and(|c| SOFT_FOLLOWING_HEADS.contains(&c)),
+        Some(_) => true,
+    }
+}
+
+/// 表層 run 1 つを学習表記へ置き換えるべきなら、その表記と強さを返す。
+fn learned_replacement(
+    store: &DictStore,
+    run: &AlignedRun,
+    prev: Option<&AlignedRun>,
+    next: Option<&AlignedRun>,
+) -> Option<(String, Strength)> {
     if !matches!(run.kind, RunKind::Kanji | RunKind::Katakana) {
         return None;
     }
-    if run.reading.chars().count() < LEARNED_RUN_MIN_READING_CHARS {
+    let reading_chars = run.reading.chars().count();
+    if reading_chars < LEARNED_SOFT_MIN_READING_CHARS {
         return None;
     }
     let learned = store.lookup_learn(&run.reading);
@@ -311,13 +371,20 @@ fn learned_replacement(store: &DictStore, run: &AlignedRun) -> Option<String> {
     {
         return None;
     }
-    if !has_kanji_or_katakana(top) || store.learn_freq(&run.reading, top) < LEARNED_RUN_MIN_FREQ {
+    if !has_kanji_or_katakana(top) {
         return None;
     }
-    Some(top.clone())
+    let freq = store.learn_freq(&run.reading, top);
+    if reading_chars >= LEARNED_RUN_MIN_READING_CHARS && freq >= LEARNED_RUN_MIN_FREQ {
+        return Some((top.clone(), Strength::Strong));
+    }
+    if freq >= LEARNED_SOFT_MIN_FREQ && soft_boundary_ok(prev, next) {
+        return Some((top.clone(), Strength::Soft));
+    }
+    None
 }
 
-/// よく使っている学習語を、長文の第 1 候補の途中にも効かせる。
+/// 学習語を、長文の候補の途中にも効かせる。
 ///
 /// 学習履歴も辞書と同じく読み全体の完全一致でしか引かれないので、
 /// `みかん → 美柑` を何十回確定していても、`みかんのへやのはいけい` と伸びた
@@ -325,14 +392,19 @@ fn learned_replacement(store: &DictStore, run: &AlignedRun) -> Option<String> {
 /// なので、LLM が `美柑` を一度も出さなければ救えない。
 ///
 /// そこで第 1 候補を読みへ割り戻し、漢字・カタカナ run の読みが学習キーと一致し、
-/// かつ LLM とは別の表記を何度も選んでいるなら、その run だけ学習表記へ
-/// 差し替えた候補を **先頭に足す**。元の第 1 候補は 2 番目に残るので、
-/// 文脈上は LLM が正しかった場合も 1 打鍵で戻せる。
+/// かつ LLM とは別の表記を選んでいるなら、その run を学習表記へ差し替える。
 ///
-/// 置き換えを断られたら（元の候補が確定されたら）、その読みでは LLM の表記も
-/// 使うと学習させる。次からは `learned_replacement` の「LLM と同じ表記を選んだ
-/// ことがある」で止まる（`しんちょう → 身長` を覚えていても、文中の `慎重` を
-/// 塗り替え続けないため）。
+/// - 何度も選んでいる長い語（`Strength::Strong`）は、差し替えた候補を
+///   **先頭に足す**。元の第 1 候補は 2 番目に残るので 1 打鍵で戻せる。
+/// - 短い語や選んだ回数が少ない語（`Strength::Soft`）は、第 1 候補は変えず、
+///   差し替えた候補を **2 番目に足す**。
+///
+/// 先頭を書き換えたのに断られたら（元の候補が確定されたら）、その読みでは LLM の
+/// 表記も使うと学習させる。次からは `learned_replacement` の「LLM と同じ表記を
+/// 選んだことがある」で止まる（`しんちょう → 身長` を覚えていても、文中の `慎重`
+/// を塗り替え続けないため）。2 番目に足しただけの差し替えは、元の候補の確定を
+/// 「断った」とは見なさない（見ずに Space 1 回で確定しただけかもしれない）ので、
+/// `LearnedRewrite` には入れない。
 ///
 /// 候補が 0 件のときは何もしない（件数が増えるのは実候補がある時だけ）。
 pub fn apply_learned_runs(
@@ -340,10 +412,10 @@ pub fn apply_learned_runs(
     reading: &str,
     candidates: Vec<String>,
 ) -> (Vec<String>, Option<LearnedRewrite>) {
-    let Some(first) = candidates.first() else {
+    let Some(first) = candidates.first().cloned() else {
         return (candidates, None);
     };
-    let Some(runs) = align(reading, first) else {
+    let Some(runs) = align(reading, &first) else {
         return (candidates, None);
     };
     if runs.len() < 2 {
@@ -351,39 +423,66 @@ pub fn apply_learned_runs(
         return (candidates, None);
     }
 
-    let mut replaced_runs: Vec<(String, String)> = Vec::new();
-    let mut rewritten = String::new();
-    for run in &runs {
-        match learned_replacement(store, run) {
-            Some(s) => {
-                rewritten.push_str(&s);
-                replaced_runs.push((run.reading.clone(), run.surface.clone()));
+    let mut strong_runs: Vec<(String, String)> = Vec::new();
+    let mut any_soft = false;
+    // Strong だけを差し替えた表記と、Soft も含めて差し替えた表記。
+    let mut strong_text = String::new();
+    let mut soft_text = String::new();
+    for (i, run) in runs.iter().enumerate() {
+        let prev = i.checked_sub(1).map(|j| &runs[j]);
+        let next = runs.get(i + 1);
+        match learned_replacement(store, run, prev, next) {
+            Some((s, Strength::Strong)) => {
+                strong_text.push_str(&s);
+                soft_text.push_str(&s);
+                strong_runs.push((run.reading.clone(), run.surface.clone()));
             }
-            None => rewritten.push_str(&run.surface),
+            Some((s, Strength::Soft)) => {
+                strong_text.push_str(&run.surface);
+                soft_text.push_str(&s);
+                any_soft = true;
+            }
+            None => {
+                strong_text.push_str(&run.surface);
+                soft_text.push_str(&run.surface);
+            }
         }
     }
-    if replaced_runs.is_empty() {
+    if strong_runs.is_empty() && !any_soft {
         return (candidates, None);
     }
 
     tracing::info!(
         reading = %reading,
         from = %first,
-        to = %rewritten,
+        strong = %strong_text,
+        soft = %soft_text,
         "rescore: applied learned runs"
     );
-    let rewrite = LearnedRewrite {
-        original: first.clone(),
-        runs: replaced_runs,
-    };
-    let mut out = Vec::with_capacity(candidates.len() + 1);
-    out.push(rewritten);
-    for c in candidates {
+    let rewrite = (!strong_runs.is_empty()).then(|| LearnedRewrite {
+        original: first,
+        runs: strong_runs,
+    });
+
+    let mut out: Vec<String> = Vec::with_capacity(candidates.len() + 2);
+    let mut push = |c: String| {
         if !out.contains(&c) {
             out.push(c);
         }
+    };
+    let mut rest = candidates.into_iter();
+    if rewrite.is_some() {
+        push(strong_text);
+    } else if let Some(c) = rest.next() {
+        push(c);
     }
-    (out, Some(rewrite))
+    if any_soft {
+        push(soft_text);
+    }
+    for c in rest {
+        push(c);
+    }
+    (out, rewrite)
 }
 
 /// `apply_learned_runs` が差し替えた内容。`original` が確定されたら、
@@ -521,7 +620,7 @@ surfaces = ["指示"]
     }
 
     #[test]
-    fn applies_frequently_learned_word_inside_long_reading() {
+    fn applies_learned_word_inside_long_reading() {
         let (_dir, store) = store_with_user_entries("");
         let reading = "みかんのへやのはいけい";
         let cands = vec![
@@ -529,12 +628,25 @@ surfaces = ["指示"]
             "みかんの部屋の背景".to_string(),
         ];
 
-        // 1 回選んだだけでは文中の同音語を塗り替えない。
-        store.learn_force("みかん", "美柑");
+        // 学習が無ければ触らない。
         let (got, rewrite) = apply_learned_runs(&store, reading, cands.clone());
         assert_eq!(got, cands);
         assert!(rewrite.is_none());
 
+        // 1 回選んだだけなら先頭は変えず、2 番目に足す（断りの学習もしない）。
+        store.learn_force("みかん", "美柑");
+        let (got, rewrite) = apply_learned_runs(&store, reading, cands.clone());
+        assert!(rewrite.is_none());
+        assert_eq!(
+            got,
+            vec![
+                "蜜柑の部屋の背景".to_string(),
+                "美柑の部屋の背景".to_string(),
+                "みかんの部屋の背景".to_string(),
+            ]
+        );
+
+        // 何度も選んでいれば先頭を書き換える。
         for _ in 0..3 {
             store.learn_force("みかん", "美柑");
         }
@@ -563,6 +675,92 @@ surfaces = ["指示"]
         store.learn_force("さくら", "サクラ");
         let cands = vec!["桜が咲いた".to_string()];
         let (got, _) = apply_learned_runs(&store, "さくらがさいた", cands.clone());
+        assert_eq!(got, cands);
+    }
+
+    #[test]
+    fn offers_two_char_learned_word_as_second_candidate() {
+        let (_dir, store) = store_with_user_entries("");
+        // 何度選んでいても、2 文字の読みは先頭を書き換えない。
+        for _ in 0..5 {
+            store.learn_force("かわ", "河");
+        }
+        let cands = vec!["皮に捨てる".to_string(), "かわに捨てる".to_string()];
+        let (got, rewrite) = apply_learned_runs(&store, "かわにすてる", cands);
+        assert!(rewrite.is_none());
+        assert_eq!(
+            got,
+            vec![
+                "皮に捨てる".to_string(),
+                "河に捨てる".to_string(),
+                "かわに捨てる".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn offers_learned_word_for_katakana_run_before_kanji() {
+        let (_dir, store) = store_with_user_entries("");
+        store.learn_force("まい", "枚");
+        let cands = vec!["マイ程度のフォルダ".to_string()];
+        let (got, _) = apply_learned_runs(&store, "まいていどのふぉるだ", cands);
+        assert_eq!(
+            got,
+            vec![
+                "マイ程度のフォルダ".to_string(),
+                "枚程度のフォルダ".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn skips_verb_stem_followed_by_inflection() {
+        // 実ログで出た誤爆: `入って`→`牌って`、`含んで`→`服んで`、`同じ`→`オナじ`。
+        let (_dir, store) = store_with_user_entries("");
+        store.learn_force("はい", "牌");
+        store.learn_force("ふく", "服");
+        store.learn_force("おな", "オナ");
+        for (reading, surface) in [
+            ("ちからははいっていない", "力は入っていない"),
+            ("くちでふくんで", "口で含んで"),
+            ("おなじように", "同じように"),
+        ] {
+            let cands = vec![surface.to_string()];
+            let (got, rewrite) = apply_learned_runs(&store, reading, cands.clone());
+            assert!(rewrite.is_none(), "{reading}");
+            assert_eq!(got, cands, "{reading}");
+        }
+    }
+
+    #[test]
+    fn skips_run_after_honorific_prefix() {
+        let (_dir, store) = store_with_user_entries("");
+        store.learn_force("なか", "中");
+        let cands = vec!["お腹が空いた".to_string()];
+        let (got, _) = apply_learned_runs(&store, "おなかがすいた", cands.clone());
+        assert_eq!(got, cands);
+    }
+
+    #[test]
+    fn offers_learned_word_before_particle_or_at_end() {
+        let (_dir, store) = store_with_user_entries("");
+        store.learn_force("ふく", "服");
+        let cands = vec!["その腹ごと".to_string()];
+        let (got, _) = apply_learned_runs(&store, "そのふくごと", cands);
+        assert_eq!(got[1], "その服ごと");
+
+        let cands = vec!["根元まで口で腹".to_string()];
+        let (got, _) = apply_learned_runs(&store, "ねもとまでくちでふく", cands);
+        assert_eq!(got[1], "根元まで口で服");
+    }
+
+    #[test]
+    fn skips_one_char_reading() {
+        let (_dir, store) = store_with_user_entries("");
+        store.learn_force("は", "葉");
+        let cands = vec!["歯が痛い".to_string()];
+        let (got, rewrite) = apply_learned_runs(&store, "はがいたい", cands.clone());
+        assert!(rewrite.is_none());
         assert_eq!(got, cands);
     }
 }
