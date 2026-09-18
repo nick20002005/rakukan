@@ -23,6 +23,8 @@ gpu_backend = "auto"
 # 0 で CPU のみ、未指定で全レイヤーを GPU にオフロード
 # GPU 競合や他アプリの異常終了がある場合は 8 / 16 / 24 など小さめを試す
 n_gpu_layers = 16
+# 推論時間に応じて GPU/CPU を自動選択（0 layers 時は無効、再起動で反映）
+adaptive_gpu = false
 
 # 使用する GPU インデックス（複数 GPU 環境で 2 枚目以降を使う場合に変更）
 main_gpu = 0

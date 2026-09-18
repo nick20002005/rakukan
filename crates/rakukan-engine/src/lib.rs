@@ -224,6 +224,8 @@ pub struct EngineConfig {
     pub n_threads: u32,
     /// GPU レイヤー数 (u32::MAX = 全レイヤー, 0 = CPU のみ)
     pub n_gpu_layers: u32,
+    /// Opt-in inference-time GPU/CPU selection (ignored with zero GPU layers).
+    pub adaptive_gpu: bool,
     /// 使用する GPU インデックス (0 = 最初の GPU, -1 = 自動)
     pub main_gpu: i32,
     /// 数字の入力幅: "fullwidth" = 全角 (０１２), "halfwidth" = 半角 (012)
@@ -459,6 +461,7 @@ impl Default for EngineConfig {
             num_candidates: 5,
             n_threads: 0,
             n_gpu_layers: 0u32,
+            adaptive_gpu: false,
             main_gpu: 0,
             digit_width: DigitWidth::default(),
             alpha_width: AlphaWidth::default(),
@@ -876,8 +879,9 @@ impl RakunEngine {
             force_inference_failure: config.force_inference_failure,
             ..Default::default()
         };
-        let mut converter = KanaKanjiConverter::with_config(backend, conv_cfg)
-            .map_err(|e| EngineError::InitFailed(e.to_string()))?;
+        let mut converter =
+            KanaKanjiConverter::with_adaptive_config(backend, conv_cfg, config.adaptive_gpu)
+                .map_err(|e| EngineError::InitFailed(e.to_string()))?;
         if config.n_threads > 0 {
             converter.set_n_threads(config.n_threads);
         }
@@ -4311,5 +4315,25 @@ mod log_rewrite_tests {
             assert_eq!(e.hiragana_from_romaji_log(), e.hiragana_text());
         }
         assert_eq!(e.current_preedit().display(), "");
+    }
+}
+
+#[cfg(test)]
+mod adaptive_config_tests {
+    use super::EngineConfig;
+
+    #[test]
+    fn adaptive_gpu_json_is_opt_in_and_preserved() {
+        assert!(!EngineConfig::default().adaptive_gpu);
+        for json in [r#"{}"#, r#"{"adaptive_gpu":false,"n_gpu_layers":16}"#] {
+            let cfg: EngineConfig = serde_json::from_str(json).unwrap();
+            assert!(!cfg.adaptive_gpu);
+        }
+        let cfg: EngineConfig =
+            serde_json::from_str(r#"{"adaptive_gpu":true,"n_gpu_layers":16}"#).unwrap();
+        assert!(cfg.adaptive_gpu);
+        let copy: EngineConfig =
+            serde_json::from_str(&serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert!(copy.adaptive_gpu);
     }
 }

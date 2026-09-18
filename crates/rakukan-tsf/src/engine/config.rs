@@ -76,6 +76,8 @@ pub struct GeneralConfig {
     #[serde(default)]
     pub n_gpu_layers: Option<u32>,
     #[serde(default)]
+    pub adaptive_gpu: bool,
+    #[serde(default)]
     pub main_gpu: i32,
     /// LLM 推論スレッド数。未指定（または 0）は llama.cpp の既定値。
     #[serde(default)]
@@ -90,6 +92,7 @@ impl Default for GeneralConfig {
             log_level: default_log_level(),
             gpu_backend: None,
             n_gpu_layers: None,
+            adaptive_gpu: false,
             main_gpu: 0,
             n_threads: None,
             model_variant: None,

@@ -1,11 +1,13 @@
 //! Backend interface for kanji conversion using llama.cpp
 
+use super::adaptive::{Device, Policy};
 use super::error::KanjiError;
 use super::hf_download::{get_tokenizer_path, get_variant_path};
 use super::llamacpp::LlamaCppModel;
 use super::model_config::{ModelFamily, VariantConfig, registry};
 use super::{CONTEXT_TOKEN, INPUT_START_TOKEN, OUTPUT_START_TOKEN};
 use crate::kana::{hiragana_to_katakana, katakana_to_hiragana};
+use std::sync::Mutex;
 
 type Result<T> = super::error::Result<T>;
 
@@ -538,6 +540,10 @@ impl Backend {
 /// Kanji converter using llama.cpp backend
 pub struct KanaKanjiConverter {
     model: LlamaCppModel,
+    cpu_model: Option<LlamaCppModel>,
+    device: Device,
+    // Index 0 is greedy; beam widths use indices 1..=30.
+    policies: Mutex<[Policy; 31]>,
     config: ConversionConfig,
     display_name: String,
 }
@@ -550,6 +556,27 @@ impl KanaKanjiConverter {
 
     /// Create a new converter with the specified backend and configuration
     pub fn with_config(backend: Backend, config: ConversionConfig) -> Result<Self> {
+        Self::with_adaptive_config(backend, config, false)
+    }
+
+    /// Keep both models in the same owner across BG transfers and reloads.
+    pub fn with_adaptive_config(
+        backend: Backend,
+        config: ConversionConfig,
+        adaptive_gpu: bool,
+    ) -> Result<Self> {
+        let cpu_model = if super::adaptive::enabled(adaptive_gpu, backend.n_gpu_layers) {
+            let mut cpu = LlamaCppModel::from_file_with_gpu_layers(
+                &backend.gguf_path,
+                &backend.tokenizer_json_path,
+                0,
+                backend.main_gpu,
+            )?;
+            cpu.disable_gpu_ops();
+            Some(cpu)
+        } else {
+            None
+        };
         let model = LlamaCppModel::from_file_with_gpu_layers(
             &backend.gguf_path,
             &backend.tokenizer_json_path,
@@ -558,6 +585,13 @@ impl KanaKanjiConverter {
         )?;
         Ok(KanaKanjiConverter {
             model,
+            cpu_model,
+            device: if backend.n_gpu_layers == 0 {
+                Device::Cpu
+            } else {
+                Device::Gpu
+            },
+            policies: Mutex::new([Policy::default(); 31]),
             config,
             display_name: backend.display_name,
         })
@@ -566,6 +600,27 @@ impl KanaKanjiConverter {
     /// Set the number of threads for inference (0 = default).
     pub fn set_n_threads(&mut self, n: u32) {
         self.model.set_n_threads(n);
+        if let Some(cpu) = &mut self.cpu_model {
+            cpu.set_n_threads(n);
+        }
+    }
+
+    fn record_inference(&self, width: usize, device: Device, elapsed_ms: f64, chars: usize) {
+        if self.cpu_model.is_none() {
+            return;
+        }
+        let mut policies = self.policies.lock().unwrap_or_else(|e| e.into_inner());
+        let old = policies[width];
+        let new = old.observe(device, elapsed_ms, chars);
+        if old.preferred != new.preferred {
+            tracing::info!(
+                from = ?old.preferred, to = ?new.preferred,
+                gpu_ms_per_char = new.gpu_ms, cpu_ms_per_char = new.cpu_ms,
+                decoding_width = width,
+                "adaptive inference device switched"
+            );
+        }
+        policies[width] = new;
     }
 
     /// Convert hiragana to kanji candidates
@@ -597,6 +652,20 @@ impl KanaKanjiConverter {
             return Ok(vec![reading.to_string()]);
         }
 
+        let beam_size = num_candidates
+            .min(self.config.beam_size.clamp(1, 30))
+            .clamp(1, 30);
+        let width = if num_candidates == 1 { 0 } else { beam_size };
+        let device = if self.cpu_model.is_some() {
+            self.policies.lock().unwrap_or_else(|e| e.into_inner())[width].next()
+        } else {
+            self.device
+        };
+        let model = if device == Device::Cpu {
+            self.cpu_model.as_ref().unwrap_or(&self.model)
+        } else {
+            &self.model
+        };
         let max_new_tokens = generation_budget(reading, self.config.max_new_tokens);
 
         // context 汚染対策: 読みのエコー源（長いかな run）を含む文を context から除去。
@@ -620,14 +689,23 @@ impl KanaKanjiConverter {
         let prompt = build_jinen_prompt(&katakana, context);
 
         // Tokenize
-        let tokens = self.model.tokenize(&prompt)?;
-        let eos = Some(self.model.eos_token_id().0);
+        let tokens = model.tokenize(&prompt)?;
+        let eos = Some(model.eos_token_id().0);
 
         if num_candidates == 1 {
             // Single candidate: use greedy decoding (faster)
-            let output_tokens = self.model.generate(&tokens, max_new_tokens, eos)?;
+            let gen_start = std::time::Instant::now();
+            let output_tokens = model.generate(&tokens, max_new_tokens, eos)?;
+            let elapsed_ms = gen_start.elapsed().as_secs_f64() * 1000.0;
+            self.record_inference(width, device, elapsed_ms, reading.chars().count());
+            tracing::info!(
+                ?device,
+                elapsed_ms,
+                reading_chars = reading.chars().count(),
+                "greedy conversion done"
+            );
             let generated = &output_tokens[tokens.len()..];
-            let text = self.model.decode(generated, true)?;
+            let text = model.decode(generated, true)?;
             let clean = clean_model_output(&text);
 
             let mut candidates = Vec::with_capacity(1);
@@ -675,12 +753,10 @@ impl KanaKanjiConverter {
         // beam 幅になる）。`config.beam_size` は安全上限として機能し、デフォルト
         // 30 で実質上限なし。変換速度を抑えたいユーザは config.toml の
         // `[conversion] beam_size` を小さく設定して明示的に上限をかける。
-        let configured_cap = self.config.beam_size.clamp(1, 30);
-        let beam_size = num_candidates.min(configured_cap).clamp(1, 30);
         let gen_start = std::time::Instant::now();
-        let results = self
-            .model
-            .generate_beam_search(&tokens, max_new_tokens, eos, beam_size)?;
+        let results = model.generate_beam_search(&tokens, max_new_tokens, eos, beam_size)?;
+        let elapsed_ms = gen_start.elapsed().as_secs_f64() * 1000.0;
+        self.record_inference(width, device, elapsed_ms, reading.chars().count());
         // 変換 1 件ごとの観測ログ。「止まる」「切れる」報告時に
         // rakukan-engine-dll.log だけで所要時間と EOS 到達状況を切り分けられる。
         tracing::info!(
@@ -688,7 +764,8 @@ impl KanaKanjiConverter {
             beam_size,
             budget = max_new_tokens,
             finished_beams = results.len(),
-            elapsed_ms = gen_start.elapsed().as_millis() as u64,
+            elapsed_ms,
+            ?device,
             "beam conversion done"
         );
 
@@ -696,7 +773,7 @@ impl KanaKanjiConverter {
         // トークン数で正規化して候補間で比較可能な自信度にする。
         let mut scored: Vec<(String, f32)> = Vec::with_capacity(results.len());
         for (output_tokens, score) in results {
-            let text = self.model.decode(&output_tokens, true)?;
+            let text = model.decode(&output_tokens, true)?;
             let clean = clean_model_output(&text);
             if clean.is_empty() || scored.iter().any(|(s, _)| s == &clean) {
                 continue;

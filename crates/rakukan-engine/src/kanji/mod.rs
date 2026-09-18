@@ -1,5 +1,6 @@
 //! 漢字変換（llama.cpp GGUF 推論）
 
+mod adaptive;
 mod backend;
 pub mod error;
 pub mod hf_download;

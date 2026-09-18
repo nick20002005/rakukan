@@ -666,6 +666,11 @@ fn create_engine() -> anyhow::Result<DynEngine> {
 /// %APPDATA%\rakukan\config.toml を読んで EngineConfig JSON を生成する。
 fn build_engine_config_json() -> String {
     let cfg = super::config::current_config();
+    engine_config_json(&cfg)
+}
+
+fn engine_config_json(cfg: &super::config::AppConfig) -> String {
+    let adaptive_gpu = cfg.general.adaptive_gpu;
     let num_candidates = cfg.effective_num_candidates();
     let main_gpu = cfg.general.main_gpu;
     let n_gpu_layers = cfg.general.n_gpu_layers.unwrap_or(u32::MAX);
@@ -721,7 +726,7 @@ fn build_engine_config_json() -> String {
         None => String::new(),
     };
     format!(
-        r#"{{"num_candidates":{num_candidates},"n_gpu_layers":{n_gpu_layers},"main_gpu":{main_gpu},"n_threads":{n_threads},"digit_width":"{digit_width}","alpha_width":"{alpha_width}","symbol_width":"{symbol_width}","digit_separator_auto":{digit_separator_auto},"digit_candidates_order":[{digit_candidates_order}],"live_conv_beam_size":{live_conv_beam_size},"convert_beam_size":{convert_beam_size},"prediction_enabled":{prediction_enabled},"prediction_max_candidates":{prediction_max_candidates},"prediction_min_reading_chars":{prediction_min_reading_chars},"rescore_enabled":{rescore_enabled},"rescore_min_reading_chars":{rescore_min_reading_chars},"rescore_min_gain":{rescore_min_gain},"force_inference_failure":{force_inference_failure}{mv_json}}}"#
+        r#"{{"num_candidates":{num_candidates},"n_gpu_layers":{n_gpu_layers},"adaptive_gpu":{adaptive_gpu},"main_gpu":{main_gpu},"n_threads":{n_threads},"digit_width":"{digit_width}","alpha_width":"{alpha_width}","symbol_width":"{symbol_width}","digit_separator_auto":{digit_separator_auto},"digit_candidates_order":[{digit_candidates_order}],"live_conv_beam_size":{live_conv_beam_size},"convert_beam_size":{convert_beam_size},"prediction_enabled":{prediction_enabled},"prediction_max_candidates":{prediction_max_candidates},"prediction_min_reading_chars":{prediction_min_reading_chars},"rescore_enabled":{rescore_enabled},"rescore_min_reading_chars":{rescore_min_reading_chars},"rescore_min_gain":{rescore_min_gain},"force_inference_failure":{force_inference_failure}{mv_json}}}"#
     )
 }
 
@@ -3676,5 +3681,23 @@ mod tests {
             state.block_selecting_full_text().as_deref(),
             Some("だいぶいいと思う、今回の男")
         );
+    }
+}
+
+#[cfg(test)]
+mod adaptive_config_tests {
+    use super::engine_config_json;
+    use crate::engine::config::AppConfig;
+
+    #[test]
+    fn adaptive_gpu_is_forwarded_in_engine_json_including_off() {
+        let default = AppConfig::default();
+        assert!(engine_config_json(&default).contains("\"adaptive_gpu\":false"));
+        for enabled in [false, true] {
+            let cfg: AppConfig =
+                toml::from_str(&format!("[general]\nadaptive_gpu = {enabled}\n")).unwrap();
+            assert_eq!(cfg.general.adaptive_gpu, enabled);
+            assert!(engine_config_json(&cfg).contains(&format!("\"adaptive_gpu\":{enabled}")));
+        }
     }
 }

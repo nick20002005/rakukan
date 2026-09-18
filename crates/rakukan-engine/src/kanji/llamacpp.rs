@@ -107,6 +107,7 @@ pub struct LlamaCppModel {
     n_threads: u32,
     /// Number of layers to offload to GPU (0 = CPU only, u32::MAX = all layers)
     n_gpu_layers: u32,
+    cpu_only_context: bool,
     /// GPU index (0 = first GPU)
     main_gpu: i32,
 }
@@ -143,6 +144,7 @@ impl LlamaCppModel {
             special_token_ids,
             n_threads: 0,
             n_gpu_layers,
+            cpu_only_context: false,
             main_gpu,
         })
     }
@@ -190,6 +192,7 @@ impl LlamaCppModel {
             special_token_ids,
             n_threads: 0,
             n_gpu_layers: 0,
+            cpu_only_context: false,
             main_gpu: 0,
         })
     }
@@ -216,6 +219,7 @@ impl LlamaCppModel {
             special_token_ids,
             n_threads: 0,
             n_gpu_layers: 0,
+            cpu_only_context: false,
             main_gpu: 0,
         })
     }
@@ -226,11 +230,21 @@ impl LlamaCppModel {
         self.n_threads = n;
     }
 
+    /// Disable even small GPU operations for the adaptive CPU fallback.
+    pub(super) fn disable_gpu_ops(&mut self) {
+        self.cpu_only_context = true;
+    }
+
     /// Build LlamaContextParams with configured n_threads
     fn context_params(&self) -> LlamaContextParams {
         let params = LlamaContextParams::default().with_n_ctx(Some(
             NonZeroU32::new(self.n_ctx).expect("n_ctx must be non-zero"),
         ));
+        let params = if self.cpu_only_context {
+            params.with_offload_kqv(false).with_op_offload(false)
+        } else {
+            params
+        };
         if self.n_threads > 0 {
             params
                 .with_n_threads(self.n_threads as i32)
