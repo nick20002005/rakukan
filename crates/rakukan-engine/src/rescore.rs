@@ -26,6 +26,7 @@
 
 use crate::kana::katakana_to_hiragana;
 use rakukan_dict::DictStore;
+use std::collections::HashMap;
 
 /// 得点に数える run の最小読み長。単漢字（`は` → `葉` 等）は辞書に載って
 /// いても偶然一致しやすく、雑音にしかならないので除く。
@@ -208,9 +209,97 @@ pub fn dict_agreement_score(store: &DictStore, reading: &str, surface: &str) -> 
         }
         if let Some(w) = run_weight(store, &run.reading, &run.surface) {
             total += w * (n * n) as f64;
+        } else if run.kind == RunKind::Kanji {
+            total += kanji_compound_score(store, &run.reading, &run.surface);
         }
     }
     Some(total)
+}
+
+/// 漢字 1 文字あたりの読みの最大長。辞書に無い漢字を読み飛ばす幅に使う。
+const MAX_READING_PER_KANJI: usize = 4;
+
+/// 辞書を引く読み片の最大長（`りんしゃんかいほう` = 9 が入る程度）。
+const MAX_PIECE_READING_CHARS: usize = 10;
+
+/// 読み片 1 つに対する辞書表記と重み。出自が重なる表記は重い方を採る。
+fn piece_surfaces(store: &DictStore, reading: &str) -> Vec<(Vec<char>, f64)> {
+    let mut out: Vec<(Vec<char>, f64)> = Vec::new();
+    let sources = [
+        (store.lookup_user(reading), WEIGHT_USER),
+        (store.lookup_learn(reading), WEIGHT_LEARN),
+        (store.lookup_dict(reading, DICT_LOOKUP_LIMIT), WEIGHT_DICT),
+    ];
+    for (surfaces, w) in sources {
+        for surface in surfaces {
+            let chars: Vec<char> = surface.chars().collect();
+            // 重みの大きい出自から順に積むので、既出の表記は捨ててよい
+            if !out.iter().any(|(s, _)| *s == chars) {
+                out.push((chars, w));
+            }
+        }
+    }
+    out
+}
+
+/// 漢字 run が丸ごとは辞書に無いとき、辞書の語の連なりとして採点する。
+///
+/// 漢字が続くと `麻雀用語` のように 1 つの run になり、`まーじゃんようご` では
+/// 辞書に当たらず 0 点になる。一方 `マージャン用語` はカタカナで run が切れるので
+/// `マージャン` と `用語` の両方が加点され、LLM が第 1 候補に出した漢字表記を
+/// カタカナ表記が追い越していた（麻雀用語・リーチ/立直・ゼッタイ/絶対 など）。
+/// そこで読みを区切って辞書を引き、表層の続きがその表記で始まっていれば
+/// 片ごとに読み長の二乗で加点する。辞書に無い漢字は 1 文字ずつ 0 点で読み飛ばす。
+///
+/// 辞書は読み片ごとに 1 回だけ引き、表層側の区切りは引いた表記との前方一致で
+/// 決める。打鍵ごとに n-best 全件へ走るので、表層×読みの総当たりにはしない。
+fn kanji_compound_score(store: &DictStore, reading: &str, surface: &str) -> f64 {
+    let r: Vec<char> = reading.chars().collect();
+    let s: Vec<char> = surface.chars().collect();
+    if s.len() < 2 || r.len() < MIN_RUN_READING_CHARS {
+        return 0.0;
+    }
+    let mut cache: HashMap<(usize, usize), Vec<(Vec<char>, f64)>> = HashMap::new();
+    // best[i][j] = 読み r[..i] と表層 s[..j] を対応させ切ったときの最高点
+    let mut best = vec![vec![f64::NEG_INFINITY; s.len() + 1]; r.len() + 1];
+    best[0][0] = 0.0;
+    for j in 0..s.len() {
+        for i in 0..r.len() {
+            let base = best[i][j];
+            if base == f64::NEG_INFINITY {
+                continue;
+            }
+            // 辞書に無い漢字 1 文字を読み飛ばす（0 点）
+            for i2 in i + 1..=(i + MAX_READING_PER_KANJI).min(r.len()) {
+                if base > best[i2][j + 1] {
+                    best[i2][j + 1] = base;
+                }
+            }
+            // 辞書の語として進む
+            for i2 in i + MIN_RUN_READING_CHARS..=(i + MAX_PIECE_READING_CHARS).min(r.len()) {
+                // 丸ごとの run は呼び出し側で引き済み
+                if i == 0 && i2 == r.len() {
+                    continue;
+                }
+                let n = i2 - i;
+                let entries = cache.entry((i, i2)).or_insert_with(|| {
+                    let piece: String = r[i..i2].iter().collect();
+                    piece_surfaces(store, &piece)
+                });
+                for (surf, w) in entries.iter() {
+                    let j2 = j + surf.len();
+                    if j2 > s.len() || s[j..j2] != surf[..] {
+                        continue;
+                    }
+                    let score = base + w * (n * n) as f64;
+                    if score > best[i2][j2] {
+                        best[i2][j2] = score;
+                    }
+                }
+            }
+        }
+    }
+    best[r.len()][s.len()].max(0.0)
 }
 
 /// n-best の中で最も辞書と整合する候補を先頭へ繰り上げる。
@@ -617,6 +706,30 @@ surfaces = ["指示"]
         let partial = dict_agreement_score(&store, reading, "指示ぶんをかくにんする").unwrap();
         let whole = dict_agreement_score(&store, reading, "指示文をかくにんする").unwrap();
         assert!(whole > partial, "whole={whole} should beat partial={partial}");
+    }
+
+    #[test]
+    fn scores_kanji_compound_by_its_dictionary_words() {
+        let (_dir, store) = store_with_user_entries(
+            r#"
+[[entries]]
+reading = "まーじゃん"
+surfaces = ["マージャン", "麻雀"]
+
+[[entries]]
+reading = "ようご"
+surfaces = ["用語"]
+"#,
+        );
+        let reading = "まーじゃんようごがぜんぜんへんかんできない";
+        // `麻雀用語` は 1 つの漢字 run になるが、`麻雀`＋`用語` として採点されるので
+        // カタカナ表記に追い越されない。
+        let cands = vec![
+            "麻雀用語が全然変換できない".to_string(),
+            "マージャン用語が全然変換できない".to_string(),
+        ];
+        let got = promote_dict_agreeing(&store, reading, cands.clone(), 12, 24.0);
+        assert_eq!(got, cands);
     }
 
     #[test]
