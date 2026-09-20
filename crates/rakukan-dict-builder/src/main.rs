@@ -224,6 +224,22 @@ struct ReadingGroup {
     tokens: Vec<(String, u16)>,
 }
 
+/// 麻雀の風牌（東南西北）は牌文字でなく普通の漢字を候補にする。
+///
+/// symbol.tsv では「とん」「なん」「しゃー」「ぺー」の読みに牌文字（U+1F000..U+1F003）が
+/// 割り当たっていて、東・南・西・北はカラム 5（付加説明）にしか入っていない。牌文字のままでは
+/// 使い道がないので surface を漢字へ差し替える。他の牌（萬子・索子・筒子・三元牌など）は
+/// 既存語と表記がぶつかるので触らない。
+fn mahjong_wind_kanji(surface: &str) -> Option<&'static str> {
+    match surface {
+        "\u{1F000}" => Some("東"),
+        "\u{1F001}" => Some("南"),
+        "\u{1F002}" => Some("西"),
+        "\u{1F003}" => Some("北"),
+        _ => None,
+    }
+}
+
 /// symbol.tsv パーサー
 ///
 /// フォーマット: POS TAB CHAR TAB Readings(space-sep) TAB description ...
@@ -252,7 +268,10 @@ fn parse_symbol_tsv(path: &PathBuf) -> Result<Vec<Entry>> {
             continue;
         }
 
-        let surface = cols[1].trim().to_string();
+        let raw_surface = cols[1].trim();
+        let surface = mahjong_wind_kanji(raw_surface)
+            .unwrap_or(raw_surface)
+            .to_string();
         let readings_raw = cols[2];
 
         if surface.is_empty() {
@@ -771,6 +790,30 @@ mod tests {
                 .iter()
                 .all(|e| cost_band::classify(e.cost) == cost_band::Class::Symbol)
         );
+    }
+
+    #[test]
+    fn test_mahjong_wind_uses_plain_kanji() {
+        // 風牌の行は牌文字でなく東南西北を surface にする。他の牌はそのまま
+        let content = [
+            "POS\tCHAR\tREADINGS\tDESC",
+            "記号\t\u{1F000}\tまーじゃん とん\t麻雀牌\t東\tSYMBOL",
+            "記号\t\u{1F003}\tまーじゃん ぺい ぺー\t麻雀牌\t北\tSYMBOL",
+            "記号\t\u{1F007}\tまーじゃん いーまん\t麻雀牌\t一萬\tSYMBOL",
+        ]
+        .join("\n");
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &content).unwrap();
+        let entries = parse_symbol_tsv(&tmp.path().to_path_buf()).unwrap();
+        let surface_of = |reading: &str| {
+            entries
+                .iter()
+                .find(|e| e.reading == reading)
+                .map(|e| e.surface.clone())
+        };
+        assert_eq!(surface_of("とん").as_deref(), Some("東"));
+        assert_eq!(surface_of("ぺー").as_deref(), Some("北"));
+        assert_eq!(surface_of("いーまん").as_deref(), Some("\u{1F007}"));
     }
 
     #[test]
