@@ -61,17 +61,36 @@ impl super::TextServiceFactory_Impl {
                 Err(_) => None,
             };
             if let Some((reading, was_waiting)) = restore.filter(|(r, _)| !r.is_empty()) {
-                tracing::warn!(
-                    "handle_action: engine reading lost (host restarted?), restoring {:?}",
-                    reading
-                );
-                engine.force_preedit(reading.clone());
-                if was_waiting {
-                    // 待っていた BG 変換は旧ホストと一緒に消えており、待機は終わらない
-                    candidate_window::stop_waiting_timer();
-                    candidate_window::hide();
-                    if let Ok(mut sess) = session_get() {
-                        sess.set_preedit(reading);
+                // 未確定のキャレットを読みの途中へ戻している間は、キャレットより右側が
+                // CARET_TAIL へ退避されていて、engine が持つのは左側だけ。
+                // 先頭へ戻した直後は engine が空になるがこれは正常で、読み全体を
+                // 戻すと退避分と二重になる。戻すのは退避分を除いた左側だけ。
+                // （2026-09-20 実ログ: ← で先頭へ → Delete で "ひがへん" が
+                // "ひがへんがへん" へ増殖）
+                let tail = crate::engine::state::caret_tail_get();
+                let head = if tail.is_empty() {
+                    reading.as_str()
+                } else if let Some(head) = reading.strip_suffix(tail.as_str()) {
+                    head
+                } else {
+                    // 退避分が読みの末尾と一致しない＝状態が壊れている。
+                    // 増殖させないよう退避を捨て、キャレットを末尾へ戻して復元する。
+                    crate::engine::state::caret_tail_clear();
+                    reading.as_str()
+                };
+                if !head.is_empty() {
+                    tracing::warn!(
+                        "handle_action: engine reading lost (host restarted?), restoring {:?}",
+                        head
+                    );
+                    engine.force_preedit(head.to_string());
+                    if was_waiting {
+                        // 待っていた BG 変換は旧ホストと一緒に消えており、待機は終わらない
+                        candidate_window::stop_waiting_timer();
+                        candidate_window::hide();
+                        if let Ok(mut sess) = session_get() {
+                            sess.set_preedit(reading);
+                        }
                     }
                 }
             }
