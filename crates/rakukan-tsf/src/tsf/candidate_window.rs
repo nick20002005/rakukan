@@ -764,6 +764,12 @@ pub fn set_placement_below() {
     TL_PLACEMENT.with(|c| c.set(Placement::Below));
 }
 
+/// 候補ウィンドウがキャレットの上側に出ているか。上側に出るのは予測ウィンドウと、
+/// そこから Tab/↓ で開いた候補リストだけなので、「予測リストを選択中か」の判定に使う。
+pub fn is_placed_above() -> bool {
+    TL_PLACEMENT.with(|c| matches!(c.get(), Placement::Above))
+}
+
 /// `placement`: `Some((側, キャレット上端))` を渡すとその側に固定する。
 /// `None` は「今の側を引き継ぐ」（候補移動・ページ送り・BG 更新の再表示用）。
 #[allow(clippy::too_many_arguments)]

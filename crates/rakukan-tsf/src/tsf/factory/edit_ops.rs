@@ -539,9 +539,14 @@ impl super::TextServiceFactory_Impl {
             drop(sess);
             return self.redraw_block_selecting(ctx, tid, sink);
         }
-        match dir {
-            CandidateDir::Next => sess.next_page(),
-            CandidateDir::Prev => sess.prev_page(),
+        // 予測から開いた候補リストでは Tab / Shift+Tab を 1 候補ずつの移動にする
+        // （予測は数件しか無くページ送りでは何も起きないため。Tab 連打で切り替える）。
+        let move_one = candidate_window::is_placed_above();
+        match (dir, move_one) {
+            (CandidateDir::Next, true) => sess.next_with_page_wrap(),
+            (CandidateDir::Prev, true) => sess.prev(),
+            (CandidateDir::Next, false) => sess.next_page(),
+            (CandidateDir::Prev, false) => sess.prev_page(),
         }
         let page_cands = sess.page_candidates();
         let page_sel = sess.page_selected();
