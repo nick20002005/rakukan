@@ -3,7 +3,18 @@ pub(super) fn enabled(opt_in: bool, gpu_layers: u32) -> bool {
     opt_in && gpu_layers > 0
 }
 
-const GPU_SIDE_CPU_PROBE_INTERVAL: u8 = 50;
+// A healthy GPU runs at ~10-20 ms per reading char. Below this the GPU is
+// never worth leaving, so no CPU probe is spent: a CPU probe is a real user
+// conversion, and under CPU contention it has taken 8-30 s (2026-09-19).
+const GPU_SLOW_MS_PER_CHAR: f64 = 40.0;
+// While the GPU is slow, refresh the CPU baseline every N GPU conversions.
+const SLOW_GPU_CPU_PROBE_INTERVAL: u8 = 8;
+// While on CPU, probe the GPU often so we return quickly once it frees up.
+const CPU_SIDE_GPU_PROBE_INTERVAL: u8 = 4;
+// A CPU conversion this slow means the CPU is contended; stop using it at once
+// instead of waiting for averaged evidence.
+const CPU_BAIL_MS_PER_CHAR: f64 = 300.0;
+const CPU_BAIL_TOTAL_MS: f64 = 3000.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Device {
@@ -33,24 +44,33 @@ impl Default for Policy {
 }
 
 impl Policy {
+    fn gpu_is_slow(&self) -> bool {
+        self.gpu_ms.is_some_and(|g| g >= GPU_SLOW_MS_PER_CHAR)
+    }
+
     pub fn next(self) -> Device {
-        // Obtain a CPU baseline after three GPU conversions, then refresh it
-        // rarely: CPU speed barely changes, and every CPU probe is a slow
-        // conversion for the user. While on CPU, probe the GPU often so we
-        // return quickly once it frees up. Probes serve the request; never run
-        // inference twice.
-        let interval = match (self.preferred, self.cpu_ms) {
-            (Device::Gpu, None) => 3,
-            (Device::Gpu, Some(_)) => GPU_SIDE_CPU_PROBE_INTERVAL,
-            (Device::Cpu, _) => 8,
-        };
-        if self.since_probe >= interval {
-            match self.preferred {
-                Device::Gpu => Device::Cpu,
-                Device::Cpu => Device::Gpu,
+        // Probes serve the request; never run inference twice.
+        match self.preferred {
+            Device::Gpu => {
+                // Touch the CPU only once the GPU itself is measurably slow.
+                let interval = if self.cpu_ms.is_none() {
+                    1
+                } else {
+                    SLOW_GPU_CPU_PROBE_INTERVAL
+                };
+                if self.gpu_is_slow() && self.since_probe >= interval {
+                    Device::Cpu
+                } else {
+                    Device::Gpu
+                }
             }
-        } else {
-            self.preferred
+            Device::Cpu => {
+                if self.since_probe >= CPU_SIDE_GPU_PROBE_INTERVAL {
+                    Device::Gpu
+                } else {
+                    Device::Cpu
+                }
+            }
         }
     }
 
@@ -70,11 +90,20 @@ impl Policy {
         } else {
             self.since_probe = 0;
         }
+        if device == Device::Cpu
+            && self.preferred == Device::Cpu
+            && (sample >= CPU_BAIL_MS_PER_CHAR || elapsed_ms >= CPU_BAIL_TOTAL_MS)
+        {
+            self.preferred = Device::Gpu;
+            self.evidence = 0;
+            self.since_probe = 0;
+            return self;
+        }
         if let (Some(gpu), Some(cpu)) = (self.gpu_ms, self.cpu_ms) {
             let switch = match self.preferred {
-                Device::Gpu => gpu > cpu * 1.30,
+                Device::Gpu => self.gpu_is_slow() && gpu > cpu * 1.30,
                 // Only GPU probes count as recovery evidence.
-                Device::Cpu => gpu < cpu * 0.85,
+                Device::Cpu => !self.gpu_is_slow() || gpu < cpu * 0.85,
             };
             if !switch {
                 self.evidence = 0;
@@ -107,42 +136,43 @@ mod tests {
     }
 
     #[test]
-    fn calibrates_and_probes_without_duplicate_inference() {
+    fn healthy_gpu_never_probes_cpu() {
         let mut p = Policy::default();
-        for _ in 0..3 {
+        for _ in 0..200 {
             assert_eq!(p.next(), Device::Gpu);
-            p = p.observe(Device::Gpu, 100.0, 10);
+            p = p.observe(Device::Gpu, 150.0, 10);
         }
-        assert_eq!(p.next(), Device::Cpu);
-        p = p.observe(Device::Cpu, 200.0, 10);
-        for _ in 0..GPU_SIDE_CPU_PROBE_INTERVAL {
-            assert_eq!(p.next(), Device::Gpu);
-            p = p.observe(Device::Gpu, 100.0, 10);
-        }
-        assert_eq!(p.next(), Device::Cpu);
+        assert_eq!(p.cpu_ms, None);
     }
 
     #[test]
     fn slow_gpu_requires_evidence_and_recovery_requires_probes() {
-        let mut p = Policy::default().observe(Device::Cpu, 100.0, 10);
-        p = p.observe(Device::Gpu, 200.0, 10);
+        let mut p = Policy::default().observe(Device::Gpu, 500.0, 10);
+        assert_eq!(p.next(), Device::Cpu);
+        p = p.observe(Device::Cpu, 300.0, 10);
         assert_eq!(p.preferred, Device::Gpu);
-        p = p.observe(Device::Gpu, 200.0, 10);
+        p = p.observe(Device::Gpu, 500.0, 10);
         assert_eq!(p.preferred, Device::Cpu);
-        for _ in 0..8 {
+        for _ in 0..CPU_SIDE_GPU_PROBE_INTERVAL {
             assert_eq!(p.next(), Device::Cpu);
-            p = p.observe(Device::Cpu, 100.0, 10);
+            p = p.observe(Device::Cpu, 300.0, 10);
         }
         assert_eq!(p.next(), Device::Gpu);
-        p = p.observe(Device::Gpu, 10.0, 10);
-        p = p.observe(Device::Gpu, 10.0, 10);
+        p = p.observe(Device::Gpu, 100.0, 10);
         assert_eq!(p.preferred, Device::Cpu);
-        for _ in 0..8 {
-            p = p.observe(Device::Cpu, 100.0, 10);
-        }
-        assert_eq!(p.preferred, Device::Cpu);
-        p = p.observe(Device::Gpu, 10.0, 10);
+        p = p.observe(Device::Gpu, 100.0, 10);
         assert_eq!(p.preferred, Device::Gpu);
+    }
+
+    #[test]
+    fn contended_cpu_conversion_returns_to_gpu_immediately() {
+        let mut p = Policy::default().observe(Device::Gpu, 500.0, 10);
+        p = p.observe(Device::Cpu, 300.0, 10);
+        p = p.observe(Device::Gpu, 500.0, 10);
+        assert_eq!(p.preferred, Device::Cpu);
+        p = p.observe(Device::Cpu, 8285.0, 4);
+        assert_eq!(p.preferred, Device::Gpu);
+        assert_eq!(p.next(), Device::Gpu);
     }
 
     #[test]
