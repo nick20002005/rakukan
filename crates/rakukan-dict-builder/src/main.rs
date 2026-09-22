@@ -224,20 +224,17 @@ struct ReadingGroup {
     tokens: Vec<(String, u16)>,
 }
 
-/// 麻雀の風牌（東南西北）は牌文字でなく普通の漢字を候補にする。
+/// 麻雀牌は牌文字でなく普通の漢字（東・発・一萬 など）を候補にする。
 ///
-/// symbol.tsv では「とん」「なん」「しゃー」「ぺー」の読みに牌文字（U+1F000..U+1F003）が
-/// 割り当たっていて、東・南・西・北はカラム 5（付加説明）にしか入っていない。牌文字のままでは
-/// 使い道がないので surface を漢字へ差し替える。他の牌（萬子・索子・筒子・三元牌など）は
-/// 既存語と表記がぶつかるので触らない。
-fn mahjong_wind_kanji(surface: &str) -> Option<&'static str> {
-    match surface {
-        "\u{1F000}" => Some("東"),
-        "\u{1F001}" => Some("南"),
-        "\u{1F002}" => Some("西"),
-        "\u{1F003}" => Some("北"),
-        _ => None,
+/// symbol.tsv の麻雀牌の行は、読み（「とん」「はつ」「いーまん」など）に牌文字（U+1F000..）が
+/// 割り当たっていて、漢字はカラム 5（付加説明）にしか入っていない。牌文字は絵文字として描画され
+/// 使い道がないので、カラム 4 が「麻雀牌」の行は surface をカラム 5 の漢字へ差し替える。
+/// はく→白 のように既存語と重なる表記は、候補マージ時の重複除去で消える。
+fn mahjong_tile_kanji<'a>(cols: &[&'a str]) -> Option<&'a str> {
+    if cols.get(3).map(|c| c.trim()) != Some("麻雀牌") {
+        return None;
     }
+    cols.get(4).map(|c| c.trim()).filter(|c| !c.is_empty())
 }
 
 /// symbol.tsv パーサー
@@ -262,14 +259,14 @@ fn parse_symbol_tsv(path: &PathBuf) -> Result<Vec<Entry>> {
             continue;
         }
 
-        let cols: Vec<&str> = line.splitn(4, '\t').collect();
+        let cols: Vec<&str> = line.splitn(6, '\t').collect();
         if cols.len() < 3 {
             skipped += 1;
             continue;
         }
 
         let raw_surface = cols[1].trim();
-        let surface = mahjong_wind_kanji(raw_surface)
+        let surface = mahjong_tile_kanji(&cols)
             .unwrap_or(raw_surface)
             .to_string();
         let readings_raw = cols[2];
@@ -793,13 +790,15 @@ mod tests {
     }
 
     #[test]
-    fn test_mahjong_wind_uses_plain_kanji() {
-        // 風牌の行は牌文字でなく東南西北を surface にする。他の牌はそのまま
+    fn test_mahjong_tiles_use_plain_kanji() {
+        // 麻雀牌の行は牌文字でなくカラム 5 の漢字を surface にする。他の記号はそのまま
         let content = [
             "POS\tCHAR\tREADINGS\tDESC",
             "記号\t\u{1F000}\tまーじゃん とん\t麻雀牌\t東\tSYMBOL",
             "記号\t\u{1F003}\tまーじゃん ぺい ぺー\t麻雀牌\t北\tSYMBOL",
+            "記号\t\u{1F005}\tまーじゃん はつ\t麻雀牌\t発\tSYMBOL",
             "記号\t\u{1F007}\tまーじゃん いーまん\t麻雀牌\t一萬\tSYMBOL",
+            "記号\t\u{2605}\tほし\t黒星\t\tSYMBOL",
         ]
         .join("\n");
         let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -813,7 +812,9 @@ mod tests {
         };
         assert_eq!(surface_of("とん").as_deref(), Some("東"));
         assert_eq!(surface_of("ぺー").as_deref(), Some("北"));
-        assert_eq!(surface_of("いーまん").as_deref(), Some("\u{1F007}"));
+        assert_eq!(surface_of("はつ").as_deref(), Some("発"));
+        assert_eq!(surface_of("いーまん").as_deref(), Some("一萬"));
+        assert_eq!(surface_of("ほし").as_deref(), Some("\u{2605}"));
     }
 
     #[test]
