@@ -678,10 +678,14 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
                 // 集合は resolve_action ①.5 と同じ（keymap.rs の essential_fallback_action）。
                 match crate::engine::keymap::essential_fallback_action(vk) {
                     Some(a) => a,
-                    None => return Ok(FALSE),
+                    None => {
+                        self.idle_key_prelude(None);
+                        return Ok(FALSE);
+                    }
                 }
             }
         };
+        self.idle_key_prelude(Some(&action));
 
         // ロックなし高速チェック: アトミックでモード取得（try_lock 失敗でも正確）
         // コンパートメントは内部状態から導出して書く「通知」であり、真の状態ではない。
@@ -756,9 +760,11 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
                     vk,
                     reason: "unmapped",
                 });
+                self.idle_key_prelude(None);
                 return Ok(FALSE);
             }
         };
+        self.idle_key_prelude(Some(&action));
         let ctx = match pic {
             Some(c) => c.clone(),
             None => {
@@ -871,6 +877,27 @@ impl TextServiceFactory_Impl {
             unsafe {
                 let _ = sink.OnUpdate(TF_LBI_ICON | TF_LBI_TEXT);
             }
+        }
+    }
+
+    /// キー入力の入口で呼ぶ（`OnTestKeyDown` / `OnKeyDown` の両方）。
+    ///
+    /// 無入力が閾値を超えて IME がオンのまま残っていたら、このキーの処理の前にオフにする
+    /// （後続の `ime_mode_get_atomic()` 判定がオフを見て、キーは直接入力としてアプリへ流れる）。
+    /// ただし `ImeToggle` / `ImeOn` / `ImeOff` のときはしない。表示がオンのまま残っているのを
+    /// 見て半角/全角を押した人が、自動オフ → トグルでオンに戻されるのを防ぐ。
+    /// そのあと活動時刻を更新し、オンなら無入力タイマーを張る（張り済みなら何もしない）。
+    fn idle_key_prelude(&self, action: Option<&UserAction>) {
+        let is_ime_ctrl = matches!(
+            action,
+            Some(UserAction::ImeToggle | UserAction::ImeOn | UserAction::ImeOff)
+        );
+        if !is_ime_ctrl && crate::tsf::candidate_window::idle_off_if_due() {
+            self.notify_langbar_update();
+        }
+        crate::engine::state::idle_activity_touch();
+        if crate::engine::state::ime_mode_get_atomic().is_on() {
+            crate::tsf::candidate_window::arm_idle_off_timer(true);
         }
     }
 

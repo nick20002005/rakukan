@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::SystemTime;
 
@@ -247,6 +247,10 @@ pub struct InputConfig {
     /// 使う。アクティブ化後 1 回だけ適用し、その後は操作した状態が続く。
     #[serde(default)]
     pub ime_on_apps: Vec<String>,
+    /// アプリ（プロセス）ごとに、最後のキー入力からこの秒数が過ぎたら IME を自動でオフにする。
+    /// 0 = 無効（既定）。未確定文字がある・候補選択中など入力途中のときは何もしない。
+    #[serde(default)]
+    pub auto_off_idle_secs: u64,
 }
 
 /// `ime_off_apps` の既定値。
@@ -284,6 +288,7 @@ impl Default for InputConfig {
             auto_learn: default_auto_learn(),
             ime_off_apps: default_ime_off_apps(),
             ime_on_apps: Vec::new(),
+            auto_off_idle_secs: 0,
         }
     }
 }
@@ -522,6 +527,7 @@ fn publish_atomics(cfg: &AppConfig) {
             .clamp(MIN_CANDIDATE_FONT_HEIGHT, MAX_CANDIDATE_FONT_HEIGHT),
         Ordering::Relaxed,
     );
+    AUTO_OFF_IDLE_SECS.store(cfg.input.auto_off_idle_secs, Ordering::Relaxed);
 }
 
 const MIN_CANDIDATE_FONT_HEIGHT: i32 = 10;
@@ -532,6 +538,14 @@ static CANDIDATE_FONT_HEIGHT: AtomicI32 = AtomicI32::new(DEFAULT_CANDIDATE_FONT_
 /// 候補ウィンドウのフォント高さ（ピクセル）。描画パスから毎行呼ばれる想定でロックしない。
 pub fn candidate_font_height() -> i32 {
     CANDIDATE_FONT_HEIGHT.load(Ordering::Relaxed)
+}
+
+/// `input.auto_off_idle_secs` の実行時コピー。打鍵経路・タイマーからロックなしで読む。
+static AUTO_OFF_IDLE_SECS: AtomicU64 = AtomicU64::new(0);
+
+/// 無入力で IME を自動オフにするまでの秒数（0 = 無効）。
+pub fn auto_off_idle_secs() -> u64 {
+    AUTO_OFF_IDLE_SECS.load(Ordering::Relaxed)
 }
 
 /// `refresh_appearance_if_changed` 用の mtime キャッシュ。
@@ -734,6 +748,9 @@ ime_off_apps = ["conhost.exe", "WindowsTerminal.exe", "mintty.exe", "wezterm-gui
 # Photoshop の文字ツールのように、入力のたびに別の入力先が作られるアプリで使う。
 # アクティブ化後 1 回だけ適用し、その後は操作した状態が続く。
 ime_on_apps = []
+# アプリごとに、最後のキー入力からこの秒数が過ぎたら IME を自動でオフにする (0 = 無効)。
+# 未確定文字がある・候補選択中など入力途中のときは何もしない。
+auto_off_idle_secs = 0
 
 [live_conversion]
 enabled = false

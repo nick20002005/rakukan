@@ -67,6 +67,16 @@ pub fn apply(
         });
     }
 
+    // 無入力による自動オフ（input.auto_off_idle_secs）の起点。
+    // オフ→オンはそこから数え始める。ただしフォーカス復元は「活動」に数えない。
+    if new.is_on() {
+        if from == Some(ImeMode::Off) && source != "focus_change" {
+            crate::engine::state::idle_activity_touch();
+        }
+        // TSF スレッド以外から呼ばれうるので、HWND が無ければ何もしない
+        crate::tsf::candidate_window::arm_idle_off_timer(false);
+    }
+
     // 言語バーは呼び出し側で即時更新する。ここでは取りこぼし防止のフラグだけ立てる。
     crate::engine::state::langbar_update_set();
     tray_ipc::publish(new);

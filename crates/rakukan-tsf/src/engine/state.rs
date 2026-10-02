@@ -47,6 +47,72 @@ pub fn ime_mode_get_atomic() -> ImeMode {
     }
 }
 
+// ─── 無入力検知（input.auto_off_idle_secs）────────────────────────────────────
+
+/// このプロセスで最後にキーが来た（または IME がオンになった）時刻（`GetTickCount64`、ms）。
+/// 0 = まだ一度も記録なし（この場合は「期限切れ」と判定しない）。
+static LAST_ACTIVITY_MS: AtomicU64 = AtomicU64::new(0);
+
+/// 現在の tick（ms）。スリープ中も進むので、離席して戻った場合も無入力に数えられる。
+#[inline]
+pub fn idle_now_ms() -> u64 {
+    unsafe { windows::Win32::System::SystemInformation::GetTickCount64() }
+}
+
+/// 活動を記録する（0 は「未記録」の印なので 1 に丸める）。
+#[inline]
+pub fn idle_activity_touch() {
+    LAST_ACTIVITY_MS.store(idle_now_ms().max(1), AO::Release);
+}
+
+#[inline]
+pub fn idle_last_activity_ms() -> u64 {
+    LAST_ACTIVITY_MS.load(AO::Acquire)
+}
+
+/// 無入力が `secs` 秒以上続いたか。`secs == 0`（無効）や未記録（`last == 0`）は偽。
+pub fn idle_is_expired(last_ms: u64, now_ms: u64, secs: u64) -> bool {
+    secs > 0 && last_ms != 0 && now_ms.saturating_sub(last_ms) >= secs.saturating_mul(1000)
+}
+
+/// 設定が有効で、無入力が閾値を超えているか。
+pub fn idle_expired_now() -> bool {
+    idle_is_expired(
+        idle_last_activity_ms(),
+        idle_now_ms(),
+        super::config::auto_off_idle_secs(),
+    )
+}
+
+/// 入力途中（未確定文字・キャレット退避・候補選択中）か。
+///
+/// `OnTestKeyDown` の `has_preedit` / `session_is_selecting_fast()` と同じ基準。
+/// タイマー側から呼ぶのでエンジンは新規作成せず、ロックが取れない（処理中）場合は
+/// 入力途中とみなして何もしない側に倒す。
+pub fn input_in_progress() -> bool {
+    let has_preedit = match RAKUKAN_ENGINE.try_lock() {
+        Ok(g) => g.0.as_ref().is_some_and(|e| !e.preedit_is_empty()),
+        Err(_) => true,
+    };
+    has_preedit || !caret_tail_is_empty() || session_is_selecting_fast()
+}
+
+/// フォーカス復帰で記憶モードを復元するとき、オンのまま無入力が閾値を超えていたらオフにする。
+/// 記憶側（呼び出し元で書き戻す）もオフに揃える。
+fn idle_off_on_restore(saved: ImeMode) -> ImeMode {
+    if saved.is_on() && idle_expired_now() {
+        tracing::info!("doc_mode: idle auto-off on focus restore");
+        ImeMode::Off
+    } else {
+        saved
+    }
+}
+
+/// 無入力による自動オフを今行うべきか（設定>0・現在オン・閾値超え・入力途中でない）。
+pub fn idle_off_due() -> bool {
+    ime_mode_get_atomic().is_on() && idle_expired_now() && !input_in_progress()
+}
+
 // ─── EngineWrapper ────────────────────────────────────────────────────────────
 // Safety: TSF は STA で動作し、Mutex で保護するため Send/Sync を許容する。
 // ただし ホットパスでは try_lock() しか使わないことを必ず守ること。
@@ -2999,13 +3065,19 @@ pub fn doc_mode_on_focus_change(
         if let Some(&saved) = store.dm_modes.get(&next_dm_ptr) {
             // 既知の DM → 前回モードを復元
             tracing::debug!("doc_mode: restored mode={saved:?} from dm={next_dm_ptr:#x}");
+            let saved = idle_off_on_restore(saved);
+            store.dm_modes.insert(next_dm_ptr, saved);
             saved
         } else if let Some(&saved) = store.hwnd_modes.get(&next_hwnd) {
             // DM は新規だが同じ HWND → HWND 経由で復元（ブラウザの DM 再作成対応）
             tracing::debug!(
                 "doc_mode: restored mode={saved:?} from hwnd={next_hwnd:#x} (dm={next_dm_ptr:#x} is new)"
             );
+            let saved = idle_off_on_restore(saved);
             store.dm_modes.insert(next_dm_ptr, saved);
+            if next_hwnd != 0 {
+                store.hwnd_modes.insert(next_hwnd, saved);
+            }
             saved
         } else {
             // 完全初回 → デフォルトモードを記録して返す
@@ -3182,6 +3254,15 @@ mod tests {
 
     /// `ime_on_apps` の適用は「アプリ本体以外の入力先に初めて入ったとき 1 回だけ」
     /// （Issue #51）。2 回目以降は操作した状態を維持するので適用しない。
+    /// 無入力判定: 無効(0)・未記録は期限切れにしない。閾値ちょうどで期限切れ。
+    #[test]
+    fn idle_expiry_rules() {
+        assert!(!idle_is_expired(1_000, 100_000, 0));
+        assert!(!idle_is_expired(0, 100_000, 30));
+        assert!(!idle_is_expired(1_000, 30_999, 30));
+        assert!(idle_is_expired(1_000, 31_000, 30));
+    }
+
     #[test]
     fn ime_on_applies_once_for_a_non_base_input() {
         // アプリ本体（アクティブ化後に最初に見た入力先）では適用しない

@@ -194,6 +194,9 @@ thread_local! {
     static TL_THREAD_MGR: RefCell<Option<ITfThreadMgr>> = const { RefCell::new(None) };
     /// Activate 時にキャッシュする TSF client_id。
     static TL_CLIENT_ID: Cell<u32> = const { Cell::new(0) };
+    /// 無入力タイマーを張った先の HWND 値（0 = 張っていない）。bool でなく HWND 値で持つのは、
+    /// Deactivate の `destroy()` でウィンドウが作り直されると、タイマーごと失われるため。
+    static TL_IDLE_TIMER_HWND: Cell<isize> = const { Cell::new(0) };
 
     // ─── [M1.7 T-MODE2] フォーカス中 DM / HWND キャッシュ ─────────────────────────
     // `IMEState::set_mode` から呼ぶ `doc_mode_remember_current` が、モード変更の
@@ -322,6 +325,10 @@ unsafe extern "system" fn wnd_proc(
             // [Live] ライブ変換タイマー
             if wparam.0 == LIVE_TIMER_ID {
                 crate::tsf::candidate_window::on_live_timer();
+            }
+            // 無入力 IME 自動オフタイマー
+            if wparam.0 == IDLE_OFF_TIMER_ID {
+                on_idle_off_timer();
             }
             LRESULT(0)
         }
@@ -1160,6 +1167,129 @@ fn process_openclose_change() {
     crate::tsf::ime_sync::apply(Some(&tm), tid, new_mode, false, "external_openclose");
     hide();
     stop_live_timer();
+}
+
+// ─── 無入力での IME 自動オフ（input.auto_off_idle_secs）─────────────────────────
+
+const IDLE_OFF_TIMER_ID: usize = 0x1236;
+/// USER タイマーの上限（約 24.8 日）。
+const IDLE_TIMER_MAX_MS: u64 = 0x7FFF_FFFF;
+
+fn set_idle_timer(hwnd: HWND, ms: u64) {
+    let ms = ms.clamp(100, IDLE_TIMER_MAX_MS) as u32;
+    let id = unsafe { SetTimer(hwnd, IDLE_OFF_TIMER_ID, ms, None) };
+    TL_IDLE_TIMER_HWND.with(|c| c.set(if id != 0 { hwnd.0 as isize } else { 0 }));
+}
+
+fn kill_idle_timer() {
+    let hwnd = get_hwnd();
+    if is_valid(hwnd) {
+        unsafe {
+            let _ = KillTimer(hwnd, IDLE_OFF_TIMER_ID);
+        }
+    }
+    TL_IDLE_TIMER_HWND.with(|c| c.set(0));
+}
+
+/// 無入力タイマーを張る（設定が 0 なら張らない）。
+///
+/// 🔴 **既に張ってあるなら張り直さない**。同じ (hwnd, id) への `SetTimer` は周期を先頭から
+/// やり直すので、打鍵ごとに呼ぶと発火しなくなる（ライブ変換タイマーと同じ罠）。
+/// 「張ってある」は張った先の HWND 値で判定する（ウィンドウが作り直されたら張り直す）。
+///
+/// `create = false` は TSF スレッド以外から呼ばれうる経路用で、HWND が無ければ黙って何もしない
+/// （HWND はスレッドローカルなので、他スレッドでウィンドウを作ってもメッセージが回らない）。
+pub fn arm_idle_off_timer(create: bool) {
+    let secs = crate::engine::config::auto_off_idle_secs();
+    if secs == 0 {
+        return;
+    }
+    let hwnd = if create { ensure_hwnd() } else { get_hwnd() };
+    if !is_valid(hwnd) {
+        return;
+    }
+    if TL_IDLE_TIMER_HWND.with(|c| c.get()) == hwnd.0 as isize {
+        return;
+    }
+    set_idle_timer(hwnd, secs.saturating_mul(1000));
+}
+
+/// このプロセスのウィンドウが前面か。
+fn is_foreground_process() -> bool {
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+    unsafe {
+        let fg = GetForegroundWindow();
+        if fg.0.is_null() {
+            return false;
+        }
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(fg, Some(&mut pid));
+        pid != 0 && pid == GetCurrentProcessId()
+    }
+}
+
+/// IME を無入力によりオフにする共通処理（タイマー・打鍵経路から）。
+/// 外部要因でモードを変える `process_openclose_change` と同じ後始末をする。
+fn do_idle_off() {
+    use crate::engine::ime_mode::ImeMode;
+    let tm_opt = TL_THREAD_MGR.with(|c| c.borrow().clone());
+    let tid = TL_CLIENT_ID.with(|c| c.get());
+    crate::tsf::ime_sync::apply(tm_opt.as_ref(), tid, ImeMode::Off, true, "idle_off");
+    hide();
+    stop_live_timer();
+    kill_idle_timer();
+    tracing::info!("idle auto-off: IME On → Off");
+}
+
+/// 打鍵時の最終防衛線。無入力が閾値を超えていて入力途中でなければ IME をオフにする。
+/// 切り替えたら `true`（呼び出し側が言語バーを更新する）。
+pub fn idle_off_if_due() -> bool {
+    if !crate::engine::state::idle_off_due() {
+        return false;
+    }
+    do_idle_off();
+    true
+}
+
+/// WM_TIMER(IDLE_OFF_TIMER_ID)。
+fn on_idle_off_timer() {
+    use crate::engine::state::{
+        idle_is_expired, idle_last_activity_ms, idle_now_ms, ime_mode_get_atomic,
+        input_in_progress,
+    };
+    let secs = crate::engine::config::auto_off_idle_secs();
+    // a. 無効化された・既にオフ → 止める（次にオンになる/打鍵されるときに張り直す）
+    if secs == 0 || !ime_mode_get_atomic().is_on() {
+        kill_idle_timer();
+        return;
+    }
+    // b. まだ閾値に達していない → 残り時間で張り直す
+    let last = idle_last_activity_ms();
+    let now = idle_now_ms();
+    if !idle_is_expired(last, now, secs) {
+        let total = secs.saturating_mul(1000);
+        let wait = if last == 0 {
+            total
+        } else {
+            total.saturating_sub(now.saturating_sub(last))
+        };
+        set_idle_timer(get_hwnd(), wait);
+        return;
+    }
+    // c. 入力途中 → 勝手に確定も破棄もしない。次の打鍵で張り直される
+    if input_in_progress() {
+        kill_idle_timer();
+        return;
+    }
+    // d. 前面が別プロセス → ここで apply するとトレイが前面アプリとずれる。
+    //    フォーカス復帰時・次の打鍵時の判定に任せる
+    if !is_foreground_process() {
+        kill_idle_timer();
+        return;
+    }
+    // e. オフにする
+    do_idle_off();
 }
 
 /// OnSetFocus から呼ばれる。イベントをキューに積み、WM_APP_FOCUS_CHANGED を
