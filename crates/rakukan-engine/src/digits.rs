@@ -600,7 +600,7 @@ fn symbol_candidates(s: &str, fullwidth_first: bool) -> Vec<String> {
     let full = to_fullwidth_symbol(s);
     if half == full {
         vec![half]
-    } else if fullwidth_first {
+    } else if fullwidth_first && !half.contains('_') {
         vec![full, half]
     } else {
         vec![half, full]

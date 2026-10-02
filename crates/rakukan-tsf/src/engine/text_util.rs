@@ -37,6 +37,8 @@ pub(crate) fn direct_input_symbol(c: char) -> Option<char> {
         '!' => Some('！'),
         '~' => Some('〜'),
         '\x5C' | '\u{A5}' => Some('\u{FFE5}'),
+        // 識別子・ファイル名で使うので半角のまま入れる（全角 `＿` は変換候補に出る）
+        '_' => Some('_'),
         '、' | '。' | '「' | '」' | '・' | '？' | '！' | '〜' | '\u{FFE5}' => Some(c),
         '-' => None,
         _ if c.is_ascii_graphic() && !c.is_ascii_alphanumeric() => {

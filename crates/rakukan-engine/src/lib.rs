@@ -1046,9 +1046,13 @@ impl RakunEngine {
             let is_ascii_printable = (0x21..=0x7E).contains(&n);
             let is_trie_symbol = matches!(c, ',' | '.' | '/' | '[' | ']' | '\\' | '-');
             if is_ascii_printable && !is_trie_symbol && !c.is_ascii_alphanumeric() {
+                // `_` は識別子・ファイル名で使うので symbol_width に関係なく半角。
+                // 全角 `＿` は変換候補の 2 番目に残る。
                 let out = match self.config.symbol_width {
-                    SymbolWidth::Fullwidth => char::from_u32(n - 0x21 + 0xFF01).unwrap_or(c),
-                    SymbolWidth::Halfwidth => c,
+                    SymbolWidth::Fullwidth if c != '_' => {
+                        char::from_u32(n - 0x21 + 0xFF01).unwrap_or(c)
+                    }
+                    _ => c,
                 };
                 self.hiragana_buf.push(out);
                 self.log_push(c, out, InputKind::Symbol);
@@ -2545,6 +2549,17 @@ mod symbol_input_tests {
         assert!(push("", '@').ends_with('＠'));
         assert!(push("", '(').ends_with('（'));
         assert!(push("", ')').ends_with('）'));
+    }
+
+    #[test]
+    fn underscore_stays_halfwidth_with_fullwidth_symbols() {
+        let config = crate::EngineConfig {
+            symbol_width: crate::SymbolWidth::Fullwidth,
+            ..Default::default()
+        };
+        let mut e = RakunEngine::new(config);
+        e.push_char('_');
+        assert_eq!(e.hiragana_text(), "_");
     }
 
     #[test]
