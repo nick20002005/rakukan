@@ -2413,7 +2413,7 @@ fn catch_up_live_preview(
             let restarted = if engine.bg_status() == "running" {
                 false
             } else {
-                let Some(n_cands) = crate::engine::state::live_bg_start_n_cands(reading) else {
+                let Some(n_cands) = crate::engine::state::commit_catchup_bg_n_cands(reading) else {
                     tracing::info!("[Live] commit catch-up: bg not startable for {:?}", reading);
                     return (preview, true);
                 };

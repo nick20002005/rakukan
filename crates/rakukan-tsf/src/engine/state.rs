@@ -801,6 +801,18 @@ pub fn live_bg_start_n_cands(reading: &str) -> Option<usize> {
     }
 }
 
+/// Enter 時の追いつき変換用。`live_bg_start_n_cands` は区読点で終わる読み
+/// (`きょうは、`) では起動しないが、確定の直前はそれだと区読点の手前の未変換
+/// かながそのまま確定する（2026-09-26: `たちええでぃたー、` を速打ちして Enter →
+/// `立ち絵エディたー、`）。末尾の区読点を外した読みで起動可否を判定する。
+pub fn commit_catchup_bg_n_cands(reading: &str) -> Option<usize> {
+    let body = reading.trim_end_matches(super::text_util::is_kuten);
+    if body.is_empty() {
+        return None;
+    }
+    live_bg_start_n_cands(body)
+}
+
 pub fn start_live_bg_if_ready(engine: &DynEngine, reading: &str) -> bool {
     let Some(n) = live_bg_start_n_cands(reading) else {
         return false;
