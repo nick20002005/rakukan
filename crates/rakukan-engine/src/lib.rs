@@ -333,6 +333,11 @@ const PREDICTION_MIN_READING_COVERAGE: f64 = 1.0 / 3.0;
 /// 満たす予測が下位にあれば拾えるようにする。
 const PREDICTION_OVERFETCH: usize = 4;
 
+/// MOZC か LLM がひらがな表記をこの順位以内に返したら、ひらがなを 2 番目に置く。
+/// `から` `ので` のような助詞・機能語は無変換が本命なのに、文字種候補として
+/// 末尾（数ページ先）へ回されていた。
+const HIRAGANA_HEAD_RANK: usize = 3;
+
 /// な行かなを「ん + 母音」に開いた代替読みを列挙する。
 ///
 /// ローマ字入力では `n` + 母音 が な行になるので、「げんいん」を出すには
@@ -1683,6 +1688,11 @@ impl RakunEngine {
         // 長文は辞書が完全一致で引けず LLM の区切りだけで決まるので、
         // 先に n-best の並びを辞書との整合で見直す（集合は変えない）。
         let llm_candidates = self.rescore_llm_candidates(hiragana, llm_candidates);
+        let llm_head: Vec<String> = llm_candidates
+            .iter()
+            .take(HIRAGANA_HEAD_RANK)
+            .cloned()
+            .collect();
         let user_cands: Vec<String> = self
             .dict_store
             .as_ref()
@@ -1922,6 +1932,29 @@ impl RakunEngine {
             }
         }
         merged.truncate(limit.max(1));
+
+        // 7.5 ひらがな表記が本命の読み（`から` など）は、ひらがなを 2 番目に置く。
+        //
+        //     MOZC の読みそのものは `additional_dict` で落としてあり（Space 直後の
+        //     候補 0 番＝composition がひらがなのままになるのを避けるため）、
+        //     放っておくと 8. の文字種候補として末尾に回る。MOZC か LLM が上位に
+        //     返しているなら、先頭は譲ったうえで予測より前に出す。
+        //
+        //     🔴 読みと異なる候補が無いときは動かさない（preview は
+        //     `find(|c| c != reading)` で採るので、ここは 0 件の穴に当たらない）。
+        //     英字が残った読み（7. の英数候補が先頭 2 つを持つ）は対象外。
+        let hiragana_ranked_high = !hiragana.chars().any(|c| c.is_ascii_alphabetic())
+            && dict_cands
+            .iter()
+            .take(HIRAGANA_HEAD_RANK)
+            .chain(llm_head.iter())
+            .any(|c| c == hiragana);
+        //     既に 2 番目以内にあるなら（LLM が先頭に返した等）動かさない＝上げるだけ。
+        let already_high = merged.iter().take(2).any(|c| c == hiragana);
+        if hiragana_ranked_high && !already_high && merged.iter().any(|c| c != hiragana) {
+            merged.retain(|c| c != hiragana);
+            merged.insert(1, hiragana.to_string());
+        }
 
         // 8. 文字種候補（末尾）: ひらがな → カタカナ → 半角英数 → 全角英数。
         //
@@ -3192,6 +3225,28 @@ priority = "low"
         engine.set_dict_store(store);
         let merged = engine.merge_candidates_for_reading("らーめん", vec![], 40);
         assert_eq!(merged.first().map(String::as_str), Some("拉麺"));
+    }
+
+    #[test]
+    fn hiragana_ranked_high_by_llm_comes_second() {
+        // `から` は無変換が本命なのに、学習語・予測・辞書の後ろへ押し出されていた。
+        let dir = tempfile::tempdir().unwrap();
+        let user_path = dir.path().join("user_dict.toml");
+        fs::write(&user_path, "").unwrap();
+        let store = DictStore::load(Some(&user_path), None, None).unwrap();
+
+        let mut engine = RakunEngine::new(EngineConfig::default());
+        engine.set_dict_store(store);
+        engine.learn_force("から", "空");
+        engine.learn_force("からーきー", "カラーキー");
+
+        let merged = engine.merge_candidates_for_reading(
+            "から",
+            vec!["殻".to_string(), "から".to_string(), "唐".to_string()],
+            40,
+        );
+        assert_eq!(merged.first().map(String::as_str), Some("空"));
+        assert_eq!(merged.get(1).map(String::as_str), Some("から"));
     }
 
     #[test]
