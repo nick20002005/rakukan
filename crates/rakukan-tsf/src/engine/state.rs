@@ -1412,6 +1412,13 @@ pub enum SessionState {
         /// ← の戻り先の下限。既にアプリへ書き込んだブロックへ戻ると、
         /// composition の prefix として再描画されて二重に入るため。
         committed_blocks: usize,
+        /// Shift+←/→ で文節の右端を動かしている間、後続（`current_index + 1` の
+        /// 1 ブロック）をひらがなのまま置いて変換を先送りしているか。
+        ///
+        /// 後続は文末か次の区読点まであるので、押すたびに変換し直すと長文で
+        /// 重い。調整を抜けるキーが来た時に 1 回だけ変換する
+        /// ([`Self::block_selecting_resolve_tail`])。
+        tail_deferred: bool,
         #[allow(dead_code)]
         pos_x: i32,
         #[allow(dead_code)]
@@ -1580,6 +1587,7 @@ impl SessionState {
             full_reading,
             committed_prefix: String::new(),
             committed_blocks: 0,
+            tail_deferred: false,
             pos_x,
             pos_y,
         };
@@ -1783,6 +1791,7 @@ impl SessionState {
         if let SessionState::BlockSelecting {
             blocks,
             current_index,
+            tail_deferred,
             ..
         } = self
         {
@@ -1799,6 +1808,68 @@ impl SessionState {
             let at = (idx + 1).min(blocks.len());
             for (i, tb) in tail_blocks.into_iter().enumerate() {
                 blocks.insert(at + i, tb);
+            }
+            *tail_deferred = false;
+        }
+    }
+
+    /// [`Self::block_selecting_resize`] の後、選択中の文節だけ候補を差し直し、
+    /// 後続 `tail_reading` はひらがなの 1 ブロックとして置いて変換を先送りする。
+    pub fn block_selecting_apply_resize_deferred(
+        &mut self,
+        cur_candidates: Vec<String>,
+        tail_reading: String,
+        tail_punct: Option<char>,
+    ) {
+        let tail_blocks = if tail_reading.is_empty() {
+            Vec::new()
+        } else {
+            vec![ConversionBlock {
+                candidates: vec![tail_reading.clone()],
+                reading: tail_reading,
+                trailing_punct: tail_punct,
+                selected: 0,
+                expanded: false,
+            }]
+        };
+        let deferred = !tail_blocks.is_empty();
+        self.block_selecting_apply_resize(cur_candidates, tail_blocks);
+        if let SessionState::BlockSelecting { tail_deferred, .. } = self {
+            *tail_deferred = deferred;
+        }
+    }
+
+    /// 変換を先送りしている後続の `(読み, 区読点)`。先送りしていなければ `None`。
+    pub fn block_selecting_deferred_tail(&self) -> Option<(String, Option<char>)> {
+        if let SessionState::BlockSelecting {
+            blocks,
+            current_index,
+            tail_deferred: true,
+            ..
+        } = self
+        {
+            let b = blocks.get(*current_index + 1)?;
+            return Some((b.reading.clone(), b.trailing_punct));
+        }
+        None
+    }
+
+    /// 先送りしていた後続のひらがなブロックを、変換済みの文節列に差し替える。
+    pub fn block_selecting_resolve_tail(&mut self, tail_blocks: Vec<ConversionBlock>) {
+        if let SessionState::BlockSelecting {
+            blocks,
+            current_index,
+            tail_deferred,
+            ..
+        } = self
+        {
+            if !*tail_deferred {
+                return;
+            }
+            *tail_deferred = false;
+            let at = *current_index + 1;
+            if at < blocks.len() && !tail_blocks.is_empty() {
+                blocks.splice(at..=at, tail_blocks);
             }
         }
     }
@@ -3413,6 +3484,39 @@ mod tests {
         assert_eq!(s.block_selecting_full_text().unwrap(), "今日は晴れ。明日");
         assert_eq!(s.block_selecting_current_candidate(), Some("今日"));
         assert!(s.block_selecting_current_expanded());
+    }
+
+    #[test]
+    fn block_resize_deferred_keeps_tail_as_reading_until_resolved() {
+        let mut s = block_session(vec![
+            block("きょうは", "今日は", None),
+            block("はれ", "晴れ", Some('。')),
+            block("あした", "明日", None),
+        ]);
+        let (_, tail, punct) = s.block_selecting_resize(false).unwrap();
+        s.block_selecting_apply_resize_deferred(vec!["今日".into()], tail, punct);
+        // 後続はひらがなのまま 1 ブロックで、組の外（あした）は触らない
+        assert_eq!(s.block_selecting_full_text().unwrap(), "今日ははれ。明日");
+        assert_eq!(
+            s.block_selecting_deferred_tail(),
+            Some(("ははれ".to_string(), Some('。')))
+        );
+        // 続けて動かしても、ひらがなの後続を取り込んで 1 ブロックのまま
+        let (cur, tail, punct) = s.block_selecting_resize(true).unwrap();
+        assert_eq!((cur.as_str(), tail.as_str()), ("きょうは", "はれ"));
+        s.block_selecting_apply_resize_deferred(vec!["今日は".into()], tail, punct);
+        assert_eq!(s.block_selecting_full_text().unwrap(), "今日ははれ。明日");
+        // 抜けるときに変換済みの文節列へ差し替える
+        s.block_selecting_resolve_tail(vec![block("はれ", "晴れ", Some('。'))]);
+        assert_eq!(s.block_selecting_full_text().unwrap(), "今日は晴れ。明日");
+        assert_eq!(s.block_selecting_deferred_tail(), None);
+        // 後続が空になる伸ばし方では先送りしない
+        let (_, tail, punct) = s.block_selecting_resize(true).unwrap();
+        s.block_selecting_apply_resize_deferred(vec!["今日はは".into()], tail, punct);
+        let (_, tail, punct) = s.block_selecting_resize(true).unwrap();
+        assert_eq!(tail, "");
+        s.block_selecting_apply_resize_deferred(vec!["今日は晴れ".into()], tail, punct);
+        assert_eq!(s.block_selecting_deferred_tail(), None);
     }
 
     #[test]

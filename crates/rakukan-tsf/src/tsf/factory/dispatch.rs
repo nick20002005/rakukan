@@ -493,6 +493,21 @@ impl super::TextServiceFactory_Impl {
             }
         }
 
+        // Shift+←/→ の調整中にひらがなのまま置いていた後続を、調整を抜ける
+        // キーの処理に入る前に変換する。読みへ戻すだけのキーでは変換しない。
+        let keeps_deferred_tail = matches!(
+            action,
+            UserAction::SegmentShrink
+                | UserAction::SegmentExtend
+                | UserAction::Cancel
+                | UserAction::CancelAll
+                | UserAction::Backspace
+                | UserAction::Delete
+        );
+        if !keeps_deferred_tail {
+            super::edit_ops::resolve_deferred_tail(engine);
+        }
+
         match action {
             UserAction::Input(c) => {
                 if let Some(symbol) = text_util::direct_input_symbol(c) {

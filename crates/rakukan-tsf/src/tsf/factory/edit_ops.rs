@@ -105,6 +105,31 @@ fn convert_tail_blocks(
     }
 }
 
+/// Shift+←/→ の調整中にひらがなのまま先送りしていた後続を変換する。
+///
+/// 調整を抜けるキー（Enter・→・Space など）の処理に入る前に呼ぶ。
+/// session のロックを持ったまま呼ばないこと。
+pub(super) fn resolve_deferred_tail(engine: &mut crate::engine::state::DynEngine) {
+    let Some((tail, punct)) = session_get()
+        .ok()
+        .and_then(|sess| sess.block_selecting_deferred_tail())
+    else {
+        return;
+    };
+    tracing::debug!("resolve_deferred_tail: tail={:?} punct={:?}", tail, punct);
+    engine.bg_reclaim();
+    let tail_blocks = convert_tail_blocks(engine, &tail, punct);
+    if let Ok(mut sess) = session_get() {
+        sess.block_selecting_resolve_tail(tail_blocks);
+        // 変換で engine の読みが後続に変わっているので、選択中の文節へ戻す
+        if let Some(cur) = sess.block_selecting_current_reading() {
+            if !cur.is_empty() {
+                engine.force_preedit(cur);
+            }
+        }
+    }
+}
+
 /// 読みが辞書に載っている語かどうか（文節の切れ目として使えるか）。
 ///
 /// 短文予測も LLM も引かない `dict_lookup` を使う。`merge_candidates_for_reading`
@@ -1266,7 +1291,9 @@ impl super::TextServiceFactory_Impl {
     }
 
     /// Shift+←/→ の文節変換中の処理: 選択中の文節の右端を 1 文字動かし、
-    /// その文節と後続を再変換する。
+    /// その文節だけ再変換する。後続はひらがなに戻して置き、調整を抜ける時に
+    /// 1 回だけ変換する（[`resolve_deferred_tail`]）。押すたびに後続まで
+    /// 変換すると、長文では 1 打鍵ごとに長文変換が走って重い。
     fn resize_block_selecting(
         &self,
         ctx: ITfContext,
@@ -1292,9 +1319,7 @@ impl super::TextServiceFactory_Impl {
         let llm_limit = crate::engine::state::get_num_candidates();
         engine.force_preedit(cur.clone());
         let cur_cands = engine_convert_sync_multi(engine, llm_limit, BLOCK_PAGE_SIZE, &cur, &cur);
-        let tail_blocks = convert_tail_blocks(engine, &tail, punct);
-        session_get()?.block_selecting_apply_resize(cur_cands, tail_blocks);
-        engine.force_preedit(cur);
+        session_get()?.block_selecting_apply_resize_deferred(cur_cands, tail, punct);
         drop(guard);
         self.redraw_block_selecting(ctx, tid, sink)
     }
