@@ -574,6 +574,154 @@ pub fn apply_learned_runs(
     (out, rewrite)
 }
 
+/// 文中の登録語を差し替える対象にする、読みの最小・最大文字数。
+///
+/// 短い読みは別の語の並びに偶然現れやすい（`きょうか`・`はいてい`）。5 文字以上の
+/// 登録語は固有名詞がほとんどで、文中に偶然現れることはまず無い。
+const USER_WORD_MIN_READING_CHARS: usize = 5;
+const USER_WORD_MAX_READING_CHARS: usize = 24;
+
+/// LLM の表記が一般語かどうかを MOZC 辞書で確かめるときの候補上限。
+const USER_WORD_DICT_LOOKUP_LIMIT: usize = 256;
+
+/// 読みの文字位置 → 表層の文字位置。その位置で表層を切れないときは `None`。
+///
+/// かな・英数の run は 1 文字ずつ対応するので途中でも切れる。漢字 run は読みの
+/// 内訳が分からないので両端でしか切れない。
+fn reading_cut_points(runs: &[AlignedRun], reading_chars: usize) -> Vec<Option<usize>> {
+    let mut cuts: Vec<Option<usize>> = vec![None; reading_chars + 1];
+    let (mut rpos, mut spos) = (0usize, 0usize);
+    for run in runs {
+        let rn = run.reading.chars().count();
+        let sn = run.surface.chars().count();
+        cuts[rpos] = Some(spos);
+        if run.kind != RunKind::Kanji && rn == sn {
+            for k in 1..rn {
+                cuts[rpos + k] = Some(spos + k);
+            }
+        }
+        rpos += rn;
+        spos += sn;
+    }
+    cuts[rpos] = Some(spos);
+    cuts
+}
+
+/// ユーザー辞書の登録語を、長文の候補の途中にも効かせる。
+///
+/// `apply_learned_runs` は表層の run 1 つぶんしか見ないので、LLM が登録語を
+/// 複数の run に割って出すと拾えない。`はいていじゃんそう → 海底雀荘` を登録して
+/// いても、文中では `ハイテイ雀荘`（カタカナ＋漢字）や `履いていじゃんそう`
+/// （漢字＋かな）になり、どの run の読みも登録語と一致しない。
+///
+/// そこで読みの側から登録語を探し、その区間に当たる表層を登録表記へ差し替えた
+/// 候補を **先頭に足す**。元の第 1 候補は 2 番目に残る。断られたら
+/// （元の候補が確定されたら）`LearnedRewrite` 経由でその読みに LLM の表記を
+/// 学習し、次からは差し替えない。
+///
+/// 候補が 0 件のときは何もしない。読み全体が登録語なら merge 側の完全一致に任せる。
+pub fn apply_user_words(
+    store: &DictStore,
+    reading: &str,
+    candidates: Vec<String>,
+) -> (Vec<String>, Option<LearnedRewrite>) {
+    let Some(first) = candidates.first().cloned() else {
+        return (candidates, None);
+    };
+    let reading_chars: Vec<char> = reading.chars().collect();
+    let n = reading_chars.len();
+    let mut hits = store.user_words_within(
+        reading,
+        USER_WORD_MIN_READING_CHARS,
+        USER_WORD_MAX_READING_CHARS,
+    );
+    hits.retain(|(start, end, _)| end - start < n);
+    if hits.is_empty() {
+        return (candidates, None);
+    }
+    let Some(runs) = align(reading, &first) else {
+        return (candidates, None);
+    };
+    let cuts = reading_cut_points(&runs, n);
+    let surface_chars: Vec<char> = first.chars().collect();
+
+    // 長い登録語を優先し、重なる区間は捨てる。
+    hits.sort_by_key(|(start, end, _)| (std::cmp::Reverse(end - start), *start));
+    let mut picked: Vec<(usize, usize, usize, usize, String)> = Vec::new();
+    for (start, end, surfaces) in hits {
+        if picked.iter().any(|p| start < p.1 && p.0 < end) {
+            continue;
+        }
+        let (Some(s), Some(e)) = (cuts[start], cuts[end]) else {
+            continue;
+        };
+        let span_reading: String = reading_chars[start..end].iter().collect();
+        let span_surface: String = surface_chars[s..e].iter().collect();
+        let learned = store.lookup_learn(&span_reading);
+        // 登録表記のどれか、または自分で選んだことのある表記なら触らない。
+        if surfaces.contains(&span_surface) || learned.contains(&span_surface) {
+            continue;
+        }
+        // LLM がその読みの一般語を 1 語で出しているなら同音異義。登録語で塗り替えない
+        // （`とうじょう → 東條` を登録していても、文中の `登場` はそのまま）。
+        // 差し替えるのは、登録語がばらばらに割れて出たときだけ。
+        if store
+            .lookup_dict(&span_reading, USER_WORD_DICT_LOOKUP_LIMIT)
+            .contains(&span_surface)
+        {
+            continue;
+        }
+        // 登録表記が複数あるときは、よく選んでいるものを使う。
+        let word = learned
+            .iter()
+            .find(|l| surfaces.contains(l))
+            .unwrap_or(&surfaces[0]);
+        if !has_kanji_or_katakana(word) {
+            continue;
+        }
+        picked.push((start, end, s, e, word.clone()));
+    }
+    if picked.is_empty() {
+        return (candidates, None);
+    }
+
+    picked.sort_by_key(|p| p.2);
+    let mut rewritten = String::new();
+    let mut declined: Vec<(String, String)> = Vec::new();
+    let mut pos = 0usize;
+    for (start, end, s, e, word) in &picked {
+        rewritten.extend(&surface_chars[pos..*s]);
+        rewritten.push_str(word);
+        declined.push((
+            reading_chars[*start..*end].iter().collect(),
+            surface_chars[*s..*e].iter().collect(),
+        ));
+        pos = *e;
+    }
+    rewritten.extend(&surface_chars[pos..]);
+
+    tracing::info!(
+        reading = %reading,
+        from = %first,
+        to = %rewritten,
+        "rescore: applied user words"
+    );
+    let mut out: Vec<String> = Vec::with_capacity(candidates.len() + 1);
+    out.push(rewritten);
+    for c in candidates {
+        if !out.contains(&c) {
+            out.push(c);
+        }
+    }
+    (
+        out,
+        Some(LearnedRewrite {
+            original: first,
+            runs: declined,
+        }),
+    )
+}
+
 /// `apply_learned_runs` が差し替えた内容。`original` が確定されたら、
 /// `runs` の `(読み, LLM の表記)` を学習して次から差し替えないようにする。
 #[derive(Clone, Debug, PartialEq)]
@@ -865,6 +1013,54 @@ surfaces = ["用語"]
         let cands = vec!["根元まで口で腹".to_string()];
         let (got, _) = apply_learned_runs(&store, "ねもとまでくちでふく", cands);
         assert_eq!(got[1], "根元まで口で服");
+    }
+
+    #[test]
+    fn applies_user_word_split_across_runs() {
+        let (_dir, store) = store_with_user_entries(
+            r#"
+[[entries]]
+reading = "はいていじゃんそう"
+surfaces = ["海底雀荘"]
+
+[[entries]]
+reading = "はいてい"
+surfaces = ["海底", "ハイテイ"]
+"#,
+        );
+        let reading = "もちべはあきらかにはいていじゃんそうにかたむいている";
+        // 実ログで出た 2 つの割れ方: カタカナ＋漢字、漢字＋かな。
+        for llm in [
+            "モチベは明らかにハイテイ雀荘に傾いている",
+            "モチベは明らかに履いていじゃんそうに傾いている",
+        ] {
+            let (got, rewrite) = apply_user_words(&store, reading, vec![llm.to_string()]);
+            assert_eq!(
+                got,
+                vec![
+                    "モチベは明らかに海底雀荘に傾いている".to_string(),
+                    llm.to_string(),
+                ]
+            );
+            assert_eq!(rewrite.unwrap().original, llm);
+        }
+
+        // LLM が登録表記を出していれば触らない。
+        let cands = vec!["モチベは明らかに海底雀荘に傾いている".to_string()];
+        let (got, rewrite) = apply_user_words(&store, reading, cands.clone());
+        assert_eq!(got, cands);
+        assert!(rewrite.is_none());
+
+        // 読み全体が登録語なら merge 側の完全一致に任せる。
+        let cands = vec!["ハイテイ雀荘".to_string()];
+        let (got, _) = apply_user_words(&store, "はいていじゃんそう", cands.clone());
+        assert_eq!(got, cands);
+
+        // 断られた表記を覚えたら、次からは差し替えない。
+        store.learn_force("はいていじゃんそう", "ハイテイ雀荘");
+        let cands = vec!["モチベは明らかにハイテイ雀荘に傾いている".to_string()];
+        let (got, _) = apply_user_words(&store, reading, cands.clone());
+        assert_eq!(got, cands);
     }
 
     #[test]

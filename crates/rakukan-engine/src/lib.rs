@@ -2100,8 +2100,9 @@ impl RakunEngine {
             self.config.rescore_min_reading_chars,
             self.config.rescore_min_gain,
         );
+        let (candidates, word_rewrite) = rescore::apply_user_words(store, reading, candidates);
         let (candidates, rewrite) = rescore::apply_learned_runs(store, reading, candidates);
-        if let Some(rewrite) = rewrite
+        if let Some(rewrite) = rewrite.or(word_rewrite)
             && let Ok(mut slot) = self.last_learned_rewrite.lock()
         {
             *slot = Some((reading.to_string(), rewrite));

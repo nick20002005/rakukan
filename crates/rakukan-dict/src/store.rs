@@ -728,6 +728,46 @@ impl DictStore {
         user_low.get(reading).cloned().unwrap_or_default()
     }
 
+    /// `reading` の部分文字列のうち、ユーザー辞書（normal / low）の読みと一致する
+    /// ものを `(開始文字位置, 終了文字位置, 表記一覧)` で返す。
+    ///
+    /// 長文の途中に現れた登録語を拾うためのもの（engine の
+    /// `rescore::apply_user_words`）。部分文字列ごとに `lookup_user` を呼ぶと
+    /// そのたびに辞書ファイルの更新確認が走るので、確認とロックを 1 回で済ませる。
+    pub fn user_words_within(
+        &self,
+        reading: &str,
+        min_chars: usize,
+        max_chars: usize,
+    ) -> Vec<(usize, usize, Vec<String>)> {
+        self.reload_user_if_changed();
+        let (Ok(user), Ok(user_low)) = (self.inner.user.read(), self.inner.user_low.read()) else {
+            return vec![];
+        };
+        let idx: Vec<usize> = reading
+            .char_indices()
+            .map(|(i, _)| i)
+            .chain(std::iter::once(reading.len()))
+            .collect();
+        let n = idx.len() - 1;
+        let mut out = Vec::new();
+        for start in 0..n {
+            for end in (start + min_chars.max(1))..=n.min(start + max_chars) {
+                let key = &reading[idx[start]..idx[end]];
+                let mut surfaces = user.get(key).cloned().unwrap_or_default();
+                for s in user_low.get(key).into_iter().flatten() {
+                    if !surfaces.contains(s) {
+                        surfaces.push(s.clone());
+                    }
+                }
+                if !surfaces.is_empty() {
+                    out.push((start, end, surfaces));
+                }
+            }
+        }
+        out
+    }
+
     /// ひらがな読みから mozc の通常語候補を返す（ユーザー辞書・記号・絵文字を除く。
     /// cost 昇順、最大 `limit` 件）
     pub fn lookup_dict(&self, reading: &str, limit: usize) -> Vec<String> {
