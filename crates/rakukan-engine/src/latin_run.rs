@@ -53,7 +53,7 @@
 /// 左端に日本語の前置きが無いことを疑うための手掛かりでもある。
 const PARTICLES: [char; 10] = ['の', 'を', 'は', 'が', 'に', 'で', 'と', 'も', 'や', 'へ'];
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 struct LatinWords {
@@ -63,6 +63,9 @@ struct LatinWords {
     /// 後ろの境界を緩めると `makeru` → `makeる` のように日本語を壊すので、
     /// 助詞・「する」の直前でしか復元しない。
     readable: HashSet<String>,
+    /// リストに大文字入りで書かれた語の綴り（小文字 → `DLsite`）。
+    /// 打鍵の大文字小文字にかかわらず、この綴りで復元する。
+    canonical: HashMap<String, String>,
     max_len: usize,
 }
 
@@ -71,13 +74,19 @@ impl LatinWords {
         let mut words = HashSet::new();
         let mut terms = HashSet::new();
         let mut readable = HashSet::new();
+        let mut canonical = HashMap::new();
         let mut conv = crate::romaji::RomajiConverter::new();
         for (text, explicit) in [(standard, false), (user, true)] {
             for line in text.lines() {
-                let word = line.trim();
-                if word.len() < 3 || !word.bytes().all(|c| c.is_ascii_lowercase()) {
+                let written = line.trim();
+                if written.len() < 3 || !written.bytes().all(|c| c.is_ascii_alphabetic()) {
                     continue;
                 }
+                let lower = written.to_ascii_lowercase();
+                if lower != written {
+                    canonical.insert(lower.clone(), written.to_string());
+                }
+                let word = lower.as_str();
                 conv.reset();
                 for c in word.chars() {
                     conv.push(c);
@@ -98,7 +107,7 @@ impl LatinWords {
             }
         }
         let max_len = words.iter().map(String::len).max().unwrap_or(0);
-        Self { words, terms, readable, max_len }
+        Self { words, terms, readable, canonical, max_len }
     }
 }
 
@@ -122,11 +131,29 @@ fn latin_words() -> &'static LatinWords {
         );
         let mut dictionary = LatinWords::from_lists(standard, &user);
         dictionary.terms = include_str!("../data/latin_extra.txt").lines()
-            .chain(user.lines().map(str::trim))
-            .filter(|word| dictionary.words.contains(*word))
-            .map(str::to_string).collect();
+            .chain(user.lines())
+            .map(|word| word.trim().to_ascii_lowercase())
+            .filter(|word| dictionary.words.contains(word))
+            .collect();
         dictionary
     })
+}
+
+/// 「する」の活用の頭。英字のすぐ後ろにこれが続く語（`DLsite` = `DL` + して）は、
+/// 日本語（DLして）とも読める。
+const SURU_HEADS: [&str; 9] = ["して", "した", "する", "すれ", "しな", "しま", "しよ", "しろ", "しち"];
+
+/// 読みの中で見つけた英単語の区間。
+struct Span {
+    /// `hiragana` 上のバイト範囲
+    range: std::ops::Range<usize>,
+    /// 復元する綴り（リストに大文字入りで書かれていればその綴り、無ければ打鍵どおり）
+    word: String,
+    /// 日本語としても読める形（`DLして`）。英字 + 「する」の活用で終わる語だけが持つ。
+    japanese: Option<String>,
+    /// 読みの中で英字へ戻してよいか。`japanese` を持つ語は、後ろが名詞に付く助詞の
+    /// ときだけ戻す（`DLsiteの`。`DLしてください` `DLしても` は日本語のまま）。
+    restore: bool,
 }
 
 /// ログの境界で最長一致を探し、互いに重ならない区間を左から復元する。
@@ -140,6 +167,26 @@ pub(crate) fn normalize_latin_spans(
     normalize_with_words(log, detached_at, hiragana, pending, latin_words())
 }
 
+/// 英語とも日本語とも読める語（`DLsite` / `DLして`）の
+/// `(英語の綴り, 日本語の形, 打鍵どおりの読み)`。
+///
+/// どちらを意図したかは読みから決まらないので、変換結果の本命候補を
+/// もう一方へ読み替えた候補を出すのに使う（`insert_dual_reading_variant`）。
+pub(crate) fn dual_reading_words(
+    log: &[crate::InputEntry],
+    detached_at: usize,
+    hiragana: &str,
+    pending: &str,
+) -> Vec<(String, String, String)> {
+    find_spans(log, detached_at, hiragana, pending, latin_words())
+        .into_iter()
+        .filter_map(|span| {
+            let japanese = span.japanese?;
+            Some((span.word, japanese, hiragana[span.range].to_string()))
+        })
+        .collect()
+}
+
 fn normalize_with_words(
     log: &[crate::InputEntry],
     detached_at: usize,
@@ -147,36 +194,67 @@ fn normalize_with_words(
     pending: &str,
     dictionary: &LatinWords,
 ) -> Option<String> {
-    if log.is_empty() || detached_at != 0 {
+    let mut restored = String::new();
+    let mut cursor = 0;
+    let mut changed = false;
+    for span in find_spans(log, detached_at, hiragana, pending, dictionary) {
+        if !span.restore {
+            continue;
+        }
+        restored.push_str(&hiragana[cursor..span.range.start]);
+        restored.push_str(&span.word);
+        cursor = span.range.end;
+        changed = true;
+    }
+    if !changed {
         return None;
+    }
+    restored.push_str(&hiragana[cursor..]);
+    Some(restored)
+}
+
+fn find_spans(
+    log: &[crate::InputEntry],
+    detached_at: usize,
+    hiragana: &str,
+    pending: &str,
+    dictionary: &LatinWords,
+) -> Vec<Span> {
+    let mut spans = Vec::new();
+    if log.is_empty() || detached_at != 0 {
+        return spans;
     }
     let logged: String = log.iter().map(|e| e.output.as_str()).collect();
     if logged != hiragana {
-        return None;
+        return spans;
     }
+    // 語に含めてよいのは、小文字のローマ字と Shift+英字（`Dlsite` の `D`）。
     let mut entries: Vec<(&str, &str, bool)> = log.iter()
-        .map(|e| (e.typed.as_str(), e.output.as_str(), e.kind == crate::InputKind::Romaji))
+        .map(|e| (e.typed.as_str(), e.output.as_str(), match e.kind {
+            crate::InputKind::Romaji => e.typed.bytes().all(|c| c.is_ascii_lowercase()),
+            crate::InputKind::ShiftAlpha => e.typed.bytes().all(|c| c.is_ascii_uppercase()),
+            _ => false,
+        }))
         .collect();
     if !pending.is_empty() {
-        entries.push((pending, "", true));
+        entries.push((pending, "", pending.bytes().all(|c| c.is_ascii_lowercase())));
     }
     let mut offsets = vec![0];
     for (_, output, _) in &entries {
         offsets.push(offsets.last().unwrap() + output.len());
     }
-    let mut restored = String::new();
-    let mut cursor = 0;
     let mut start = 0;
-    let mut changed = false;
     while start < entries.len() {
         let mut typed = String::new();
+        let mut raw = String::new();
         let mut longest = None;
         for end in start..entries.len() {
-            let (keys, _, romaji) = entries[end];
-            if !romaji || !keys.bytes().all(|c| c.is_ascii_lowercase()) {
+            let (keys, _, usable) = entries[end];
+            if !usable {
                 break;
             }
-            typed.push_str(keys);
+            raw.push_str(keys);
+            typed.push_str(&keys.to_ascii_lowercase());
             if typed.len() > dictionary.max_len {
                 break;
             }
@@ -198,35 +276,66 @@ fn normalize_with_words(
             {
                 continue;
             }
+            let word = dictionary.canonical.get(&typed).cloned().unwrap_or_else(|| raw.clone());
             let right = &hiragana[offsets[end + 1]..];
-            // 助詞・「する」の活用、または日本語の前置きがある末尾だけを境界とする。
-            let at_end = end + 1 == entries.len();
-            let boundary = right.chars().next().is_some_and(is_boundary_particle)
-                || ["する", "した", "して", "しない", "します", "すれば", "しよう"]
-                    .iter().any(|suffix| right.starts_with(suffix));
-            // 補助リスト・ユーザー指定語でローマ字として読めない語は、後ろが何でも
-            // 英単語として切る（`googleから` `githubって` `discordだよ`）。
-            let loose = dictionary.terms.contains(&typed) && !dictionary.readable.contains(&typed);
-            if (at_end && start > 0) || (!right.is_empty() && (boundary || loose)) {
-                longest = Some((end + 1, typed.clone()));
+            // 英字のすぐ後ろが「する」の活用で終わる語（`dl` + して）は日本語とも読める。
+            let kana_tail = hiragana[offsets[start]..offsets[end + 1]]
+                .trim_start_matches(|c: char| !is_kana(c));
+            let japanese = (dictionary.terms.contains(&typed)
+                && kana_tail.chars().all(is_kana)
+                && SURU_HEADS.iter().any(|head| kana_tail.starts_with(head)))
+                .then(|| format!("{}{kana_tail}", &word[..leading_letters(&typed, kana_tail)]));
+            let restore = if japanese.is_some() {
+                // 名詞に付く助詞の前だけ。は・も は「しては」「しても」と区別できない。
+                right.chars().next().is_some_and(|c| is_boundary_particle(c) && c != 'は' && c != 'も')
+            } else {
+                // 助詞・「する」の活用、または日本語の前置きがある末尾だけを境界とする。
+                let at_end = end + 1 == entries.len();
+                let boundary = right.chars().next().is_some_and(is_boundary_particle)
+                    || ["する", "した", "して", "しない", "します", "すれば", "しよう"]
+                        .iter().any(|suffix| right.starts_with(suffix));
+                // 補助リスト・ユーザー指定語でローマ字として読めない語は、後ろが何でも
+                // 英単語として切る（`googleから` `githubって` `discordだよ`）。
+                let loose = dictionary.terms.contains(&typed) && !dictionary.readable.contains(&typed);
+                (at_end && start > 0) || (!right.is_empty() && (boundary || loose))
+            };
+            if restore || japanese.is_some() {
+                longest = Some((end + 1, Span {
+                    range: offsets[start]..offsets[end + 1],
+                    word,
+                    japanese,
+                    restore,
+                }));
             }
         }
-        if let Some((end, word)) = longest {
-            restored.push_str(&hiragana[cursor..offsets[start]]);
-            restored.push_str(&word);
-            cursor = offsets[end];
+        if let Some((end, span)) = longest {
+            spans.push(span);
             start = end;
-            changed = true;
         } else {
             start += 1;
         }
     }
-    if changed {
-        restored.push_str(&hiragana[cursor..]);
-        Some(restored)
-    } else {
-        None
-    }
+    spans
+}
+
+fn is_kana(c: char) -> bool {
+    matches!(c, 'ぁ'..='ゖ' | 'ー')
+}
+
+/// 語の先頭の、かなにならなかった英字の数（`dlsite` と かな尾 `して` なら `dl` の 2）。
+/// かな尾を打ったローマ字の綴りは 1 通りでない（si / shi）ので、後ろ側を実際に
+/// ローマ字変換器へ通して、かな尾と一致する切れ目を探す。
+fn leading_letters(typed: &str, kana_tail: &str) -> usize {
+    let mut conv = crate::romaji::RomajiConverter::new();
+    (1..typed.len())
+        .find(|&i| {
+            conv.reset();
+            for c in typed[i..].chars() {
+                conv.push(c);
+            }
+            conv.buffer().is_empty() && conv.output() == kana_tail
+        })
+        .unwrap_or(typed.len())
 }
 
 fn is_boundary_particle(c: char) -> bool {
@@ -360,7 +469,8 @@ mod tests {
         let dictionary = super::LatinWords::from_lists("sushi\nmake\ntomato\nanime\nsake\nno\nto\nit\n", "sushi\nno\nWithCase\nbad-word\n");
         assert!(!dictionary.words.contains("make"));
         assert!(!dictionary.words.contains("it"));
-        assert_eq!(dictionary.words.len(), 1);
+        assert_eq!(dictionary.words.len(), 2);
+        assert_eq!(dictionary.canonical.get("withcase").map(String::as_str), Some("WithCase"));
         let e = engine_after("sushiwotaberu");
         assert_eq!(super::normalize_with_words(&e.input_log, 0, &e.hiragana_buf,
             &e.pending_romaji_buf, &dictionary).as_deref(), Some("sushiをたべる"));
@@ -425,6 +535,31 @@ mod tests {
         let e = engine_after("makeru");
         assert!(super::normalize_with_words(&e.input_log, 0, &e.hiragana_buf,
             &e.pending_romaji_buf, &dictionary).is_none());
+    }
+
+    /// `DLsite` は `DL` + して とも読める。名詞に付く助詞の前だけ英語にし、
+    /// どちらの場合も読み替え用の組を返す。大文字小文字はリストの綴りへ揃える。
+    #[test]
+    fn suru_tailed_word_restores_only_before_noun_particle() {
+        let dictionary = super::LatinWords::from_lists("", "DLsite\n");
+        let run = |e: &crate::RakunEngine| {
+            super::normalize_with_words(&e.input_log, 0, &e.hiragana_buf, &e.pending_romaji_buf, &dictionary)
+        };
+        let mut e = crate::RakunEngine::new(crate::EngineConfig::default());
+        e.push_fullwidth_alpha('D');
+        for c in "lsitenorankingu".chars() {
+            e.push_char(c);
+        }
+        assert!(run(&e).is_some_and(|r| r.starts_with("DLsiteの")), "{:?}", run(&e));
+        assert_eq!(run(&engine_after("dlsitedekau")).as_deref(), Some("DLsiteでかう"));
+        for typed in ["dlsitekudasai", "dlsitemoii", "dlsitehadame", "dlsite"] {
+            let e = engine_after(typed);
+            assert!(run(&e).is_none(), "{typed}");
+            let spans = super::find_spans(&e.input_log, 0, &e.hiragana_buf, &e.pending_romaji_buf, &dictionary);
+            assert_eq!(spans.len(), 1, "{typed}");
+            assert_eq!(spans[0].word, "DLsite");
+            assert_eq!(spans[0].japanese.as_deref(), Some("DLして"));
+        }
     }
 
     #[test]

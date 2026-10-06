@@ -645,3 +645,5 @@ zoom
 zotac
 zsh
 zypper
+DLsite
+pixiv

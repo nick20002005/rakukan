@@ -1687,6 +1687,44 @@ impl RakunEngine {
         self.romaji_alnum_candidates(hiragana)
     }
 
+    /// 英語とも日本語とも読める語（`DLsite` / `DLして`）を含む読みで、本命候補を
+    /// もう一方へ読み替えた候補をそのすぐ後ろに足す。
+    ///
+    /// 本命は「読みと異なる最初の候補」。ライブ変換の preview もそれを採るので、
+    /// その前には入れない。読みと異なる候補が無ければ何もしない。
+    fn insert_dual_reading_variant(&self, hiragana: &str, merged: &mut Vec<String>) {
+        if hiragana != self.hiragana_buf
+            && hiragana != format!("{}{}", self.hiragana_buf, self.pending_romaji_buf)
+        {
+            return;
+        }
+        let words = latin_run::dual_reading_words(
+            &self.input_log,
+            self.log_detached_at,
+            &self.hiragana_buf,
+            &self.pending_romaji_buf,
+        );
+        if words.is_empty() {
+            return;
+        }
+        let Some(pos) = merged.iter().position(|c| c != hiragana) else {
+            return;
+        };
+        let mut variant = merged[pos].clone();
+        for (word, japanese, typed) in &words {
+            variant = if variant.contains(word.as_str()) {
+                variant.replace(word.as_str(), japanese)
+            } else if variant.contains(typed.as_str()) {
+                variant.replace(typed.as_str(), word)
+            } else {
+                variant.replace(japanese.as_str(), word)
+            };
+        }
+        if !merged.contains(&variant) {
+            merged.insert(pos + 1, variant);
+        }
+    }
+
     pub fn merge_candidates_for_reading(
         &self,
         hiragana: &str,
@@ -1990,6 +2028,7 @@ impl RakunEngine {
         if merged.is_empty() {
             merged.push(hiragana.to_string());
         } else {
+            self.insert_dual_reading_variant(hiragana, &mut merged);
             let mut char_type_cands: Vec<String> =
                 vec![hiragana.to_string(), hiragana_to_katakana(hiragana)];
             if let Some((half, full)) = self.romaji_alnum_candidates(hiragana) {
