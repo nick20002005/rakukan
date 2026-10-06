@@ -1,4 +1,8 @@
-//! 先頭ラテン語ランの復元
+//! 英単語リストに一致するラテン文字区間の復元
+//!
+//! 文中のログ境界から最長一致を取り、ローマ字として完結しない3文字以上の語を
+//! 復元する。ユーザー指定語は日本語として読めても復元する。
+//! 以下は辞書にない造語用に保持している先頭限定フォールバックの説明。
 //!
 //! ひらがなモードのまま英単語を打つと、読みはローマ字が部分的にかなへ潰れた姿に
 //! なる。`seedream` なら `せえdれあm`（トライで解決できなかった子音だけが素の
@@ -48,6 +52,182 @@
 /// 英単語の直後に来る助詞。読みの右端を決める唯一の手掛かりであり、
 /// 左端に日本語の前置きが無いことを疑うための手掛かりでもある。
 const PARTICLES: [char; 10] = ['の', 'を', 'は', 'が', 'に', 'で', 'と', 'も', 'や', 'へ'];
+
+use std::collections::HashSet;
+use std::sync::OnceLock;
+
+struct LatinWords {
+    words: HashSet<String>,
+    terms: HashSet<String>,
+    /// ユーザー指定語のうち、ローマ字としても読み切れる語（`sushi` `make`）。
+    /// 後ろの境界を緩めると `makeru` → `makeる` のように日本語を壊すので、
+    /// 助詞・「する」の直前でしか復元しない。
+    readable: HashSet<String>,
+    max_len: usize,
+}
+
+impl LatinWords {
+    fn from_lists(standard: &str, user: &str) -> Self {
+        let mut words = HashSet::new();
+        let mut terms = HashSet::new();
+        let mut readable = HashSet::new();
+        let mut conv = crate::romaji::RomajiConverter::new();
+        for (text, explicit) in [(standard, false), (user, true)] {
+            for line in text.lines() {
+                let word = line.trim();
+                if word.len() < 3 || !word.bytes().all(|c| c.is_ascii_lowercase()) {
+                    continue;
+                }
+                conv.reset();
+                for c in word.chars() {
+                    conv.push(c);
+                }
+                // 単独 n は「ん」と読めるため日本語側へ倒す。
+                let reads_as_romaji = !conv.output().chars().any(|c| c.is_ascii_alphabetic())
+                    && (conv.buffer().is_empty() || conv.buffer() == "n");
+                if reads_as_romaji && !explicit {
+                    continue;
+                }
+                if explicit {
+                    terms.insert(word.to_string());
+                    if reads_as_romaji {
+                        readable.insert(word.to_string());
+                    }
+                }
+                words.insert(word.to_string());
+            }
+        }
+        let max_len = words.iter().map(String::len).max().unwrap_or(0);
+        Self { words, terms, readable, max_len }
+    }
+}
+
+fn latin_words() -> &'static LatinWords {
+    static WORDS: OnceLock<LatinWords> = OnceLock::new();
+    WORDS.get_or_init(|| {
+        let user = crate::user_dict_path()
+            .map(|path| path.with_file_name("latin_words.txt"))
+            .and_then(|path| match std::fs::read_to_string(&path) {
+                Ok(text) => Some(text),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+                Err(err) => {
+                    tracing::warn!("latin words: {}: {err}", path.display());
+                    None
+                }
+            })
+            .unwrap_or_default();
+        let standard = concat!(
+            include_str!("../data/latin_scowl.txt"),
+            include_str!("../data/latin_extra.txt")
+        );
+        let mut dictionary = LatinWords::from_lists(standard, &user);
+        dictionary.terms = include_str!("../data/latin_extra.txt").lines()
+            .chain(user.lines().map(str::trim))
+            .filter(|word| dictionary.words.contains(*word))
+            .map(str::to_string).collect();
+        dictionary
+    })
+}
+
+/// ログの境界で最長一致を探し、互いに重ならない区間を左から復元する。
+/// 未確定末尾は仮想エントリとして扱い、実際の入力状態は変更しない。
+pub(crate) fn normalize_latin_spans(
+    log: &[crate::InputEntry],
+    detached_at: usize,
+    hiragana: &str,
+    pending: &str,
+) -> Option<String> {
+    normalize_with_words(log, detached_at, hiragana, pending, latin_words())
+}
+
+fn normalize_with_words(
+    log: &[crate::InputEntry],
+    detached_at: usize,
+    hiragana: &str,
+    pending: &str,
+    dictionary: &LatinWords,
+) -> Option<String> {
+    if log.is_empty() || detached_at != 0 {
+        return None;
+    }
+    let logged: String = log.iter().map(|e| e.output.as_str()).collect();
+    if logged != hiragana {
+        return None;
+    }
+    let mut entries: Vec<(&str, &str, bool)> = log.iter()
+        .map(|e| (e.typed.as_str(), e.output.as_str(), e.kind == crate::InputKind::Romaji))
+        .collect();
+    if !pending.is_empty() {
+        entries.push((pending, "", true));
+    }
+    let mut offsets = vec![0];
+    for (_, output, _) in &entries {
+        offsets.push(offsets.last().unwrap() + output.len());
+    }
+    let mut restored = String::new();
+    let mut cursor = 0;
+    let mut start = 0;
+    let mut changed = false;
+    while start < entries.len() {
+        let mut typed = String::new();
+        let mut longest = None;
+        for end in start..entries.len() {
+            let (keys, _, romaji) = entries[end];
+            if !romaji || !keys.bytes().all(|c| c.is_ascii_lowercase()) {
+                break;
+            }
+            typed.push_str(keys);
+            if typed.len() > dictionary.max_len {
+                break;
+            }
+            if !dictionary.words.contains(&typed) {
+                continue;
+            }
+            // 一般英単語の接尾辞だけを未知語から拾わない（seedream 内の dream 等）。
+            // 固有名詞・ユーザー指定語には辞書で明示した強い手掛かりがある。
+            if start > 0 && !dictionary.terms.contains(&typed)
+                && !hiragana[..offsets[start]].chars().next_back().is_some_and(is_boundary_particle)
+            {
+                continue;
+            }
+            // 区間の最後が促音になった子音で、その手前がかなとして読み切れているなら
+            // 日本語の途中（`ki` + `t`(っ) + `to` = きっと。`kit` + と ではない）。
+            // 手前に素の ASCII が残る語（`discord` + `da` の `d`）は英単語の末尾。
+            if entries[end].1 == "っ"
+                && !hiragana[offsets[start]..offsets[end]].chars().any(|c| c.is_ascii_alphabetic())
+            {
+                continue;
+            }
+            let right = &hiragana[offsets[end + 1]..];
+            // 助詞・「する」の活用、または日本語の前置きがある末尾だけを境界とする。
+            let at_end = end + 1 == entries.len();
+            let boundary = right.chars().next().is_some_and(is_boundary_particle)
+                || ["する", "した", "して", "しない", "します", "すれば", "しよう"]
+                    .iter().any(|suffix| right.starts_with(suffix));
+            // 補助リスト・ユーザー指定語でローマ字として読めない語は、後ろが何でも
+            // 英単語として切る（`googleから` `githubって` `discordだよ`）。
+            let loose = dictionary.terms.contains(&typed) && !dictionary.readable.contains(&typed);
+            if (at_end && start > 0) || (!right.is_empty() && (boundary || loose)) {
+                longest = Some((end + 1, typed.clone()));
+            }
+        }
+        if let Some((end, word)) = longest {
+            restored.push_str(&hiragana[cursor..offsets[start]]);
+            restored.push_str(&word);
+            cursor = offsets[end];
+            start = end;
+            changed = true;
+        } else {
+            start += 1;
+        }
+    }
+    if changed {
+        restored.push_str(&hiragana[cursor..]);
+        Some(restored)
+    } else {
+        None
+    }
+}
 
 fn is_boundary_particle(c: char) -> bool {
     PARTICLES.contains(&c)
@@ -126,6 +306,134 @@ pub(crate) fn normalize_leading_latin(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn span_readings_match_observed_input() {
+        for (typed, reading, pending) in [
+            ("kyouhagoogledekensaku", "きょうはごおgぇでけんさく", ""),
+            ("githubnipushsita", "ぎてゅbにぷshした", ""),
+            ("zoomdekaigi", "ぞおmでかいぎ", ""),
+            ("monitorwokau", "もにとrをかう", ""),
+            ("korehagithubnohanasi", "これはぎてゅbのはなし", ""),
+            ("pythondekaku", "pyてょんでかく", ""),
+            ("pythonnohon", "pyてょんおほ", "n"),
+            ("kyouhadezoom", "きょうはでぞお", "m"),
+            ("sushiwotaberu", "すしをたべる", ""),
+            ("tomatowokau", "とまとをかう", ""),
+            ("nihongo", "にほんご", ""),
+            ("itaiyo", "いたいよ", ""),
+            ("makeinu", "まけいぬ", ""),
+            ("animewomiru", "あにめをみる", ""),
+            ("sorehasoreto", "それはそれと", ""),
+        ] {
+            let e = engine_after(typed);
+            assert_eq!(e.hiragana_text(), reading, "{typed}");
+            assert_eq!(e.pending_romaji_buf, pending, "{typed}");
+        }
+    }
+
+    #[test]
+    fn restores_dictionary_spans() {
+        for (typed, expected) in [
+            ("kyouhagoogledekensaku", "きょうはgoogleでけんさく"),
+            ("githubnipushsita", "githubにpushした"),
+            ("zoomdekaigi", "zoomでかいぎ"),
+            ("monitorwokau", "monitorをかう"),
+            ("korehagithubnohanasi", "これはgithubのはなし"),
+            ("pythondekaku", "pythonでかく"),
+            ("kyouhadezoom", "きょうはでzoom"),
+        ] {
+            assert_eq!(conv_reading_after(typed), expected, "{typed}");
+        }
+    }
+
+    #[test]
+    fn leaves_japanese_spans_unchanged() {
+        for typed in ["kanntannna", "sushiwotaberu", "tomatowokau", "nihongo",
+            "itaiyo", "makeinu", "animewomiru", "sorehasoreto"] {
+            let e = engine_after(typed);
+            assert_eq!(e.conv_reading(), e.hiragana_text(), "{typed}");
+        }
+    }
+
+    #[test]
+    fn explicit_words_override_romaji_filter_and_take_longest() {
+        let dictionary = super::LatinWords::from_lists("sushi\nmake\ntomato\nanime\nsake\nno\nto\nit\n", "sushi\nno\nWithCase\nbad-word\n");
+        assert!(!dictionary.words.contains("make"));
+        assert!(!dictionary.words.contains("it"));
+        assert_eq!(dictionary.words.len(), 1);
+        let e = engine_after("sushiwotaberu");
+        assert_eq!(super::normalize_with_words(&e.input_log, 0, &e.hiragana_buf,
+            &e.pending_romaji_buf, &dictionary).as_deref(), Some("sushiをたべる"));
+        // 同じ開始位置で二つの語が助詞境界に一致するときも最長を選ぶ。
+        let dictionary = super::LatinWords::from_lists("monitor\nmonitorno\n", "");
+        let e = engine_after("monitornoha");
+        assert_eq!(super::normalize_with_words(&e.input_log, 0, &e.hiragana_buf,
+            &e.pending_romaji_buf, &dictionary).as_deref(), Some("monitornoは"));
+    }
+
+    #[test]
+    fn dictionary_spans_respect_log_guards() {
+        let mut e = engine_after("zoomdekaigi");
+        assert!(super::normalize_latin_spans(&e.input_log, 1, &e.hiragana_buf, "").is_none());
+        assert!(super::normalize_latin_spans(&e.input_log, 0, "違う読み", "").is_none());
+        e.input_log[0].kind = crate::InputKind::Raw;
+        assert!(super::normalize_latin_spans(&e.input_log, 0, &e.hiragana_buf, "").is_none());
+    }
+
+    #[test]
+    fn middle_alpha_runs_preserve_both_kana_sides() {
+        use crate::digits::Run;
+        let reading = conv_reading_after("kyouhagoogledekensaku");
+        assert_eq!(crate::digits::split_by_digits(&reading), vec![
+            Run::Kana("きょうは".into()), Run::Alpha("google".into()), Run::Kana("でけんさく".into())]);
+    }
+
+    #[test]
+    fn pending_tail_restoration_does_not_mutate_input() {
+        let e = engine_after("kyouhadezoom");
+        assert_eq!(e.conv_reading(), "きょうはでzoom");
+        assert_eq!(e.conv_reading(), "きょうはでzoom");
+        assert_eq!(e.pending_romaji_buf, "m");
+        assert_eq!(e.hiragana_text(), "きょうはでぞお");
+    }
+
+    /// 促音で終わる日本語（きっと・ネット・セット）を 英単語 + と に化かさない。
+    #[test]
+    fn sokuon_before_particle_stays_japanese() {
+        for typed in ["kittokuru", "nettowa-ku", "settosuru", "hottosita", "korehanettode",
+            "pettowokau", "hittosita", "sattokaeru", "guttokuru", "robottowotukuru",
+            "merittoga", "yunittowo", "mottohosii", "kippuwokau"] {
+            let e = engine_after(typed);
+            assert_eq!(e.conv_reading(), e.hiragana_text(), "{typed}");
+        }
+    }
+
+    /// 補助リストの語は、後ろが助詞・「する」以外でも切る。
+    #[test]
+    fn listed_terms_split_before_any_kana() {
+        for (typed, expected) in [
+            ("googlekara", "googleから"),
+            ("githubtte", "githubって"),
+            ("discorddayo", "discordだよ"),
+            ("kyouhagithubmiru", "きょうはgithubみる"),
+        ] {
+            assert_eq!(conv_reading_after(typed), expected, "{typed}");
+        }
+        // ローマ字として読めるユーザー指定語は、助詞の前でしか切らない。
+        let dictionary = super::LatinWords::from_lists("", "make
+");
+        let e = engine_after("makeru");
+        assert!(super::normalize_with_words(&e.input_log, 0, &e.hiragana_buf,
+            &e.pending_romaji_buf, &dictionary).is_none());
+    }
+
+    #[test]
+    fn merged_nn_boundary_is_not_guessed() {
+        // python + no は nn が一音に合流し、単語末尾のログ境界が存在しない。
+        let e = engine_after("pythonnohon");
+        assert!(e.input_log.iter().any(|entry| entry.typed == "nn"));
+        assert_eq!(e.conv_reading(), "pyてょんおほ");
+    }
     fn engine_after(typed: &str) -> crate::RakunEngine {
         let mut e = crate::RakunEngine::new(crate::EngineConfig::default());
         for c in typed.chars() {

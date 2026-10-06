@@ -1299,14 +1299,20 @@ impl RakunEngine {
     /// 渡って壊れる。打鍵ログから英単語を復元して `seedreamのぺーすはどう` の形に
     /// してから変換へ回す。
     ///
-    /// 復元できない読み（普通の日本語 / 読み全体が英単語 / 日本語の前置きがある /
-    /// F9-F10 で force_preedit した後）はそのまま返す。
+    /// 辞書に載る語は文中でも復元する。日本語として完結するローマ字は標準辞書から
+    /// 除外し、未確定末尾を含む単語も入力状態を変更せず照合する。
+    /// ログと読みが対応しない場合はそのまま返す。
     pub fn conv_reading(&self) -> String {
-        if let Some(normalized) = latin_run::normalize_leading_latin(
+        if let Some(normalized) = latin_run::normalize_latin_spans(
             &self.input_log,
             self.log_detached_at,
             &self.hiragana_buf,
-        ) {
+            &self.pending_romaji_buf,
+        ).or_else(|| latin_run::normalize_leading_latin(
+            &self.input_log,
+            self.log_detached_at,
+            &self.hiragana_buf,
+        )) {
             info!(
                 "engine::conv_reading: latin run restored {:?} -> {:?}",
                 self.hiragana_buf, normalized
@@ -1671,6 +1677,11 @@ impl RakunEngine {
     /// の 8. ブロック）が拾う。
     fn romaji_literal_candidates(&self, hiragana: &str) -> Option<(String, String)> {
         if !hiragana.chars().any(|c| c.is_ascii_alphabetic()) {
+            return None;
+        }
+        // 英単語を復元でき、かつ日本語が残る読み（`きょうはgoogleでけんさく`）は
+        // 変換結果のほうが本命。打鍵そのままの英数字は末尾の文字種候補に任せる。
+        if self.conv_reading().chars().any(|c| !c.is_ascii()) && self.conv_reading() != self.hiragana_buf {
             return None;
         }
         self.romaji_alnum_candidates(hiragana)
