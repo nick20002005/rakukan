@@ -2169,9 +2169,15 @@ impl RakunEngine {
             self.config.rescore_min_reading_chars,
             self.config.rescore_min_gain,
         );
+        let (candidates, inflection_rewrite) = rescore::promote_learned_inflection(
+            store,
+            reading,
+            candidates,
+            &|top, other| rescore::noted_confidence_gap(reading, top, other),
+        );
         let (candidates, word_rewrite) = rescore::apply_user_words(store, reading, candidates);
         let (candidates, rewrite) = rescore::apply_learned_runs(store, reading, candidates);
-        if let Some(rewrite) = rewrite.or(word_rewrite)
+        if let Some(rewrite) = rewrite.or(word_rewrite).or(inflection_rewrite)
             && let Ok(mut slot) = self.last_learned_rewrite.lock()
         {
             *slot = Some((reading.to_string(), rewrite));

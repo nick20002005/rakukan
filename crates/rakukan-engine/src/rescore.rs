@@ -26,7 +26,8 @@
 
 use crate::kana::katakana_to_hiragana;
 use rakukan_dict::DictStore;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::sync::Mutex;
 
 /// 得点に数える run の最小読み長。単漢字（`は` → `葉` 等）は辞書に載って
 /// いても偶然一致しやすく、雑音にしかならないので除く。
@@ -362,6 +363,182 @@ pub fn promote_dict_agreeing(
     );
     out.insert(0, promoted);
     out
+}
+
+/// 送り仮名として学習キーに含める、漢字 run 直後のひらがなの最大文字数。
+/// `重い`・`帰る` は 1、`新しい`・`変わる` は 2。
+const INFLECTED_MAX_OKURI_CHARS: usize = 2;
+
+/// 繰り上げを許す、第 1 候補との自信度（平均 log-prob）の差の上限。
+///
+/// 実ログ 4,330 変換で再生すると、直したい取り違え（`動作が思い`→`重い` が 0.17、
+/// `プレビューが思い`→`重い` が 0.06、`もっと起き`→`置き` が 0.13）と、LLM が
+/// 文脈で正しく選んでいるもの（`づくりを進めて`→`勧めて` が 1.0）の間に開きがある。
+const INFLECTED_MAX_CONFIDENCE_GAP: f32 = 0.4;
+
+/// 送り仮名ではなく助詞として付く文字。`あしの → 足の` のような「語＋助詞」の
+/// 学習を、文中の `脚の` の選び直しに使わない。
+const INFLECTED_PARTICLE_TAILS: &[char] = &['の', 'を', 'へ'];
+
+/// 直近の変換の自信度を覚えておく件数。打鍵ごとの BG 変換と Space 変換が
+/// 入れ替わりで入るので、数件あれば足りる。
+const CONFIDENCE_MEMO_CAPACITY: usize = 16;
+
+/// 直近の変換の `(読み, [(候補, 平均 log-prob)])`。
+///
+/// n-best は文字列だけで TSF との間を往復するので、自信度はここへ別に控えておき、
+/// 読みと候補の文字列で引き直す。数字・英字で読みが割られた変換は読みが一致せず
+/// 引けないが、そのときは繰り上げないだけで済む。
+static CONFIDENCE_MEMO: Mutex<VecDeque<(String, Vec<(String, f32)>)>> =
+    Mutex::new(VecDeque::new());
+
+/// 変換器が出した候補の自信度を控える。
+pub fn note_confidence(reading: &str, scored: &[(String, f32)]) {
+    let Ok(mut memo) = CONFIDENCE_MEMO.lock() else {
+        return;
+    };
+    memo.retain(|(r, _)| r != reading);
+    if memo.len() >= CONFIDENCE_MEMO_CAPACITY {
+        memo.pop_front();
+    }
+    memo.push_back((reading.to_string(), scored.to_vec()));
+}
+
+/// `top` と `other` の自信度の差（`top - other`）。どちらかが控えに無ければ `None`。
+pub fn noted_confidence_gap(reading: &str, top: &str, other: &str) -> Option<f32> {
+    let memo = CONFIDENCE_MEMO.lock().ok()?;
+    let (_, scored) = memo.iter().find(|(r, _)| r == reading)?;
+    let of = |c: &str| scored.iter().find(|(s, _)| s == c).map(|(_, lp)| *lp);
+    Some(of(top)? - of(other)?)
+}
+
+fn is_kanji(c: char) -> bool {
+    matches!(c, '一'..='鿿' | '㐀'..='䶿' | '々')
+}
+
+/// `promote_learned_inflection` が選び直した 1 か所。
+struct InflectionPick {
+    /// 繰り上げる候補の位置（1 以上）
+    index: usize,
+    /// 学習キー（漢字 run の読み＋送り仮名）
+    key: String,
+    /// 第 1 候補がその区間に出していた表記
+    llm_surface: String,
+}
+
+fn learned_inflection_pick(
+    store: &DictStore,
+    reading: &str,
+    candidates: &[String],
+    confidence_gap: &dyn Fn(&str, &str) -> Option<f32>,
+) -> Option<InflectionPick> {
+    if candidates.len() < 2 {
+        return None;
+    }
+    let first = &candidates[0];
+    let runs = align(reading, first)?;
+    let first_chars: Vec<char> = first.chars().collect();
+    let mut spos = 0usize;
+    for (i, run) in runs.iter().enumerate() {
+        let start = spos;
+        let run_len = run.surface.chars().count();
+        spos += run_len;
+        if run.kind != RunKind::Kanji || !run.surface.chars().all(is_kanji) {
+            continue;
+        }
+        let Some(next) = runs.get(i + 1).filter(|n| n.kind == RunKind::Hiragana) else {
+            continue;
+        };
+        let following: Vec<char> = next.surface.chars().collect();
+        for k in 1..=INFLECTED_MAX_OKURI_CHARS.min(following.len()) {
+            // 読み全体がその語なら merge 側の完全一致に任せる。
+            if start == 0 && run_len + k == first_chars.len() {
+                break;
+            }
+            if INFLECTED_PARTICLE_TAILS.contains(&following[k - 1]) {
+                continue;
+            }
+            let okuri: String = following[..k].iter().collect();
+            let key = format!("{}{}", run.reading, okuri);
+            let llm_surface = format!("{}{}", run.surface, okuri);
+            // 並びは「最後に確定した表記が先頭」。LLM と同じ表記を最後に選んで
+            // いるなら、その語は今は LLM の表記で使っている。
+            let learned = store.lookup_learn(&key);
+            let Some(top) = learned.first() else {
+                continue;
+            };
+            if *top == llm_surface {
+                continue;
+            }
+            // 同じ送り仮名で終わる「漢字＋送り仮名」の形だけを対象にする。
+            let Some(stem) = top.strip_suffix(okuri.as_str()) else {
+                continue;
+            };
+            if stem.is_empty() || !stem.chars().all(is_kanji) {
+                continue;
+            }
+            if store.learn_freq(&key, top) < LEARNED_SOFT_MIN_FREQ {
+                continue;
+            }
+            let mut replaced: String = first_chars[..start].iter().collect();
+            replaced.push_str(top);
+            replaced.extend(&first_chars[start + run_len + k..]);
+            if let Some(index) = candidates.iter().position(|c| *c == replaced)
+                && confidence_gap(first, &replaced)
+                    .is_some_and(|g| g <= INFLECTED_MAX_CONFIDENCE_GAP)
+            {
+                return Some(InflectionPick {
+                    index,
+                    key,
+                    llm_surface,
+                });
+            }
+        }
+    }
+    None
+}
+
+/// 送り仮名つきの同音語（`思い`/`重い`、`帰る`/`変える`）を、学習で選び直す。
+///
+/// `apply_learned_runs` は漢字 run の読みだけで学習を引くので、`動作が思い` の
+/// `思` は `おも` で引かれ、`おもい → 重い` の学習に当たらない。送り仮名のある
+/// 形容詞・動詞はすべてこの形で、単独では何度 `重い` を選んでいても文中では
+/// LLM の `思い` がそのまま出ていた。
+///
+/// そこで漢字 run に直後のひらがなを 1〜2 文字足した読みで学習を引き、最後に
+/// 選んだ表記が LLM と違っていて、かつ **その表記へ差し替えた文が n-best の中に
+/// あり、LLM の自信度が第 1 候補と僅差の** ときだけ、そちらを先頭へ繰り上げる。
+/// LLM 自身が迷っている候補からしか選ばないので、文として成り立たない差し替え
+/// （`と思います`→`と重います`）や、文脈ではっきり決まっている語の塗り替えは
+/// 起きない。`confidence_gap` は `(第 1 候補, 繰り上げる候補)` の自信度の差を返す。
+///
+/// 候補の集合・件数は変えない。断られたら（元の第 1 候補が確定されたら）
+/// `LearnedRewrite` 経由でその読みに LLM の表記を学習し、次に学習表記を単独で
+/// 選び直すまでは繰り上げない。
+pub fn promote_learned_inflection(
+    store: &DictStore,
+    reading: &str,
+    candidates: Vec<String>,
+    confidence_gap: &dyn Fn(&str, &str) -> Option<f32>,
+) -> (Vec<String>, Option<LearnedRewrite>) {
+    let Some(pick) = learned_inflection_pick(store, reading, &candidates, confidence_gap) else {
+        return (candidates, None);
+    };
+    let mut out = candidates;
+    let promoted = out.remove(pick.index);
+    tracing::info!(
+        reading = %reading,
+        promoted = %promoted,
+        from_rank = pick.index,
+        key = %pick.key,
+        "rescore: promoted learned inflection"
+    );
+    let rewrite = LearnedRewrite {
+        original: out[0].clone(),
+        runs: vec![(pick.key, pick.llm_surface)],
+    };
+    out.insert(0, promoted);
+    (out, Some(rewrite))
 }
 
 /// 長文の第 1 候補を学習表記で**書き換える**ための、読みの最小文字数。2 文字の読み
@@ -1060,6 +1237,59 @@ surfaces = ["海底", "ハイテイ"]
         store.learn_force("はいていじゃんそう", "ハイテイ雀荘");
         let cands = vec!["モチベは明らかにハイテイ雀荘に傾いている".to_string()];
         let (got, _) = apply_user_words(&store, reading, cands.clone());
+        assert_eq!(got, cands);
+    }
+
+    #[test]
+    fn promotes_learned_inflection_from_nbest() {
+        let (_dir, store) = store_with_user_entries("");
+        store.learn_force("おもい", "重い");
+        let reading = "どうさがおもい";
+        let cands = vec![
+            "動作が思い".to_string(),
+            "動作が重い".to_string(),
+            "動作がおもい".to_string(),
+        ];
+        let close = |_: &str, _: &str| Some(0.17f32);
+
+        let (got, rewrite) = promote_learned_inflection(&store, reading, cands.clone(), &close);
+        assert_eq!(got[0], "動作が重い");
+        assert_eq!(got[1], "動作が思い");
+        assert_eq!(got.len(), 3);
+        let rewrite = rewrite.unwrap();
+        assert_eq!(rewrite.original, "動作が思い");
+        assert_eq!(rewrite.runs, vec![("おもい".to_string(), "思い".to_string())]);
+
+        // LLM がはっきり選んでいる（差が大きい・自信度が不明）なら触らない。
+        let far = |_: &str, _: &str| Some(1.0f32);
+        let (got, _) = promote_learned_inflection(&store, reading, cands.clone(), &far);
+        assert_eq!(got, cands);
+        let unknown = |_: &str, _: &str| None;
+        let (got, _) = promote_learned_inflection(&store, reading, cands.clone(), &unknown);
+        assert_eq!(got, cands);
+
+        // n-best に無い表記は作らない。
+        let only = vec!["動作が思い".to_string(), "動作がおもい".to_string()];
+        let (got, _) = promote_learned_inflection(&store, reading, only.clone(), &close);
+        assert_eq!(got, only);
+
+        // 最後に LLM と同じ表記を選んでいれば触らない（断られた後の状態）。
+        // 同じ秒の確定は回数で並ぶので 2 回選ぶ。
+        store.learn_force("おもい", "思い");
+        store.learn_force("おもい", "思い");
+        let (got, rewrite) = promote_learned_inflection(&store, reading, cands.clone(), &close);
+        assert_eq!(got, cands);
+        assert!(rewrite.is_none());
+    }
+
+    #[test]
+    fn skips_learned_word_with_particle_as_inflection() {
+        // 実ログで出た誤爆: `あしの → 足の` の学習で `脚のある家具` を塗り替えた。
+        let (_dir, store) = store_with_user_entries("");
+        store.learn_force("あしの", "足の");
+        let cands = vec!["脚のある家具".to_string(), "足のある家具".to_string()];
+        let close = |_: &str, _: &str| Some(0.09f32);
+        let (got, _) = promote_learned_inflection(&store, "あしのあるかぐ", cands.clone(), &close);
         assert_eq!(got, cands);
     }
 

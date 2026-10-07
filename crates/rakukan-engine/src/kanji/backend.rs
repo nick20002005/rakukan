@@ -819,6 +819,9 @@ impl KanaKanjiConverter {
             }
         }
 
+        // 送り仮名つきの同音語を学習で選び直すときに、僅差かどうかを見る。
+        crate::rescore::note_confidence(reading, &scored);
+
         // 自信度に基づく異常変換の棄却（相対外れ値＋絶対フロア）。
         let mut candidates = filter_by_confidence(
             scored,
