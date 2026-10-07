@@ -828,6 +828,11 @@ pub struct RakunEngine {
     /// これより前のエントリは `hiragana_buf` と対応しないので、Backspace 再生の対象外。
     /// log をクリアしたら 0 に戻す。
     log_detached_at: usize,
+    /// 打鍵が一区切りした（Space / 確定の直前に `flush_pending_n` が呼ばれた）時点の
+    /// `(input_log.len(), pending_romaji_buf)`。今の状態と一致する間だけ、末尾に余った
+    /// 子音を英単語の照合に含める（`conv_reading`）。打鍵の途中は次の母音を待っている
+    /// だけの子音で英単語が完成してしまう（`とまって` + `r` = `matter`）ので含めない。
+    tail_closed_at: Option<(usize, String)>,
     committed: String,
     dict_store: Option<DictStore>,
     /// 直近に「短文予測」として提示した候補: `(提示した読み, [(登録キー, surface)])`。
@@ -851,6 +856,7 @@ impl RakunEngine {
             pending_romaji_buf: String::new(),
             input_log: Vec::new(),
             log_detached_at: 0,
+            tail_closed_at: None,
             committed: String::new(),
             dict_store: None,
             last_predictions: Mutex::new(None),
@@ -938,7 +944,7 @@ impl RakunEngine {
         if self.pending_romaji_buf.is_empty() {
             return;
         }
-        if self.flush_pending_n() {
+        if self.flush_pending_n_inner() {
             return;
         }
         let typed = std::mem::take(&mut self.pending_romaji_buf);
@@ -955,6 +961,7 @@ impl RakunEngine {
     }
 
     pub fn push_char(&mut self, c: char) -> PreeditState {
+        self.tail_closed_at = None;
         let before = self.hiragana_buf.len();
         self.push_char_inner(c);
         if self.hiragana_buf.len() > before {
@@ -1082,6 +1089,12 @@ impl RakunEngine {
 
     /// 末尾の未確定 "n" を「ん」として確定する（Convert / CommitRaw 前に呼ぶ）
     pub fn flush_pending_n(&mut self) -> bool {
+        let flushed = self.flush_pending_n_inner();
+        self.tail_closed_at = Some((self.input_log.len(), self.pending_romaji_buf.clone()));
+        flushed
+    }
+
+    fn flush_pending_n_inner(&mut self) -> bool {
         if self.pending_romaji_buf == "n" {
             self.hiragana_buf.push('ん');
             let entry = std::mem::take(&mut self.pending_romaji_buf);
@@ -1134,6 +1147,7 @@ impl RakunEngine {
     }
 
     pub fn backspace(&mut self) -> bool {
+        self.tail_closed_at = None;
         if !self.pending_romaji_buf.is_empty() {
             if self.replay_backspace() {
                 return true;
@@ -1300,14 +1314,19 @@ impl RakunEngine {
     /// してから変換へ回す。
     ///
     /// 辞書に載る語は文中でも復元する。日本語として完結するローマ字は標準辞書から
-    /// 除外し、未確定末尾を含む単語も入力状態を変更せず照合する。
+    /// 除外する。未確定末尾を含む単語は、打鍵が一区切りした後（Space の直前）だけ
+    /// 入力状態を変更せず照合する。打鍵の途中で末尾の子音まで照合すると、次の母音を
+    /// 待っているだけの子音で英単語が完成し、ライブ変換の preview に英字が出る。
     /// ログと読みが対応しない場合はそのまま返す。
     pub fn conv_reading(&self) -> String {
+        let tail_closed = self.tail_closed_at.as_ref().is_some_and(|(len, pending)| {
+            *len == self.input_log.len() && *pending == self.pending_romaji_buf
+        });
         if let Some(normalized) = latin_run::normalize_latin_spans(
             &self.input_log,
             self.log_detached_at,
             &self.hiragana_buf,
-            &self.pending_romaji_buf,
+            if tail_closed { &self.pending_romaji_buf } else { "" },
         ).or_else(|| latin_run::normalize_leading_latin(
             &self.input_log,
             self.log_detached_at,

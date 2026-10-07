@@ -449,7 +449,6 @@ mod tests {
             ("monitorwokau", "monitorをかう"),
             ("korehagithubnohanasi", "これはgithubのはなし"),
             ("pythondekaku", "pythonでかく"),
-            ("kyouhadezoom", "きょうはでzoom"),
         ] {
             assert_eq!(conv_reading_after(typed), expected, "{typed}");
         }
@@ -500,11 +499,30 @@ mod tests {
 
     #[test]
     fn pending_tail_restoration_does_not_mutate_input() {
-        let e = engine_after("kyouhadezoom");
+        let mut e = engine_after("kyouhadezoom");
+        // 打鍵の途中は末尾の子音を照合に含めない。Space の直前に閉じてから含める。
+        assert_eq!(e.conv_reading(), e.hiragana_text());
+        assert!(!e.flush_pending_n());
         assert_eq!(e.conv_reading(), "きょうはでzoom");
         assert_eq!(e.conv_reading(), "きょうはでzoom");
         assert_eq!(e.pending_romaji_buf, "m");
         assert_eq!(e.hiragana_text(), "きょうはでぞお");
+    }
+
+    /// 次の母音を待っているだけの子音で英単語を完成させない（実機のログで出た例）。
+    #[test]
+    fn dangling_consonant_does_not_complete_word_while_typing() {
+        for typed in ["gurafugatomatter", "no-towot", "joseihapant", "syoukaitosand",
+            "yokokarasuraid", "wout"] {
+            let e = engine_after(typed);
+            assert_eq!(e.conv_reading(), e.hiragana_text(), "{typed}");
+        }
+        let mut e = engine_after("githubnipush");
+        assert_eq!(e.conv_reading(), "githubにぷ");
+        e.flush_pending_n();
+        assert_eq!(e.conv_reading(), "githubにpush");
+        e.push_char('i');
+        assert_eq!(e.conv_reading(), "githubにぷし");
     }
 
     /// 促音で終わる日本語（きっと・ネット・セット）を 英単語 + と に化かさない。
