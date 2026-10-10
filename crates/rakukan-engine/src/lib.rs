@@ -648,7 +648,11 @@ fn merge_candidate_lists(
             llm_unique.push(c);
         }
     }
-    let dict_cap = limit.saturating_sub(llm_unique.len()).max(merged.len());
+    //    ただし LLM に残す枠は上限の半分まで。文節ごとの候補（上限 9）で LLM が
+    //    8 件返すと辞書が 1 件しか入らず、`かき` の 2 番目にある `描き` が候補から
+    //    消えていた（短い読みの LLM 下位は `か気` `か来` のような割り方で、辞書より弱い）。
+    let llm_reserved = llm_unique.len().min(limit / 2);
+    let dict_cap = limit.saturating_sub(llm_reserved).max(merged.len());
     for c in dict {
         push_unique(&mut merged, c, dict_cap);
     }
@@ -3057,6 +3061,24 @@ surfaces = ["杜野"]
             3,
         );
         assert_eq!(merged, ["辞1", "L1", "L2"]);
+    }
+
+    #[test]
+    fn merge_lists_keeps_dict_head_when_llm_fills_small_limit() {
+        // 文節ごとの候補（上限 9）: LLM が 8 件返しても辞書の上位は落とさない
+        let dict: Vec<String> = ["書き", "描き", "下記", "欠き", "掻き", "賀喜"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let llm: Vec<String> = ["書き", "欠き", "掻き", "か気", "か来", "カキ", "書", "柿"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let merged = super::merge_candidate_lists(&[], &[], &dict, llm, 9);
+        assert_eq!(
+            merged,
+            ["書き", "描き", "下記", "欠き", "掻き", "か気", "か来", "カキ", "書"]
+        );
     }
 
     #[test]
