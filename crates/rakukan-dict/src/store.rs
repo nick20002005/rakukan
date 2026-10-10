@@ -621,6 +621,38 @@ impl DictStore {
         out
     }
 
+    /// 読みが `prefix` で始まり、それより 1〜`max_extra_chars` 文字だけ長い学習
+    /// エントリを `(読み, 表記, 最終確定時刻)` で返す。
+    ///
+    /// 活用形どうしで学習を共有する（engine の `rescore::offer_learned_stems`）ために、
+    /// 語幹の読みから `かく → 描く`・`かいた → 描いた` のような一族をまとめて引く。
+    /// 走査は `lookup_learn_prefix_keyed` と同じ全キーの前方一致。
+    pub fn learn_entries_near(
+        &self,
+        prefix: &str,
+        max_extra_chars: usize,
+    ) -> Vec<(String, String, u64)> {
+        if prefix.is_empty() || max_extra_chars == 0 {
+            return vec![];
+        }
+        let Ok(hist) = self.inner.learn_history.read() else {
+            return vec![];
+        };
+        let mut out: Vec<(String, String, u64)> = Vec::new();
+        for (reading, entries) in hist.iter() {
+            if reading.len() <= prefix.len() || !reading.starts_with(prefix) {
+                continue;
+            }
+            if reading[prefix.len()..].chars().count() > max_extra_chars {
+                continue;
+            }
+            for e in entries {
+                out.push((reading.clone(), e.surface.clone(), e.last_access_time));
+            }
+        }
+        out
+    }
+
     /// 学習履歴の全エントリ (reading, surface) を返す（棚卸し・掃除ツール用）。
     pub fn learn_entries_snapshot(&self) -> Vec<(String, String)> {
         let Ok(hist) = self.inner.learn_history.read() else {

@@ -541,6 +541,202 @@ pub fn promote_learned_inflection(
     (out, Some(rewrite))
 }
 
+/// 語幹の一族として数える、語幹の読みより後ろ（送り仮名・活用語尾）の最大文字数。
+/// `描く`=1、`描いた`=2、`描かない`=3、`描きました`=4。
+const STEM_MAX_TAIL_CHARS: usize = 4;
+
+/// 1 回の変換で 2 番目以降に足す、語幹違いの候補の最大数。
+const STEM_MAX_OFFERS: usize = 2;
+
+/// 送り仮名つきの形が辞書に載っているかを見るときの、辞書の引き数。
+const STEM_DICT_LOOKUP_LIMIT: usize = 64;
+
+/// 語幹の読み `stem_reading` で、`stem_kanji` と**同じ読みキーの下で選び分けた
+/// ことのある**漢字を、最後に選んだ順で返す。
+///
+/// 戻り値は `(stem_kanji を最後に選んだ時刻, [(別の漢字, 最後に選んだ時刻)])`。
+/// `かく → 書く / 描く` の両方を選んだことがあれば、`か`・`書` に対して `描` が返る。
+/// 活用形はどれでもよく（`かいた → 描いた` も `描` の時刻に数える）、ここで活用形を
+/// またいだ共有が起きる。読みが同じだけの別の動詞（`買う`）は、同じキーで
+/// 選び分けたことが無いかぎり混ざらない。
+fn stem_rivals(
+    store: &DictStore,
+    stem_reading: &str,
+    stem_kanji: &str,
+) -> Option<(u64, Vec<(String, u64)>)> {
+    let mut by_key: HashMap<String, Vec<String>> = HashMap::new();
+    let mut last: HashMap<String, u64> = HashMap::new();
+    for (key, surface, at) in store.learn_entries_near(stem_reading, STEM_MAX_TAIL_CHARS) {
+        let tail = &key[stem_reading.len()..];
+        if !tail.chars().all(|c| classify(c) == RunKind::Hiragana) {
+            continue;
+        }
+        let Some(kanji) = surface.strip_suffix(tail) else {
+            continue;
+        };
+        if kanji.is_empty() || !kanji.chars().all(is_kanji) {
+            continue;
+        }
+        let slot = last.entry(kanji.to_string()).or_insert(0);
+        *slot = (*slot).max(at);
+        by_key.entry(key).or_default().push(kanji.to_string());
+    }
+    let own = *last.get(stem_kanji)?;
+    let mut rivals: Vec<(String, u64)> = Vec::new();
+    for kanjis in by_key.values() {
+        if !kanjis.iter().any(|k| k == stem_kanji) {
+            continue;
+        }
+        for k in kanjis {
+            if k != stem_kanji && !rivals.iter().any(|(r, _)| r == k) {
+                rivals.push((k.clone(), last[k]));
+            }
+        }
+    }
+    if rivals.is_empty() {
+        return None;
+    }
+    rivals.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    Some((own, rivals))
+}
+
+/// `offer_learned_stems` が出した語幹違いの候補 1 件。
+#[derive(Clone, Debug, PartialEq)]
+pub struct StemOffer {
+    /// 語幹を入れ替えた文全体
+    pub sentence: String,
+    /// 入れ替えた区間の読み（語幹＋送り仮名 1 文字。`かき`）
+    pub key: String,
+    /// 入れ替え後の区間の表記（`描き`）
+    pub surface: String,
+}
+
+/// 活用形をまたいで学習を共有し、同音の語幹（`書`/`描`）を選びやすくする。
+///
+/// 学習は読みの完全一致でしか引かれないので、`かく → 描く` を何度選んでも
+/// `かき`・`かいた` には効かず、`描き直そう` は n-best の下位か、そもそも出ない。
+/// そこで第 1 候補の「漢字＋送り仮名」ごとに、同じ語幹の読みで選び分けたことの
+/// ある別の漢字（`stem_rivals`）を引き、入れ替えた文を作る。
+///
+/// - 入れ替えた文は **必ず 2 番目**に置く（n-best にあれば移し、無ければ足す）。
+///   先頭は動かさないので、ライブ変換の preview は変わらない。
+/// - `allow_promote` で、別の漢字のほうを**後に**選んでいて、入れ替えた文が n-best に
+///   あり、LLM の自信度が僅差のときだけ先頭へ繰り上げる
+///   （`promote_learned_inflection` と同じ条件。断られたら同じ経路で止まる）。
+///
+/// 送り仮名つきの形（`描き`）が辞書の `かき` に載っているものしか作らないので、
+/// 活用の合わない入れ替え（`買き`）や、読みの割り戻しがずれた区間では何もしない。
+pub fn offer_learned_stems(
+    store: &DictStore,
+    reading: &str,
+    candidates: Vec<String>,
+    confidence_gap: &dyn Fn(&str, &str) -> Option<f32>,
+    allow_promote: bool,
+) -> (Vec<String>, Vec<StemOffer>, Option<LearnedRewrite>) {
+    let Some(first) = candidates.first().filter(|c| c.as_str() != reading).cloned() else {
+        return (candidates, Vec::new(), None);
+    };
+    let Some(runs) = align(reading, &first) else {
+        return (candidates, Vec::new(), None);
+    };
+    let first_chars: Vec<char> = first.chars().collect();
+    // (入れ替えた文, 区間の読み, 入れ替え後の表記, 第 1 候補の表記, 別の漢字のほうが後か)
+    let mut found: Vec<(StemOffer, String, bool)> = Vec::new();
+    let mut spos = 0usize;
+    for (i, run) in runs.iter().enumerate() {
+        let start = spos;
+        let run_len = run.surface.chars().count();
+        spos += run_len;
+        if found.len() >= STEM_MAX_OFFERS {
+            break;
+        }
+        if run.kind != RunKind::Kanji || !run.surface.chars().all(is_kanji) {
+            continue;
+        }
+        let Some(okuri) = runs
+            .get(i + 1)
+            .filter(|n| n.kind == RunKind::Hiragana)
+            .and_then(|n| n.surface.chars().next())
+        else {
+            continue;
+        };
+        // 読み全体がその語なら merge 側の完全一致（辞書・学習）に任せる。
+        if (start == 0 && run_len + 1 == first_chars.len())
+            || INFLECTED_PARTICLE_TAILS.contains(&okuri)
+        {
+            continue;
+        }
+        let Some((own_at, rivals)) = stem_rivals(store, &run.reading, &run.surface) else {
+            continue;
+        };
+        let key = format!("{}{}", run.reading, okuri);
+        let llm_surface = format!("{}{}", run.surface, okuri);
+        let mut known = store.lookup_dict(&key, STEM_DICT_LOOKUP_LIMIT);
+        known.extend(store.lookup_user(&key));
+        known.extend(store.lookup_user_low(&key));
+        if !known.contains(&llm_surface) {
+            continue;
+        }
+        for (kanji, at) in rivals {
+            let surface = format!("{kanji}{okuri}");
+            if !known.contains(&surface) {
+                continue;
+            }
+            let mut sentence: String = first_chars[..start].iter().collect();
+            sentence.push_str(&surface);
+            sentence.extend(&first_chars[start + run_len + 1..]);
+            found.push((
+                StemOffer {
+                    sentence,
+                    key: key.clone(),
+                    surface,
+                },
+                llm_surface.clone(),
+                at > own_at,
+            ));
+            break;
+        }
+    }
+    if found.is_empty() {
+        return (candidates, Vec::new(), None);
+    }
+
+    let mut out = candidates;
+    let mut rewrite = None;
+    if allow_promote
+        && let Some(n) = found.iter().position(|(offer, _, newer)| {
+            *newer
+                && out.contains(&offer.sentence)
+                && confidence_gap(&first, &offer.sentence)
+                    .is_some_and(|g| g <= INFLECTED_MAX_CONFIDENCE_GAP)
+        })
+    {
+        let (offer, llm_surface, _) = found.remove(n);
+        out.retain(|c| *c != offer.sentence);
+        tracing::info!(
+            reading = %reading,
+            promoted = %offer.sentence,
+            key = %offer.key,
+            "rescore: promoted learned stem"
+        );
+        rewrite = Some(LearnedRewrite {
+            original: first.clone(),
+            runs: vec![(offer.key, llm_surface)],
+        });
+        out.insert(0, offer.sentence);
+    }
+    // 先頭（繰り上げたならその次の、元の第 1 候補）の直後に並べる。
+    let base = out.iter().position(|c| *c == first).unwrap_or(0) + 1;
+    let mut offers: Vec<StemOffer> = Vec::new();
+    for (offer, _, _) in found {
+        out.retain(|c| *c != offer.sentence);
+        out.insert((base + offers.len()).min(out.len()), offer.sentence.clone());
+        offers.push(offer);
+    }
+    tracing::debug!(reading = %reading, offers = ?offers, "rescore: offered learned stems");
+    (out, offers, rewrite)
+}
+
 /// 長文の第 1 候補を学習表記で**書き換える**ための、読みの最小文字数。2 文字の読み
 /// （`いま`・`にち`・`えん`）は同音異義が多く、文脈を無視して塗り替えると壊す。
 const LEARNED_RUN_MIN_READING_CHARS: usize = 3;
@@ -1290,6 +1486,104 @@ surfaces = ["海底", "ハイテイ"]
         let cands = vec!["脚のある家具".to_string(), "足のある家具".to_string()];
         let close = |_: &str, _: &str| Some(0.09f32);
         let (got, _) = promote_learned_inflection(&store, "あしのあるかぐ", cands.clone(), &close);
+        assert_eq!(got, cands);
+    }
+
+    const KAKI_DICT: &str = r#"
+[[entries]]
+reading = "かき"
+surfaces = ["書き", "描き", "下記", "買き"]
+"#;
+
+    #[test]
+    fn offers_stem_rival_as_second_candidate_across_inflections() {
+        let (_dir, store) = store_with_user_entries(KAKI_DICT);
+        // 選び分けたのは `かく` だけ。`かき` は一度も学習していない。
+        store.learn_force("かく", "描く");
+        store.learn_force("かく", "書く");
+        let reading = "くらげがおおすぎるからかきなおそう";
+        let cands = vec![
+            "クラゲが多すぎるから書き直そう".to_string(),
+            "くらげが多すぎるから書き直そう".to_string(),
+        ];
+        let close = |_: &str, _: &str| Some(0.1f32);
+
+        // n-best に無ければ 2 番目に足す。先頭は動かさない。
+        let (got, offers, rewrite) =
+            offer_learned_stems(&store, reading, cands.clone(), &close, true);
+        assert_eq!(
+            got,
+            [
+                "クラゲが多すぎるから書き直そう",
+                "クラゲが多すぎるから描き直そう",
+                "くらげが多すぎるから書き直そう",
+            ]
+        );
+        assert!(rewrite.is_none());
+        assert_eq!(offers.len(), 1);
+        assert_eq!(offers[0].key, "かき");
+        assert_eq!(offers[0].surface, "描き");
+
+        // n-best の下位にあれば 2 番目へ移す（件数は増やさない）。もう一度通しても同じ。
+        let mut with_alt = cands.clone();
+        with_alt.push("クラゲが多すぎるから描き直そう".to_string());
+        let (moved, _, _) = offer_learned_stems(&store, reading, with_alt, &close, false);
+        assert_eq!(moved, got);
+        let (again, _, _) = offer_learned_stems(&store, reading, moved, &close, true);
+        assert_eq!(again, got);
+    }
+
+    #[test]
+    fn promotes_stem_rival_chosen_later_when_llm_is_unsure() {
+        let (_dir, store) = store_with_user_entries(KAKI_DICT);
+        store.learn_force("かく", "書く");
+        // 最終確定時刻は秒単位。`描` のほうを後に選んだ状態にする。
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        store.learn_force("かいた", "描いた");
+        store.learn_force("かく", "描く");
+        let reading = "えをかきなおそう";
+        let cands = vec![
+            "絵を書き直そう".to_string(),
+            "えを書き直そう".to_string(),
+            "絵を描き直そう".to_string(),
+        ];
+        let close = |_: &str, _: &str| Some(0.2f32);
+        let (got, offers, rewrite) =
+            offer_learned_stems(&store, reading, cands.clone(), &close, true);
+        assert_eq!(got, ["絵を描き直そう", "絵を書き直そう", "えを書き直そう"]);
+        assert!(offers.is_empty());
+        let rewrite = rewrite.unwrap();
+        assert_eq!(rewrite.original, "絵を書き直そう");
+        assert_eq!(rewrite.runs, vec![("かき".to_string(), "書き".to_string())]);
+
+        // LLM がはっきり選んでいる・繰り上げ不可のときは 2 番目に置くだけ。
+        let far = |_: &str, _: &str| Some(1.0f32);
+        let expect = ["絵を書き直そう", "絵を描き直そう", "えを書き直そう"];
+        let (got, _, rewrite) = offer_learned_stems(&store, reading, cands.clone(), &far, true);
+        assert_eq!(got, expect);
+        assert!(rewrite.is_none());
+        let (got, _, rewrite) = offer_learned_stems(&store, reading, cands.clone(), &close, false);
+        assert_eq!(got, expect);
+        assert!(rewrite.is_none());
+    }
+
+    #[test]
+    fn skips_stem_never_chosen_under_the_same_reading() {
+        let (_dir, store) = store_with_user_entries(KAKI_DICT);
+        // `買` は語幹の読みが同じでも、`書` と同じ読みキーで選び分けたことが無い。
+        store.learn_force("かく", "書く");
+        store.learn_force("かう", "買う");
+        let cands = vec!["絵を書き直そう".to_string()];
+        let close = |_: &str, _: &str| Some(0.1f32);
+        let (got, offers, _) =
+            offer_learned_stems(&store, "えをかきなおそう", cands.clone(), &close, true);
+        assert_eq!(got, cands);
+        assert!(offers.is_empty());
+
+        // 選び分けていても、その活用形が辞書に無ければ作らない。
+        store.learn_force("かく", "描く");
+        let cands = vec!["絵を書こう".to_string()];
+        let (got, _, _) = offer_learned_stems(&store, "えをかこう", cands.clone(), &close, true);
         assert_eq!(got, cands);
     }
 

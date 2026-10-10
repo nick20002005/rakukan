@@ -848,6 +848,9 @@ pub struct RakunEngine {
     /// 直近に学習語で差し替えた候補: `(読み, 差し替え内容)`。
     /// 元の候補が確定されたら `learn_declined_rewrite` が使う。
     last_learned_rewrite: Mutex<Option<(String, rescore::LearnedRewrite)>>,
+    /// 直近に出した語幹違いの候補（`rescore::offer_learned_stems`）: `(読み, 候補)`。
+    /// どれかが確定されたら `learn_accepted_stem_offer` がその語幹を学習する。
+    last_stem_offers: Mutex<Option<(String, Vec<rescore::StemOffer>)>>,
 }
 
 impl RakunEngine {
@@ -865,6 +868,7 @@ impl RakunEngine {
             dict_store: None,
             last_predictions: Mutex::new(None),
             last_learned_rewrite: Mutex::new(None),
+            last_stem_offers: Mutex::new(None),
         }
     }
 
@@ -1523,7 +1527,9 @@ impl RakunEngine {
     /// 学習語を DictStore に即時反映してファイルにも保存する。
     pub fn learn(&mut self, reading: &str, surface: &str) {
         if let Some(store) = &self.dict_store {
-            self.learn_declined_rewrite(store, reading, surface);
+            if !self.learn_declined_rewrite(store, reading, surface) {
+                self.learn_accepted_stem_offer(store, reading, surface);
+            }
             let key = self.learn_key_for(reading, surface);
             store.learn(&key, surface);
         } else {
@@ -1533,7 +1539,9 @@ impl RakunEngine {
 
     pub fn learn_force(&mut self, reading: &str, surface: &str) {
         if let Some(store) = &self.dict_store {
-            self.learn_declined_rewrite(store, reading, surface);
+            if !self.learn_declined_rewrite(store, reading, surface) {
+                self.learn_accepted_stem_offer(store, reading, surface);
+            }
             let key = self.learn_key_for(reading, surface);
             store.learn_force(&key, surface);
         } else {
@@ -2181,7 +2189,21 @@ impl RakunEngine {
         );
         let (candidates, word_rewrite) = rescore::apply_user_words(store, reading, candidates);
         let (candidates, rewrite) = rescore::apply_learned_runs(store, reading, candidates);
-        if let Some(rewrite) = rewrite.or(word_rewrite).or(inflection_rewrite)
+        let rewrite = rewrite.or(word_rewrite).or(inflection_rewrite);
+        // 先頭を他の学習で既に動かしたなら、語幹違いは 2 番目に出すだけにする。
+        let (candidates, stem_offers, stem_rewrite) = rescore::offer_learned_stems(
+            store,
+            reading,
+            candidates,
+            &|top, other| rescore::noted_confidence_gap(reading, top, other),
+            rewrite.is_none(),
+        );
+        if !stem_offers.is_empty()
+            && let Ok(mut slot) = self.last_stem_offers.lock()
+        {
+            *slot = Some((reading.to_string(), stem_offers));
+        }
+        if let Some(rewrite) = rewrite.or(stem_rewrite)
             && let Ok(mut slot) = self.last_learned_rewrite.lock()
         {
             *slot = Some((reading.to_string(), rewrite));
@@ -2191,15 +2213,16 @@ impl RakunEngine {
 
     /// 学習語の差し替え（`rescore::apply_learned_runs`）を断って元の候補を確定したら、
     /// 差し替えた run の読みに LLM の表記を学習させ、次から差し替えないようにする。
-    fn learn_declined_rewrite(&self, store: &DictStore, reading: &str, surface: &str) {
+    /// 戻り値は、断られた差し替えを学習したかどうか。
+    fn learn_declined_rewrite(&self, store: &DictStore, reading: &str, surface: &str) -> bool {
         let Ok(mut slot) = self.last_learned_rewrite.lock() else {
-            return;
+            return false;
         };
         let Some((rewrite_reading, rewrite)) = slot.as_ref() else {
-            return;
+            return false;
         };
         if rewrite_reading != reading || rewrite.original != surface {
-            return;
+            return false;
         }
         for (run_reading, llm_surface) in &rewrite.runs {
             info!(
@@ -2208,6 +2231,33 @@ impl RakunEngine {
             );
             store.learn_force(run_reading, llm_surface);
         }
+        *slot = None;
+        true
+    }
+
+    /// 語幹違いの候補（`rescore::offer_learned_stems`）が確定されたら、入れ替えた区間
+    /// （`かき → 描き`）を学習する。文全体の学習だけでは語幹の一族に数えられず、
+    /// 次に別の活用形を打ったとき「最後に選んだ漢字」が古いままになる。
+    ///
+    /// 文節ごとの変換では確定時の読みが文全体になるので、読み・表記とも包含で照合する。
+    fn learn_accepted_stem_offer(&self, store: &DictStore, reading: &str, surface: &str) {
+        let Ok(mut slot) = self.last_stem_offers.lock() else {
+            return;
+        };
+        let Some((offer_reading, offers)) = slot.as_ref() else {
+            return;
+        };
+        if !reading.contains(offer_reading.as_str()) {
+            return;
+        }
+        let Some(offer) = offers.iter().find(|o| surface.contains(o.sentence.as_str())) else {
+            return;
+        };
+        info!(
+            "learn: stem offer accepted reading={:?} key={:?} surface={:?}",
+            reading, offer.key, offer.surface
+        );
+        store.learn_force(&offer.key, &offer.surface);
         *slot = None;
     }
 
