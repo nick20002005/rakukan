@@ -338,6 +338,74 @@ const PREDICTION_OVERFETCH: usize = 4;
 /// 末尾（数ページ先）へ回されていた。
 const HIRAGANA_HEAD_RANK: usize = 3;
 
+/// MOZC 辞書の第 1 候補の直後へ割り込ませる LLM 候補の件数（`insert_llm_front`）。
+///
+/// 🔴 MOZC 辞書は活用形や「語＋助詞」を単独エントリで持たないので、`はった`
+///    `あさか` のような読みでは辞書側が人名・地名しか返さず、`貼った` `朝か` は
+///    LLM からしか出てこない。辞書を先に全部並べると固有名詞が 30 件並んでから
+///    一般語が出る（2026-09-09 に実害・2026-10-17 に `あさか` で再発。9/9 の修正は
+///    上流の Step 12-1（`merge_candidate_lists`）を取り込んだ時に消えていた）。
+///
+/// 件数を増やすと、辞書にある固有名詞を選ぶまでの手数が増える。第 1・第 2
+/// 候補が一般語で埋まれば体感はほぼ直るので 2 に留める。
+const LLM_HEAD_CANDIDATES: usize = 2;
+
+/// 上の枠に入れる候補を探す範囲（LLM 候補の先頭から何件見るか）。
+///
+/// 🔴 **LLM 側の順序も固有名詞に寄る**。`はった` の LLM 候補は
+///    `[八田, 張った, 貼った, …]` で、第 1 候補が地名だった（ビーム変換が MOZC の
+///    コストを語彙として使っているため）。「LLM の上位をそのまま前に出す」だけでは
+///    地名が第 2 候補に居座るので、**MOZC が持っていない候補だけ**を前に出す。
+///    MOZC が語を持っている通常の読みでは枠が空になり、従来と同じ順序になる。
+const LLM_HEAD_SCAN: usize = 3;
+
+/// MOZC の最良 cost がこれ以上の読みだけ、LLM 候補を辞書より前に出す。
+///
+/// 🔴 無条件に前へ出すと、辞書が一般語を持つ読みで LLM の崩れた割り方が先頭を
+///    奪う（過去ログ 322 読みで当てはめると `数千円`→`数千yen`、`受け付ける`→
+///    `受傑ける`、`指示`→`し字`）。一般語の最良 cost は `今回` 1705 / `数千円` 2926 /
+///    `受け付ける` 3869 / `指示` 3823、人名・地名だけの読みは `あさか` 4569 /
+///    `はった` 5047 / `なんの` 5232 / `かくに` 5759 で、間に線が引ける。
+const LLM_HEAD_WEAK_DICT_COST: u16 = 4500;
+
+/// LLM 候補の上位 `LLM_HEAD_SCAN` 件のうち、MOZC 辞書に無いものを
+/// `LLM_HEAD_CANDIDATES` 件まで返す（辞書より前に置く分）。
+/// 辞書が一般語を持つ読み（最良 cost が `LLM_HEAD_WEAK_DICT_COST` 未満）では空。
+fn llm_head_not_in_dict(llm: &[String], dict: &[String], best_dict_cost: Option<u16>) -> Vec<String> {
+    if best_dict_cost.is_some_and(|c| c < LLM_HEAD_WEAK_DICT_COST) {
+        return Vec::new();
+    }
+    llm.iter()
+        .take(LLM_HEAD_SCAN)
+        .filter(|c| !dict.iter().any(|d| d == *c))
+        .take(LLM_HEAD_CANDIDATES)
+        .cloned()
+        .collect()
+}
+
+/// `llm_head_not_in_dict` の候補を、辞書側の列 `dict`（low ユーザー辞書・「ん」補完・
+/// MOZC の順）へ差し込む。`fixed` は先頭の low ユーザー辞書＋「ん」補完の件数。
+///
+/// 🔴 **第 1 候補は奪わない**。ライブ変換の preview は第 1 候補を採るので、
+///    `もふく` の打鍵中に `喪服` が `も副` に化ける（過去ログで確認）。先頭が
+///    学習履歴・ユーザー辞書で決まっている（`head_taken`）なら固定分の直後、
+///    そうでなければ辞書の第 1 候補の直後に置く。2 番目に出れば 1 回で選べ、
+///    選べば学習履歴が先頭へ上げる。
+fn insert_llm_front(
+    mut dict: Vec<String>,
+    front: Vec<String>,
+    fixed: usize,
+    head_taken: bool,
+) -> Vec<String> {
+    if front.is_empty() {
+        return dict;
+    }
+    let at = if head_taken || fixed > 0 { fixed } else { 1 };
+    let at = at.min(dict.len());
+    dict.splice(at..at, front);
+    dict
+}
+
 /// な行かなを「ん + 母音」に開いた代替読みを列挙する。
 ///
 /// ローマ字入力では `n` + 母音 が な行になるので、「げんいん」を出すには
@@ -1897,10 +1965,24 @@ impl RakunEngine {
             dict_symbol_cands, n_fix_cands
         );
 
+        // MOZC に無い LLM 上位（活用形・語＋助詞）は MOZC 辞書の 2 番目以降へ割り込ませる
+        // （`LLM_HEAD_CANDIDATES` 参照）。ユーザー辞書（low 含む）・学習履歴・
+        // 「ん」補完は明示的な意思か辞書の確実な引きなので、これより前のまま。
+        let best_dict_cost = self
+            .dict_store
+            .as_ref()
+            .and_then(|d| d.best_dict_cost(hiragana));
+        let llm_front = llm_head_not_in_dict(&llm_candidates, &dict_cands, best_dict_cost);
         let additional_dict: Vec<String> = user_low_cands.iter()
             .chain(n_fix_cands.iter())
             .chain(dict_cands.iter().filter(|c| c.as_str() != hiragana))
             .cloned().collect();
+        let additional_dict = insert_llm_front(
+            additional_dict,
+            llm_front,
+            user_low_cands.len() + n_fix_cands.len(),
+            !learn_cands.is_empty() || !user_cands.is_empty(),
+        );
         let merged = merge_candidate_lists(
             &learn_cands,
             &user_cands,
@@ -3220,6 +3302,66 @@ surfaces = ["杜野"]
         let user: Vec<String> = (1..=5).map(|n| format!("ユ{n}")).collect();
         let merged = super::merge_candidate_lists(&learn, &user, &[], vec!["L1".into()], 4);
         assert_eq!(merged, ["学1", "学2", "学3", "学4"]);
+    }
+
+    fn strs(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn llm_head_takes_only_candidates_missing_from_dict() {
+        // はった: 地名は MOZC にあるので除き、活用形だけを前に出す
+        let dict = strs(&["八田", "発田", "張田"]);
+        let llm = strs(&["八田", "張った", "貼った", "這った"]);
+        assert_eq!(
+            super::llm_head_not_in_dict(&llm, &dict, Some(5047)),
+            ["張った", "貼った"]
+        );
+        // MOZC が語を持つ通常の読みでは空（従来どおりの順序）
+        let dict = strs(&["書き", "描き", "下記"]);
+        let llm = strs(&["書き", "描き", "下記", "か気"]);
+        assert!(super::llm_head_not_in_dict(&llm, &dict, Some(5047)).is_empty());
+    }
+
+    #[test]
+    fn llm_head_is_empty_when_dict_has_common_word() {
+        // 数千円（cost 2926）: LLM 下位の崩れた割り方を先頭に出さない
+        let dict = strs(&["数千円"]);
+        let llm = strs(&["数千円", "数千yen", "数千縁"]);
+        assert!(super::llm_head_not_in_dict(&llm, &dict, Some(2926)).is_empty());
+        // 境目のすぐ上は出す
+        assert_eq!(
+            super::llm_head_not_in_dict(&llm, &dict, Some(super::LLM_HEAD_WEAK_DICT_COST)),
+            ["数千yen", "数千縁"]
+        );
+    }
+
+    #[test]
+    fn asaka_puts_llm_word_before_dict_names() {
+        // 2026-10-17 実機の並び: MOZC は人名・地名 30 件、`朝か` は LLM だけが出す
+        let user = strs(&["朝香"]);
+        let dict = strs(&["朝霞", "浅香", "安積", "朝加", "麻夏", "アサカ"]);
+        let llm = strs(&["朝香", "朝か", "朝霞", "あさか", "朝加", "朝課"]);
+        let front = super::llm_head_not_in_dict(&llm, &dict, Some(4569));
+        let additional = super::insert_llm_front(dict, front, 0, true);
+        let merged = super::merge_candidate_lists(&[], &user, &additional, llm, 40);
+        assert_eq!(&merged[..3], ["朝香", "朝か", "朝霞"]);
+    }
+
+    #[test]
+    fn llm_front_never_takes_first_place_from_dict() {
+        // はった（学習・ユーザー辞書なし）: 先頭は辞書のまま、活用形が 2・3 番目
+        let dict = strs(&["八田", "発田", "張田"]);
+        let llm = strs(&["八田", "張った", "貼った"]);
+        let front = super::llm_head_not_in_dict(&llm, &dict, Some(5047));
+        let additional = super::insert_llm_front(dict, front, 0, false);
+        let merged = super::merge_candidate_lists(&[], &[], &additional, llm, 40);
+        assert_eq!(merged, ["八田", "張った", "貼った", "発田", "張田"]);
+        // 「ん」補完などの固定分があれば、その直後
+        let out = super::insert_llm_front(strs(&["原因", "辞1"]), strs(&["L"]), 1, false);
+        assert_eq!(out, ["原因", "L", "辞1"]);
+        // 辞書側が空なら先頭（LLM しか無い）
+        assert_eq!(super::insert_llm_front(vec![], strs(&["L"]), 0, false), ["L"]);
     }
 
     fn syms(prefix: &str, n: usize) -> Vec<String> {

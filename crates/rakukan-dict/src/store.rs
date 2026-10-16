@@ -813,6 +813,17 @@ impl DictStore {
         result
     }
 
+    /// ひらがな読みの mozc 通常語のうち最小の cost。辞書に無ければ `None`。
+    /// 一般語は数千前半、人名・地名だけの読みは 4500 以上になる（2026-10-17 実測）。
+    pub fn best_dict_cost(&self, reading: &str) -> Option<u16> {
+        let mozc = self.inner.mozc.as_ref()?;
+        mozc.lookup(reading, u16::MAX as usize)
+            .into_iter()
+            .map(|(_, cost)| cost)
+            .filter(|cost| cost_band::classify(*cost) == cost_band::Class::Normal)
+            .min()
+    }
+
     /// ひらがな読みから記号候補（`symbol.tsv` 由来、mozc の行順）を全件返す（Step 12-2）
     pub fn lookup_symbols(&self, reading: &str) -> Vec<String> {
         self.lookup_class(reading, cost_band::Class::Symbol, usize::MAX)
