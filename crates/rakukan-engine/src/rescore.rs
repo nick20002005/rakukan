@@ -171,7 +171,87 @@ fn align(reading: &str, surface: &str) -> Option<Vec<AlignedRun>> {
     Some(out)
 }
 
-/// run 1 つぶんの辞書一致の重み。載っていなければ `None`。
+/// 語頭以外の濁音を一つだけ清音へ戻す（半濁音は対象外）。
+fn unvoiced_readings(reading: &str) -> Vec<String> {
+    let chars: Vec<char> = reading.chars().collect();
+    let voiced = "がぎぐげござじずぜぞだぢづでどばびぶべぼ";
+    let plain: Vec<char> = "かきくけこさしすせそたちつてとはひふへほ".chars().collect();
+    chars
+        .iter()
+        .enumerate()
+        .skip(1)
+        .filter_map(|(i, c)| {
+            let k = voiced.chars().position(|v| v == *c)?;
+            let mut variant = chars.clone();
+            variant[i] = plain[k];
+            Some(variant.into_iter().collect())
+        })
+        .collect()
+}
+
+/// 文全体または一意な文節を、確定表記の同じ読み区間へ対応付ける。
+pub fn surface_for_reading(reading: &str, surface: &str, key: &str) -> Option<String> {
+    if reading == key {
+        return Some(surface.to_string());
+    }
+    if key.is_empty() {
+        return None;
+    }
+    let mut matches = reading.match_indices(key);
+    let (byte, _) = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    let start = reading[..byte].chars().count();
+    let end = start + key.chars().count();
+    let runs = align(reading, surface)?;
+    let cuts = reading_cut_points(&runs, reading.chars().count());
+    let chars: Vec<char> = surface.chars().collect();
+    Some(chars[cuts[start]?..cuts[end]?].iter().collect())
+}
+
+/// 確定側の漢字・カタカナ run を提示側と比較し、安全に切れる差分だけ返す。
+pub fn corrected_words(
+    reading: &str,
+    offered: &str,
+    accepted: &str,
+) -> Vec<(String, String, String)> {
+    let (Some(before), Some(after)) = (align(reading, offered), align(reading, accepted)) else {
+        tracing::debug!(%reading, "learn: split word alignment uncertain");
+        return Vec::new();
+    };
+    let cuts = reading_cut_points(&before, reading.chars().count());
+    let original: Vec<char> = offered.chars().collect();
+    let mut pos = 0;
+    let mut words = Vec::new();
+    for (i, run) in after.iter().enumerate() {
+        let end = pos + run.reading.chars().count();
+        // 直後が活用語尾なら run は語幹（`揃える` の `揃`）。単語として覚えると
+        // 文中の別の語（`ソロ`）を塗り替えるので、助詞で切れる語だけを学習する。
+        let boundary_ok = soft_boundary_ok(i.checked_sub(1).map(|j| &after[j]), after.get(i + 1));
+        if boundary_ok
+            && (2..=10).contains(&(end - pos))
+            && has_kanji_or_katakana(&run.surface)
+            && run
+                .surface
+                .chars()
+                .all(|c| matches!(c, '一'..='鿿' | '々' | 'ァ'..='ヶ' | 'ー'))
+        {
+            if let (Some(a), Some(b)) = (cuts[pos], cuts[end]) {
+                let from: String = original[a..b].iter().collect();
+                if from != run.surface {
+                    words.push((run.reading.clone(), run.surface.clone(), from));
+                }
+            } else {
+                tracing::debug!(%reading, "learn: split word boundary uncertain");
+            }
+        }
+        pos = end;
+    }
+    words
+}
+
+/// run 1 つぶんの辞書一致の重み。
 fn run_weight(store: &DictStore, reading: &str, surface: &str) -> Option<f64> {
     if store.lookup_user(reading).iter().any(|c| c == surface) {
         return Some(WEIGHT_USER);
@@ -185,6 +265,14 @@ fn run_weight(store: &DictStore, reading: &str, surface: &str) -> Option<f64> {
         .any(|c| c == surface)
     {
         return Some(WEIGHT_DICT);
+    }
+    if unvoiced_readings(reading).iter().any(|r| {
+        store
+            .lookup_dict(r, DICT_LOOKUP_LIMIT)
+            .iter()
+            .any(|c| c == surface)
+    }) {
+        return Some(WEIGHT_DICT * 0.9);
     }
     None
 }
@@ -237,6 +325,16 @@ fn piece_surfaces(store: &DictStore, reading: &str) -> Vec<(Vec<char>, f64)> {
             // 重みの大きい出自から順に積むので、既出の表記は捨ててよい
             if !out.iter().any(|(s, _)| *s == chars) {
                 out.push((chars, w));
+            }
+        }
+    }
+    if store.lookup_dict(reading, DICT_LOOKUP_LIMIT).is_empty() {
+        for variant in unvoiced_readings(reading) {
+            for surface in store.lookup_dict(&variant, DICT_LOOKUP_LIMIT) {
+                let chars: Vec<char> = surface.chars().collect();
+                if !out.iter().any(|(s, _)| *s == chars) {
+                    out.push((chars, WEIGHT_DICT * 0.9));
+                }
             }
         }
     }
@@ -998,17 +1096,49 @@ pub fn apply_user_words(
     reading: &str,
     candidates: Vec<String>,
 ) -> (Vec<String>, Option<LearnedRewrite>) {
+    apply_words(store, reading, candidates, false)
+}
+
+/// 一度選び直した短い学習語を、読み側から探して適用する。
+pub fn apply_split_words(
+    store: &DictStore,
+    reading: &str,
+    candidates: Vec<String>,
+) -> (Vec<String>, Option<LearnedRewrite>) {
+    apply_words(store, reading, candidates, true)
+}
+
+fn apply_words(
+    store: &DictStore,
+    reading: &str,
+    candidates: Vec<String>,
+    split: bool,
+) -> (Vec<String>, Option<LearnedRewrite>) {
     let Some(first) = candidates.first().cloned() else {
         return (candidates, None);
     };
     let reading_chars: Vec<char> = reading.chars().collect();
     let n = reading_chars.len();
-    let mut hits = store.user_words_within(
-        reading,
-        USER_WORD_MIN_READING_CHARS,
-        USER_WORD_MAX_READING_CHARS,
-    );
-    hits.retain(|(start, end, _)| end - start < n);
+    let mut hits = if split {
+        let mut hits = Vec::new();
+        for start in 0..n {
+            for end in start + 2..=(start + 10).min(n) {
+                let key: String = reading_chars[start..end].iter().collect();
+                let words = store.lookup_learn(&key);
+                if !words.is_empty() {
+                    hits.push((start, end, words));
+                }
+            }
+        }
+        hits
+    } else {
+        store.user_words_within(
+            reading,
+            USER_WORD_MIN_READING_CHARS,
+            USER_WORD_MAX_READING_CHARS,
+        )
+    };
+    hits.retain(|(start, end, _)| split || end - start < n);
     if hits.is_empty() {
         return (candidates, None);
     }
@@ -1017,6 +1147,14 @@ pub fn apply_user_words(
     };
     let cuts = reading_cut_points(&runs, n);
     let surface_chars: Vec<char> = first.chars().collect();
+    let run_starts: Vec<usize> = runs
+        .iter()
+        .scan(0usize, |pos, run| {
+            let start = *pos;
+            *pos += run.surface.chars().count();
+            Some(start)
+        })
+        .collect();
 
     // 長い登録語を優先し、重なる区間は捨てる。
     hits.sort_by_key(|(start, end, _)| (std::cmp::Reverse(end - start), *start));
@@ -1028,6 +1166,13 @@ pub fn apply_user_words(
         let (Some(s), Some(e)) = (cuts[start], cuts[end]) else {
             continue;
         };
+        // 学習語は短い読みが多く、1 つの run に収まる区間（`入って` の `はい`）まで
+        // 差し替えると学習済みの同音語で塗り替えてしまう（`牌って`）。run 1 つぶんは
+        // `apply_learned_runs` の担当なので、ここでは LLM が区間を複数の run に
+        // 割って出したときだけ扱う（`右｜は｜字` → `右端`）。
+        if split && !run_starts.iter().any(|&p| s < p && p < e) {
+            continue;
+        }
         let span_reading: String = reading_chars[start..end].iter().collect();
         let span_surface: String = surface_chars[s..e].iter().collect();
         let learned = store.lookup_learn(&span_reading);
@@ -1114,6 +1259,111 @@ mod tests {
                 .map(|r| (r.reading, r.surface))
                 .collect::<Vec<_>>()
         })
+    }
+
+    fn write_single_dict(path: &std::path::Path, reading: &str, surface: &str) {
+        let mut data = b"RKND".to_vec();
+        for n in [1u32, 1, 1, 0] {
+            data.extend(n.to_le_bytes());
+        }
+        data.extend((reading.len() as u16).to_le_bytes());
+        data.extend(0u32.to_le_bytes());
+        data.extend(1u16.to_le_bytes());
+        data.extend(reading.as_bytes());
+        data.extend(0u32.to_le_bytes());
+        data.extend((surface.len() as u16).to_le_bytes());
+        data.extend(100u16.to_le_bytes());
+        data.extend(surface.as_bytes());
+        std::fs::write(path, data).unwrap();
+    }
+
+    #[test]
+    fn unvoiced_dictionary_fallback_is_discounted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.dict");
+        write_single_dict(&path, "みぎはし", "右端");
+        let store = DictStore::load(None, Some(&path), None).unwrap();
+        assert_eq!(run_weight(&store, "みぎはし", "右端"), Some(WEIGHT_DICT));
+        assert_eq!(
+            run_weight(&store, "みぎはじ", "右端"),
+            Some(WEIGHT_DICT * 0.9)
+        );
+        assert!(
+            piece_surfaces(&store, "みぎはじ")
+                .contains(&("右端".chars().collect(), WEIGHT_DICT * 0.9))
+        );
+    }
+
+    #[test]
+    fn learns_and_rewrites_split_word_once() {
+        let words = corrected_words(
+            "みぎはじはさすがにいちどでへんかんしてほしい",
+            "右は字はさすがに一度で変換してほしい",
+            "右端はさすがに一度で変換してほしい",
+        );
+        assert_eq!(
+            words,
+            vec![("みぎはじ".into(), "右端".into(), "右は字".into())]
+        );
+        let (_dir, store) = store_with_user_entries("");
+        store.learn_force(&words[0].0, &words[0].1);
+        let original = "右は字に寄せる".to_string();
+        let (got, rewrite) = apply_split_words(&store, "みぎはじによせる", vec![original.clone()]);
+        assert_eq!(got, vec!["右端に寄せる".to_string(), original.clone()]);
+        let rewrite = rewrite.unwrap();
+        assert_eq!(rewrite.original, original);
+        for (r, s) in rewrite.runs {
+            store.learn_force(&r, &s);
+        }
+        let (got, rewrite) = apply_split_words(&store, "みぎはじによせる", vec![original.clone()]);
+        assert_eq!(got, vec![original]);
+        assert!(rewrite.is_none());
+        let (got, rewrite) = apply_split_words(&store, "みぎはじによせる", vec![]);
+        assert!(got.is_empty());
+        assert!(rewrite.is_none());
+    }
+
+    #[test]
+    fn split_word_leaves_single_run_spans_alone() {
+        // 2 文字の学習語でも、LLM が 1 つの run で出した区間は塗り替えない（`牌って`）。
+        let (_dir, store) = store_with_user_entries("");
+        store.learn_force("はい", "牌");
+        let cands = vec!["入っている".to_string()];
+        let (got, rewrite) = apply_split_words(&store, "はいっている", cands.clone());
+        assert_eq!(got, cands);
+        assert!(rewrite.is_none());
+    }
+
+    #[test]
+    fn split_word_guards_dictionary_homophones() {
+        let dir = tempfile::tempdir().unwrap();
+        let dict = dir.path().join("test.dict");
+        write_single_dict(&dict, "とうじょう", "登場");
+        let store = DictStore::load(None, Some(&dict), None).unwrap();
+        store.learn_force("とうじょう", "東條");
+        let cands = vec!["登場する".to_string()];
+        let (got, rewrite) = apply_split_words(&store, "とうじょうする", cands.clone());
+        assert_eq!(got, cands);
+        assert!(rewrite.is_none());
+    }
+
+    #[test]
+    fn split_word_block_alignment_and_conservative_boundaries() {
+        assert_eq!(
+            surface_for_reading(
+                "これはみぎはじによせる",
+                "これは右端に寄せる",
+                "みぎはじによせる"
+            ),
+            Some("右端に寄せる".into())
+        );
+        assert!(surface_for_reading("みぎはじとみぎはじ", "右端と右端", "みぎはじ").is_none());
+        assert!(corrected_words("きごう", "きごう", "！？").is_empty());
+        assert!(corrected_words("みぎはじ", "右端", "右端").is_empty());
+        // 活用語尾の前の語幹は覚えない（`そろ → 揃` を学習すると `ソロ` を塗る）
+        assert!(corrected_words("そろえる", "ソロえる", "揃える").is_empty());
+        assert_eq!(unvoiced_readings("みぎはじ"), vec!["みきはじ", "みぎはし"]);
+        assert!(unvoiced_readings("ばぱ").is_empty());
     }
 
     #[test]

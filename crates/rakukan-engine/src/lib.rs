@@ -851,6 +851,8 @@ pub struct RakunEngine {
     /// 直近に出した語幹違いの候補（`rescore::offer_learned_stems`）: `(読み, 候補)`。
     /// どれかが確定されたら `learn_accepted_stem_offer` がその語幹を学習する。
     last_stem_offers: Mutex<Option<(String, Vec<rescore::StemOffer>)>>,
+    /// rescore 後に提示した先頭候補。文節確定との照合用に最大16件保持する。
+    last_split_offers: Mutex<Vec<(String, String)>>,
 }
 
 impl RakunEngine {
@@ -868,6 +870,7 @@ impl RakunEngine {
             dict_store: None,
             last_predictions: Mutex::new(None),
             last_learned_rewrite: Mutex::new(None),
+            last_split_offers: Mutex::new(Vec::new()),
             last_stem_offers: Mutex::new(None),
         }
     }
@@ -1529,6 +1532,7 @@ impl RakunEngine {
         if let Some(store) = &self.dict_store {
             if !self.learn_declined_rewrite(store, reading, surface) {
                 self.learn_accepted_stem_offer(store, reading, surface);
+                self.learn_split_words(store, reading, surface);
             }
             let key = self.learn_key_for(reading, surface);
             store.learn(&key, surface);
@@ -1541,6 +1545,7 @@ impl RakunEngine {
         if let Some(store) = &self.dict_store {
             if !self.learn_declined_rewrite(store, reading, surface) {
                 self.learn_accepted_stem_offer(store, reading, surface);
+                self.learn_split_words(store, reading, surface);
             }
             let key = self.learn_key_for(reading, surface);
             store.learn_force(&key, surface);
@@ -2188,8 +2193,12 @@ impl RakunEngine {
             &|top, other| rescore::noted_confidence_gap(reading, top, other),
         );
         let (candidates, word_rewrite) = rescore::apply_user_words(store, reading, candidates);
+        let (candidates, split_rewrite) = rescore::apply_split_words(store, reading, candidates);
         let (candidates, rewrite) = rescore::apply_learned_runs(store, reading, candidates);
-        let rewrite = rewrite.or(word_rewrite).or(inflection_rewrite);
+        let rewrite = rewrite
+            .or(split_rewrite)
+            .or(word_rewrite)
+            .or(inflection_rewrite);
         // 先頭を他の学習で既に動かしたなら、語幹違いは 2 番目に出すだけにする。
         let (candidates, stem_offers, stem_rewrite) = rescore::offer_learned_stems(
             store,
@@ -2208,7 +2217,42 @@ impl RakunEngine {
         {
             *slot = Some((reading.to_string(), rewrite));
         }
+        if let Some(first) = candidates.first()
+            && let Ok(mut offers) = self.last_split_offers.lock()
+        {
+            offers.retain(|(r, _)| r != reading);
+            offers.push((reading.to_string(), first.clone()));
+            if offers.len() > 16 {
+                offers.remove(0);
+            }
+        }
         candidates
+    }
+
+    fn learn_split_words(&self, store: &DictStore, reading: &str, surface: &str) {
+        let Ok(mut offers) = self.last_split_offers.lock() else {
+            return;
+        };
+        // 打鍵途中の読み（`みぎはじ`・`みぎはじに`…）ごとに控えがあるので、同じ語が
+        // 何度も取り出される。1 回の確定で学習回数を水増ししないよう 1 語 1 回にする。
+        let mut learned: Vec<(String, String)> = Vec::new();
+        for (key, offered) in offers.iter() {
+            let Some(accepted) = rescore::surface_for_reading(reading, surface, key) else {
+                continue;
+            };
+            for (r, word, from) in rescore::corrected_words(key, offered, &accepted) {
+                if learned.iter().any(|(lr, lw)| *lr == r && *lw == word) {
+                    continue;
+                }
+                learned.push((r.clone(), word.clone()));
+                info!(
+                    "learn: split word learned reading={} word={} from={}",
+                    r, word, from
+                );
+                store.learn_force(&r, &word);
+            }
+        }
+        offers.clear();
     }
 
     /// 学習語の差し替え（`rescore::apply_learned_runs`）を断って元の候補を確定したら、
@@ -2221,7 +2265,9 @@ impl RakunEngine {
         let Some((rewrite_reading, rewrite)) = slot.as_ref() else {
             return false;
         };
-        if rewrite_reading != reading || rewrite.original != surface {
+        if rescore::surface_for_reading(reading, surface, rewrite_reading).as_deref()
+            != Some(rewrite.original.as_str())
+        {
             return false;
         }
         for (run_reading, llm_surface) in &rewrite.runs {
@@ -2232,6 +2278,9 @@ impl RakunEngine {
             store.learn_force(run_reading, llm_surface);
         }
         *slot = None;
+        if let Ok(mut offers) = self.last_split_offers.lock() {
+            offers.clear();
+        }
         true
     }
 
@@ -3032,6 +3081,43 @@ mod candidate_merge_tests {
         let merged = engine.merge_candidates(llm_candidates, 40);
 
         assert_eq!(merged.iter().filter(|c| c.as_str() == "てすと").count(), 1);
+    }
+
+    #[test]
+    fn split_word_learning_survives_sentence_and_block_commits() {
+        for block in [false, true] {
+            for forced in [false, true] {
+                let mut engine = RakunEngine::new(EngineConfig::default());
+                engine.set_dict_store(DictStore::load(None, None, None).unwrap());
+                let key = if block {
+                    "みぎはじ"
+                } else {
+                    "みぎはじはさすがにいちどでへんかんしてほしい"
+                };
+                let offered = if block {
+                    "右は字"
+                } else {
+                    "右は字はさすがに一度で変換してほしい"
+                };
+                engine.rescore_llm_candidates(key, vec![offered.into()]);
+                let reading = "みぎはじはさすがにいちどでへんかんしてほしい";
+                let accepted = "右端はさすがに一度で変換してほしい";
+                if forced {
+                    engine.learn_force(reading, accepted);
+                } else {
+                    engine.learn(reading, accepted);
+                }
+                let store = engine.dict_store.as_ref().unwrap();
+                assert!(store.lookup_learn("みぎはじ").contains(&"右端".to_string()));
+                let got = engine
+                    .rescore_llm_candidates("みぎはじによせる", vec!["右は字に寄せる".into()]);
+                assert_eq!(got[0], "右端に寄せる");
+                engine.learn("みぎはじによせる", "右は字に寄せる");
+                let got = engine
+                    .rescore_llm_candidates("みぎはじによせる", vec!["右は字に寄せる".into()]);
+                assert_eq!(got[0], "右は字に寄せる");
+            }
+        }
     }
 
     #[test]
