@@ -383,6 +383,65 @@ fn llm_head_not_in_dict(llm: &[String], dict: &[String], best_dict_cost: Option<
         .collect()
 }
 
+/// 「語＋助詞 1 文字」として組み立てる時の末尾の助詞。
+const PARTICLE_TAILS: &[char] = &[
+    'か', 'が', 'を', 'に', 'は', 'も', 'で', 'と', 'の', 'や', 'へ', 'よ', 'ね', 'な', 'わ',
+    'ぞ', 'さ', 'だ',
+];
+
+/// 語幹として使う辞書語の cost 上限（一般語に限る。`LLM_HEAD_WEAK_DICT_COST` と同じ線）。
+const PARTICLE_STEM_MAX_COST: u16 = LLM_HEAD_WEAK_DICT_COST;
+
+/// 「語＋助詞」で組み立てる候補の最大数。
+const PARTICLE_SPLIT_CANDIDATES: usize = 2;
+
+/// 読みを「語幹 + 助詞 1 文字」に割る。語幹は 2 文字以上。
+fn split_particle_tail(reading: &str) -> Option<(&str, char)> {
+    let tail = reading.chars().last()?;
+    if !PARTICLE_TAILS.contains(&tail) {
+        return None;
+    }
+    let stem = &reading[..reading.len() - tail.len_utf8()];
+    (stem.chars().count() >= 2).then_some((stem, tail))
+}
+
+/// 人名・地名しか辞書に無い読みで、「一般語＋助詞」を辞書から組み立てる。
+///
+/// 🔴 `あさか` の `朝か` は LLM が出すかどうかが文脈しだいで、出ない時は
+///    `insert_llm_front` では拾えない（2026-10-17 実機: LLM の n-best が
+///    `[朝香, 安積, 朝霞, 浅香, …]` で `朝か` が無かった）。語幹 `あさ` を辞書で
+///    引いて助詞を付ける。語幹の表記は学習履歴 → ユーザー辞書 → 一般語（cost が
+///    `PARTICLE_STEM_MAX_COST` 未満）の順で、ひらがなだけの表記は使わない
+///    （`なん`→`なんの` は読みそのもの）。`あさ` は `浅`(2615) と `朝`(2764) が
+///    並ぶので両方出し、選んだ方を学習履歴が先頭へ上げる。
+fn particle_split_candidates(
+    stem: &str,
+    tail: char,
+    learned: &[String],
+    user: &[String],
+    dict: &[(String, u16)],
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let surfaces = learned.iter().chain(user.iter()).chain(
+        dict.iter()
+            .filter(|(_, cost)| *cost < PARTICLE_STEM_MAX_COST)
+            .map(|(s, _)| s),
+    );
+    for s in surfaces {
+        if s == stem || s.chars().all(|c| ('\u{3041}'..='\u{309F}').contains(&c)) {
+            continue;
+        }
+        let cand = format!("{s}{tail}");
+        if !out.contains(&cand) {
+            out.push(cand);
+        }
+        if out.len() >= PARTICLE_SPLIT_CANDIDATES {
+            break;
+        }
+    }
+    out
+}
+
 /// `llm_head_not_in_dict` の候補を、辞書側の列 `dict`（low ユーザー辞書・「ん」補完・
 /// MOZC の順）へ差し込む。`fixed` は先頭の low ユーザー辞書＋「ん」補完の件数。
 ///
@@ -1972,7 +2031,27 @@ impl RakunEngine {
             .dict_store
             .as_ref()
             .and_then(|d| d.best_dict_cost(hiragana));
-        let llm_front = llm_head_not_in_dict(&llm_candidates, &dict_cands, best_dict_cost);
+        let mut llm_front = llm_head_not_in_dict(&llm_candidates, &dict_cands, best_dict_cost);
+        // 辞書が人名・地名だけの読みは「一般語＋助詞」も組み立てる（`あさか`→`朝か`）。
+        // 辞書が空（`None`）の読みでは差し込み先が先頭になるので作らない。
+        if best_dict_cost.is_some_and(|c| c >= LLM_HEAD_WEAK_DICT_COST)
+            && let Some((stem, tail)) = split_particle_tail(hiragana)
+            && let Some(d) = self.dict_store.as_ref()
+        {
+            let built = particle_split_candidates(
+                stem,
+                tail,
+                &d.lookup_learn(stem),
+                &d.lookup_user(stem),
+                &d.lookup_dict_with_cost(stem, 10),
+            );
+            debug!("engine::merge: particle split {stem:?}+{tail:?} -> {built:?}");
+            for c in built {
+                if !llm_front.contains(&c) {
+                    llm_front.push(c);
+                }
+            }
+        }
         let additional_dict: Vec<String> = user_low_cands.iter()
             .chain(n_fix_cands.iter())
             .chain(dict_cands.iter().filter(|c| c.as_str() != hiragana))
@@ -3346,6 +3425,28 @@ surfaces = ["杜野"]
         let additional = super::insert_llm_front(dict, front, 0, true);
         let merged = super::merge_candidate_lists(&[], &user, &additional, llm, 40);
         assert_eq!(&merged[..3], ["朝香", "朝か", "朝霞"]);
+    }
+
+    #[test]
+    fn particle_split_builds_common_word_plus_particle() {
+        assert_eq!(super::split_particle_tail("あさか"), Some(("あさ", 'か')));
+        assert_eq!(super::split_particle_tail("あか"), None); // 語幹 1 文字
+        assert_eq!(super::split_particle_tail("あさひ"), None); // 助詞でない
+        let dict = vec![
+            ("浅".to_string(), 2615),
+            ("朝".to_string(), 2764),
+            ("あさ".to_string(), 3528),
+        ];
+        assert_eq!(
+            super::particle_split_candidates("あさ", 'か', &[], &[], &dict),
+            ["浅か", "朝か"]
+        );
+        // 学習履歴が先、ひらがなだけの表記と cost の高い語は使わない
+        let dict = vec![("なん".to_string(), 0), ("南".to_string(), 6000)];
+        assert_eq!(
+            super::particle_split_candidates("なん", 'の', &strs(&["何"]), &[], &dict),
+            ["何の"]
+        );
     }
 
     #[test]
