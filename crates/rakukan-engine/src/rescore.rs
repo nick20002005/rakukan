@@ -210,6 +210,82 @@ pub fn surface_for_reading(reading: &str, surface: &str, key: &str) -> Option<St
     Some(chars[cuts[start]?..cuts[end]?].iter().collect())
 }
 
+/// 確定した文全体 `(reading, surface)` のうち、控え `(key, offered)` が当たる区間で
+/// 選び直された語を返す。
+///
+/// 控えは打鍵途中の読み（`…もと`）ごとにもあるので、区間の端で切れた run
+/// （`求める` の `求`）を語と取り違えやすい。語の境目は確定した文全体の割り戻しで
+/// 判定し、全体でも 1 つの run になっていて助詞で切れるものだけを返す。
+pub fn corrected_words_in(
+    reading: &str,
+    surface: &str,
+    key: &str,
+    offered: &str,
+) -> Vec<(String, String, String)> {
+    let start = if reading == key {
+        0
+    } else {
+        let mut matches = reading.match_indices(key);
+        let Some((byte, _)) = matches.next() else {
+            return Vec::new();
+        };
+        if matches.next().is_some() {
+            return Vec::new();
+        }
+        reading[..byte].chars().count()
+    };
+    let Some(accepted) = surface_for_reading(reading, surface, key) else {
+        return Vec::new();
+    };
+    let Some(full) = align(reading, surface) else {
+        return Vec::new();
+    };
+    // 全体の run を読みの区間で引けるようにする: (開始, 終了) → 添字
+    let mut spans: Vec<(usize, usize)> = Vec::with_capacity(full.len());
+    let mut pos = 0usize;
+    for run in &full {
+        let end = pos + run.reading.chars().count();
+        spans.push((pos, end));
+        pos = end;
+    }
+    let key_runs = align(key, &accepted);
+    corrected_words(key, offered, &accepted)
+        .into_iter()
+        .filter(|(r, w, from)| {
+            // 変換前のかなのまま控えられていた（打鍵に変換が追いついていない）なら、
+            // LLM が割ったのではない。
+            if from == r {
+                return false;
+            }
+            // 控えの区間内での位置を求め、全体の run と突き合わせる。
+            let Some(runs) = key_runs.as_ref() else {
+                return false;
+            };
+            let mut p = 0usize;
+            let mut local = None;
+            for run in runs {
+                let n = run.reading.chars().count();
+                if run.reading == *r && run.surface == *w {
+                    local = Some((p, p + n));
+                    break;
+                }
+                p += n;
+            }
+            let Some((ls, le)) = local else {
+                return false;
+            };
+            let Some(i) = spans
+                .iter()
+                .position(|&(s, e)| s == start + ls && e == start + le)
+            else {
+                return false;
+            };
+            full[i].surface == *w
+                && soft_boundary_ok(i.checked_sub(1).map(|j| &full[j]), full.get(i + 1))
+        })
+        .collect()
+}
+
 /// 確定側の漢字・カタカナ run を提示側と比較し、安全に切れる差分だけ返す。
 pub fn corrected_words(
     reading: &str,
@@ -222,6 +298,15 @@ pub fn corrected_words(
     };
     let cuts = reading_cut_points(&before, reading.chars().count());
     let original: Vec<char> = offered.chars().collect();
+    // 提示側の run の表層上の開始位置。区間の内側に run の切れ目がある＝LLM が割った。
+    let before_starts: Vec<usize> = before
+        .iter()
+        .scan(0usize, |p, run| {
+            let s = *p;
+            *p += run.surface.chars().count();
+            Some(s)
+        })
+        .collect();
     let mut pos = 0;
     let mut words = Vec::new();
     for (i, run) in after.iter().enumerate() {
@@ -239,7 +324,10 @@ pub fn corrected_words(
         {
             if let (Some(a), Some(b)) = (cuts[pos], cuts[end]) {
                 let from: String = original[a..b].iter().collect();
-                if from != run.surface {
+                // 1 つの run のままの同音語の選び直し（`方`→`肩`、`行動`→`公道`）は
+                // 文脈で選んだもので、`apply_learned_runs` の担当。ここでは覚えない。
+                let split_by_llm = before_starts.iter().any(|&p| a < p && p < b);
+                if split_by_llm && from != run.surface {
                     words.push((run.reading.clone(), run.surface.clone(), from));
                 }
             } else {
@@ -1362,6 +1450,32 @@ mod tests {
         assert!(corrected_words("みぎはじ", "右端", "右端").is_empty());
         // 活用語尾の前の語幹は覚えない（`そろ → 揃` を学習すると `ソロ` を塗る）
         assert!(corrected_words("そろえる", "ソロえる", "揃える").is_empty());
+    }
+
+    /// 打鍵途中の控え（読みの前半）と突き合わせても、語の切れ端を覚えない。
+    /// 2026-10-16 の実機で `もと→求`・`おも→思`・`せっしょ→セッショ` を覚えていた。
+    #[test]
+    fn split_word_uses_whole_sentence_boundaries() {
+        assert!(corrected_words_in("もとめる", "求める", "もと", "元").is_empty());
+        assert!(corrected_words_in("おもって", "思って", "おも", "おも").is_empty());
+        assert!(corrected_words_in("せっしょんを", "セッションを", "せっしょ", "せっしょ").is_empty());
+        let full = "みぎはじはさすがにいちどでへんかんしてほしい";
+        let accepted = "右端はさすがに一度で変換してほしい";
+        let want = vec![("みぎはじ".to_string(), "右端".to_string(), "右はじ".to_string())];
+        assert_eq!(corrected_words_in(full, accepted, "みぎはじ", "右はじ"), want);
+        assert_eq!(
+            corrected_words_in(full, accepted, full, "右は字はさすがに一度で変換してほしい"),
+            vec![("みぎはじ".to_string(), "右端".to_string(), "右は字".to_string())]
+        );
+        assert_eq!(
+            corrected_words_in(
+                "いったん、ちなみのかおをみぎはじによせてみる",
+                "いったん、千波の顔を右端に寄せてみる",
+                "みぎはじに",
+                "右は字に"
+            ),
+            vec![("みぎはじ".to_string(), "右端".to_string(), "右は字".to_string())]
+        );
         assert_eq!(unvoiced_readings("みぎはじ"), vec!["みきはじ", "みぎはし"]);
         assert!(unvoiced_readings("ばぱ").is_empty());
     }

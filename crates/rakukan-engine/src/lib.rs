@@ -2237,10 +2237,7 @@ impl RakunEngine {
         // 何度も取り出される。1 回の確定で学習回数を水増ししないよう 1 語 1 回にする。
         let mut learned: Vec<(String, String)> = Vec::new();
         for (key, offered) in offers.iter() {
-            let Some(accepted) = rescore::surface_for_reading(reading, surface, key) else {
-                continue;
-            };
-            for (r, word, from) in rescore::corrected_words(key, offered, &accepted) {
+            for (r, word, from) in rescore::corrected_words_in(reading, surface, key, offered) {
                 if learned.iter().any(|(lr, lw)| *lr == r && *lw == word) {
                     continue;
                 }
