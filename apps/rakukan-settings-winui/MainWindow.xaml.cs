@@ -111,6 +111,7 @@ public sealed partial class MainWindow : Window
                 {
                     Reading = entry.Reading,
                     Surfaces = new List<string>(entry.Surfaces),
+                    Priority = entry.Priority,
                 });
             }
         }
@@ -189,6 +190,7 @@ public sealed partial class MainWindow : Window
             {
                 Reading = e.Reading,
                 Surfaces = new List<string>(e.Surfaces),
+                Priority = e.Priority,
             })
             .ToList();
 

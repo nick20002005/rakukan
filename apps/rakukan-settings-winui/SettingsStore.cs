@@ -46,6 +46,10 @@ internal sealed class UserDictEntry : INotifyPropertyChanged
 
     public string SurfacesJoined => string.Join("、", Surfaces);
 
+    // user_dict.toml の priority（"low" など）。null は既定 = normal で、保存時に書き出さない。
+    // 画面では編集しないが、読み込んだ値は保存時にそのまま書き戻す。
+    public string? Priority { get; set; }
+
     public event PropertyChangedEventHandler? PropertyChanged;
 
     private void OnPropertyChanged([CallerMemberName] string? propertyName = null)
@@ -384,6 +388,7 @@ internal sealed class SettingsStore
             {
                 Reading = reading!.Trim(),
                 Surfaces = surfaces,
+                Priority = GetString(item, "priority"),
             });
         }
 
@@ -417,6 +422,11 @@ internal sealed class SettingsStore
                 }
             }
             table["surfaces"] = surfaces;
+            var priority = entry.Priority?.Trim();
+            if (!string.IsNullOrEmpty(priority) && !priority.Equals("normal", StringComparison.OrdinalIgnoreCase))
+            {
+                table["priority"] = priority;
+            }
             array.Add(table);
         }
 
