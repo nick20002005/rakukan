@@ -727,6 +727,61 @@ pub fn promote_learned_inflection(
     (out, Some(rewrite))
 }
 
+/// 文頭でかな書きに寄せる「で＋否定の条件形」。いずれも先頭の `で` を `出` と読める。
+const KANA_COPULA_HEADS: &[&str] = &["でなければ", "でなけりゃ", "でなきゃ", "でないと"];
+
+/// かな書きへ繰り上げを許す、第 1 候補との自信度の差の上限。
+///
+/// 実ログ（2026-10-21）で `でないとおそくなるのでここにした` は `出ないと…` と
+/// `でないと…` の差が 0.08、途中の `でないとおそくなる` で 0.21。単独の
+/// `でないと` を文脈から `出ないと` と読んだ時（本当に `出ないと` だった）は 1.28。
+const KANA_COPULA_MAX_CONFIDENCE_GAP: f32 = 0.4;
+
+/// 文頭の `でないと`（＝さもないと）が `出ないと` に化けるのを、かな書きへ寄せる。
+///
+/// LLM は文頭の `でないと…` を `出ないと…` と読みがちで、続きが自然に繋がると
+/// 自信度もほとんど差が付かない。読みの頭（区読点の直後＝ブロックの先頭）には
+/// `出る` の主語・目的語が来ていないので、接続詞の `でないと` のほうが多い。
+///
+/// 第 1 候補が `出ないと…` で、頭だけ `でないと` にした文が n-best にあり僅差なら
+/// 先頭へ繰り上げる。n-best に無ければ 2 番目に足す（preview は奪わない）。
+/// 文中（`いえをでないと`）は読みの頭ではないので対象外。
+pub fn prefer_kana_copula_head(
+    reading: &str,
+    candidates: Vec<String>,
+    confidence_gap: &dyn Fn(&str, &str) -> Option<f32>,
+) -> Vec<String> {
+    let Some(head) = KANA_COPULA_HEADS.iter().find(|h| reading.starts_with(**h)) else {
+        return candidates;
+    };
+    let Some(first) = candidates.first() else {
+        return candidates;
+    };
+    // `出` は `で` と同じ 1 文字なので、頭を差し替えても残りの位置はずれない。
+    let kanji_head = format!("出{}", &head['で'.len_utf8()..]);
+    let Some(rest) = first.strip_prefix(kanji_head.as_str()) else {
+        return candidates;
+    };
+    let kana = format!("{head}{rest}");
+    let mut out = candidates;
+    match out.iter().position(|c| *c == kana) {
+        Some(index) => {
+            if confidence_gap(&out[0], &kana).is_some_and(|g| g <= KANA_COPULA_MAX_CONFIDENCE_GAP) {
+                let promoted = out.remove(index);
+                tracing::info!(
+                    reading = %reading,
+                    promoted = %promoted,
+                    from_rank = index,
+                    "rescore: promoted kana copula head"
+                );
+                out.insert(0, promoted);
+            }
+        }
+        None => out.insert(1, kana),
+    }
+    out
+}
+
 /// 語幹の一族として数える、語幹の読みより後ろ（送り仮名・活用語尾）の最大文字数。
 /// `描く`=1、`描いた`=2、`描かない`=3、`描きました`=4。
 const STEM_MAX_TAIL_CHARS: usize = 4;
@@ -1840,6 +1895,38 @@ surfaces = ["海底", "ハイテイ"]
         let (got, rewrite) = promote_learned_inflection(&store, reading, cands.clone(), &close);
         assert_eq!(got, cands);
         assert!(rewrite.is_none());
+    }
+
+    #[test]
+    fn prefers_kana_copula_at_reading_head() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let reading = "でないとおそくなるのでここにした";
+        let cands = s(&["出ないと遅くなるのでここにした", "でないと遅くなるのでここにした"]);
+        let close = |_: &str, _: &str| Some(0.08f32);
+        let far = |_: &str, _: &str| Some(1.28f32);
+        assert_eq!(
+            prefer_kana_copula_head(reading, cands.clone(), &close),
+            s(&["でないと遅くなるのでここにした", "出ないと遅くなるのでここにした"])
+        );
+        // LLM が文脈ではっきり `出ないと` と読んだ時は触らない。
+        assert_eq!(prefer_kana_copula_head(reading, cands.clone(), &far), cands);
+        // n-best に無ければ 2 番目に足す。
+        assert_eq!(
+            prefer_kana_copula_head("でなければ", s(&["出なければ"]), &close),
+            s(&["出なければ", "でなければ"])
+        );
+        // 文中・空・既にかなは触らない。
+        let mid = s(&["家を出ないと"]);
+        assert_eq!(
+            prefer_kana_copula_head("いえをでないと", mid.clone(), &close),
+            mid
+        );
+        assert!(prefer_kana_copula_head(reading, vec![], &close).is_empty());
+        let kana = s(&["でないと、"]);
+        assert_eq!(
+            prefer_kana_copula_head("でないと、", kana.clone(), &close),
+            kana
+        );
     }
 
     #[test]
