@@ -782,6 +782,30 @@ pub fn prefer_kana_copula_head(
     out
 }
 
+/// 読みの頭の `どの`（連体詞）が `殿` に化けたのを、かな書きへ戻す。
+///
+/// LLM は `どのそしきに` を `殿組織に` と読むことがある（2026-10-21 実ログ）。
+/// 敬称の `殿` は人名の後ろにしか付かないので、読みの頭（ブロックの先頭）で
+/// `どの` と読む `殿` は誤り。先頭を `どの` にした候補を先頭に置き、元の候補は
+/// 2 番目に残す。`との`（`殿様`・`殿、…`）は正しいこともあるので対象外。
+pub fn prefer_kana_dono_head(reading: &str, candidates: Vec<String>) -> Vec<String> {
+    let Some(first) = candidates.first() else {
+        return candidates;
+    };
+    if !reading.starts_with("どの") {
+        return candidates;
+    }
+    let Some(rest) = first.strip_prefix('殿') else {
+        return candidates;
+    };
+    let kana = format!("どの{rest}");
+    tracing::info!(reading = %reading, from = %first, to = %kana, "rescore: kana dono head");
+    let mut out = candidates;
+    out.retain(|c| *c != kana);
+    out.insert(0, kana);
+    out
+}
+
 /// 語幹の一族として数える、語幹の読みより後ろ（送り仮名・活用語尾）の最大文字数。
 /// `描く`=1、`描いた`=2、`描かない`=3、`描きました`=4。
 const STEM_MAX_TAIL_CHARS: usize = 4;
@@ -1221,6 +1245,13 @@ fn reading_cut_points(runs: &[AlignedRun], reading_chars: usize) -> Vec<Option<u
     cuts
 }
 
+/// 表層の文字位置 `p` がカタカナ run の内側（両端を除く）にあるか。
+fn inside_katakana_run(runs: &[AlignedRun], run_starts: &[usize], p: usize) -> bool {
+    runs.iter().zip(run_starts).any(|(run, &start)| {
+        run.kind == RunKind::Katakana && start < p && p < start + run.surface.chars().count()
+    })
+}
+
 /// ユーザー辞書の登録語を、長文の候補の途中にも効かせる。
 ///
 /// `apply_learned_runs` は表層の run 1 つぶんしか見ないので、LLM が登録語を
@@ -1309,6 +1340,21 @@ fn apply_words(
         let (Some(s), Some(e)) = (cuts[start], cuts[end]) else {
             continue;
         };
+        // カタカナ run は 1 語なので途中では切らない。`との → 殿` を覚えていると、
+        // LLM が正しく出した `コンセントの` の `ト｜の` を差し替えて `コンセン殿` に
+        // していた（2026-10-21 実ログ。`トラックパッ殿`・`エージェン殿` も同じ）。
+        if [s, e].iter().any(|&p| inside_katakana_run(&runs, &run_starts, p)) {
+            continue;
+        }
+        // 学習語の区間の端がかなだと、助詞・送り仮名を巻き込んで隣の語を割る
+        // （`は｜飛` → `鳩`、`か｜食っ`）。LLM が割った語（`右｜は｜字`）は端が漢字。
+        if split
+            && [s, e - 1]
+                .iter()
+                .any(|&p| classify(surface_chars[p]) == RunKind::Hiragana)
+        {
+            continue;
+        }
         // 学習語は短い読みが多く、1 つの run に収まる区間（`入って` の `はい`）まで
         // 差し替えると学習済みの同音語で塗り替えてしまう（`牌って`）。run 1 つぶんは
         // `apply_learned_runs` の担当なので、ここでは LLM が区間を複数の run に
@@ -1464,6 +1510,48 @@ mod tests {
         let (got, rewrite) = apply_split_words(&store, "みぎはじによせる", vec![]);
         assert!(got.is_empty());
         assert!(rewrite.is_none());
+    }
+
+    #[test]
+    fn split_word_does_not_cut_inside_katakana_run() {
+        // 実ログ（2026-10-21）: `との → 殿` の学習で `コンセントの` が `コンセン殿` になった。
+        let (_dir, store) = store_with_user_entries("");
+        store.learn_force("との", "殿");
+        store.learn_force("どの", "殿");
+        for (reading, cand) in [
+            ("ますたーこんせんとのでんげん", "マスターコンセントの電源"),
+            ("とらっくぱっどのかんしょく", "トラックパッドの感触"),
+        ] {
+            let cands = vec![cand.to_string()];
+            let (got, rewrite) = apply_split_words(&store, reading, cands.clone());
+            assert_eq!(got, cands);
+            assert!(rewrite.is_none());
+        }
+        // 端がかなの区間（助詞を巻き込む）も差し替えない。
+        store.learn_force("はと", "鳩");
+        let cands = vec!["鳥は飛んだ".to_string()];
+        let (got, rewrite) = apply_split_words(&store, "とりはとんだ", cands.clone());
+        assert_eq!(got, cands);
+        assert!(rewrite.is_none());
+    }
+
+    #[test]
+    fn prefers_kana_dono_at_reading_head() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            prefer_kana_dono_head("どのそしきに", s(&["殿組織に", "どの組織に"])),
+            s(&["どの組織に", "殿組織に"])
+        );
+        assert_eq!(
+            prefer_kana_dono_head("どのそしき", s(&["殿組織"])),
+            s(&["どの組織", "殿組織"])
+        );
+        // `との`・文中・空は触らない。
+        let tono = s(&["殿様が"]);
+        assert_eq!(prefer_kana_dono_head("とのさまが", tono.clone()), tono);
+        let mid = s(&["田中殿に"]);
+        assert_eq!(prefer_kana_dono_head("たなかどのに", mid.clone()), mid);
+        assert!(prefer_kana_dono_head("どの", vec![]).is_empty());
     }
 
     #[test]

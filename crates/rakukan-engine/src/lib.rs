@@ -2358,6 +2358,7 @@ impl RakunEngine {
             candidates,
             &|top, other| rescore::noted_confidence_gap(reading, top, other),
         );
+        let candidates = rescore::prefer_kana_dono_head(reading, candidates);
         let (candidates, word_rewrite) = rescore::apply_user_words(store, reading, candidates);
         let (candidates, split_rewrite) = rescore::apply_split_words(store, reading, candidates);
         let (candidates, rewrite) = rescore::apply_learned_runs(store, reading, candidates);
