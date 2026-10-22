@@ -225,6 +225,30 @@ fn strip_echo_context<'a>(context: &'a str, reading: &str) -> std::borrow::Cow<'
     }
 }
 
+/// LLM に渡す context の上限文字数（末尾から数える）。
+///
+/// エンジンの committed は最大 200 文字を保持するが、句点の少ない台詞の断片が
+/// 200 文字近く積もると小型 LLM が変換をやめて「...」「*」「まーん」のような
+/// 記号・断片を出す（2026-10-22 実機。直近 120 文字以下なら同じ文脈でも正常）。
+const LLM_CONTEXT_MAX_CHARS: usize = 100;
+
+/// context から三点リーダーを除き、末尾 `LLM_CONTEXT_MAX_CHARS` 文字に詰める。
+///
+/// `⋯`（`SYMBOL_REPEAT_RULES` が「。。。」等から畳む記号）や `…` が文脈に
+/// 多数並ぶと、モデルが変換ではなく三点リーダーの続きを生成する。読みに対する
+/// 意味情報は持たないので、文脈からは落として構わない。
+fn trim_llm_context(context: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    let has_ellipsis = context.contains(['⋯', '…']);
+    let chars = context.chars().count();
+    if !has_ellipsis && chars <= LLM_CONTEXT_MAX_CHARS {
+        return Cow::Borrowed(context);
+    }
+    let cleaned: Vec<char> = context.chars().filter(|c| !matches!(c, '⋯' | '…')).collect();
+    let start = cleaned.len().saturating_sub(LLM_CONTEXT_MAX_CHARS);
+    Cow::Owned(cleaned[start..].iter().collect())
+}
+
 /// かなのみで読みの真のプレフィックス（読み全体は除く）になっている候補を検出する。
 ///
 /// 「きだじゅん」「キダジュン」のような途中で切れたエコー候補は、読み全体を
@@ -680,7 +704,8 @@ impl KanaKanjiConverter {
                 "echo source stripped from context"
             );
         }
-        let context = stripped.as_ref();
+        let trimmed = trim_llm_context(stripped.as_ref());
+        let context = trimmed.as_ref();
 
         // Convert hiragana to katakana (model expects katakana input)
         let katakana = hiragana_to_katakana(reading);
@@ -922,6 +947,21 @@ mod tests {
             reading_chars,
             false
         ));
+    }
+
+    #[test]
+    fn trim_llm_context_drops_ellipsis_and_keeps_tail() {
+        assert_eq!(trim_llm_context("甘奈っ⋯俺の⋯…だっ"), "甘奈っ俺のだっ");
+        let long: String = "あ".repeat(150) + "末尾";
+        let got = trim_llm_context(&long);
+        assert_eq!(got.chars().count(), LLM_CONTEXT_MAX_CHARS);
+        assert!(got.ends_with("末尾"));
+    }
+
+    #[test]
+    fn trim_llm_context_borrows_short_plain_context() {
+        let ctx = "週末は家族で海へ出かけた。";
+        assert!(matches!(trim_llm_context(ctx), std::borrow::Cow::Borrowed(_)));
     }
 
     #[test]
