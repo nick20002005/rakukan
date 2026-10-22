@@ -879,11 +879,76 @@ pub fn commit_catchup_bg_n_cands(reading: &str) -> Option<usize> {
     live_bg_start_n_cands(body)
 }
 
+/// 直近にライブ変換として起動を受け付けた読み（＝ bg が次に Done にするキー）。
+static LIVE_BG_LAST_KEY: Mutex<Option<String>> = Mutex::new(None);
+
+/// 打鍵に追い越された BG 変換結果 `(session_nonce, 変換した読み, 第 1 候補)`。
+///
+/// 長い読みは変換 1 回に 250ms ほどかかり、結果が返る頃には読みが先へ進んでいる。
+/// 完全一致の結果しか preview に出さないと、打ち続けている間は一度も置き換わらない
+/// （2026-10-07 実測: 2 秒間に 7 回変換して 7 回とも捨てていた）。次の `bg_start` が
+/// Done を回収して捨てる前にここへ控え、次の打鍵で「変換済みの前半 + かなの後半」と
+/// して出す（`take_live_partial`）。
+static LIVE_PARTIAL: Mutex<Option<(u64, String, String)>> = Mutex::new(None);
+
+/// `key` の変換結果 `top` を、先へ進んだ読み `reading` の前半として出してよいか。
+fn live_partial_applies(key: &str, top: &str, reading: &str) -> bool {
+    !key.is_empty()
+        && key != reading
+        && reading.starts_with(key)
+        && !top.is_empty()
+        && top != key
+}
+
+/// bg が Done で持っている結果が今の読みの前半に当たるなら控える。
+fn capture_live_partial(engine: &DynEngine, reading: &str) {
+    let Some(key) = LIVE_BG_LAST_KEY.lock().ok().and_then(|k| k.clone()) else {
+        return;
+    };
+    if key == reading || !reading.starts_with(&key) || engine.bg_status() != "done" {
+        return;
+    }
+    let Some(top) = engine.bg_peek_top_candidate(&key) else {
+        return;
+    };
+    if live_partial_applies(&key, &top, reading)
+        && let Ok(mut slot) = LIVE_PARTIAL.lock()
+    {
+        *slot = Some((crate::tsf::live_session::session_nonce_snapshot(), key, top));
+    }
+}
+
+/// 控えてある結果が今の読みの前半に当たるなら `(変換した読み, 表示ベース)` を返す。
+/// 表示ベースは「変換済みの前半 + かなのままの後半」。
+pub fn take_live_partial(engine: &DynEngine, reading: &str) -> Option<(String, String)> {
+    capture_live_partial(engine, reading);
+    let (nonce, key, top) = LIVE_PARTIAL.lock().ok()?.take()?;
+    if nonce != crate::tsf::live_session::session_nonce_snapshot()
+        || !live_partial_applies(&key, &top, reading)
+    {
+        return None;
+    }
+    let base = format!("{top}{}", &reading[key.len()..]);
+    Some((key, base))
+}
+
 pub fn start_live_bg_if_ready(engine: &DynEngine, reading: &str) -> bool {
     let Some(n) = live_bg_start_n_cands(reading) else {
         return false;
     };
+    // `bg_start` は先頭で古い Done を回収して捨てる。その前に控える。
+    capture_live_partial(engine, reading);
     if engine.bg_start(n) {
+        if let Ok(mut key) = LIVE_BG_LAST_KEY.lock() {
+            *key = Some(reading.to_string());
+        }
+        return true;
+    }
+    // 前の読みを変換している最中は起動できないが、呼び出し側にはライブタイマーを
+    // 張らせる。LiveConv 中の打鍵は先にタイマーを止めるので、ここで false を返すと
+    // 変換が終わっても誰も拾わず、打鍵を止めても preview が古いまま残る
+    // （2026-10-07 のログで 1 日 20 回）。
+    if engine.bg_status() == "running" {
         return true;
     }
     engine
@@ -3322,6 +3387,20 @@ pub fn ime_app_session_deactivate() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 追い越された変換結果は、今の読みの前半に当たるときだけ使う。
+    #[test]
+    fn live_partial_applies_only_to_proper_prefix() {
+        assert!(live_partial_applies("もっとおきかえ", "もっと置き換え", "もっとおきかえていい"));
+        // 完全一致は通常の preview 経路の担当
+        assert!(!live_partial_applies("もっと", "もっと", "もっと"));
+        // Backspace で読みが縮んだ・別の読みになった
+        assert!(!live_partial_applies("もっとおきかえ", "もっと置き換え", "もっとおき"));
+        assert!(!live_partial_applies("きょうは", "今日は", "あしたは"));
+        // 変換しても読みのまま・結果なし
+        assert!(!live_partial_applies("もっと", "もっと", "もっとおき"));
+        assert!(!live_partial_applies("もっと", "", "もっとおき"));
+    }
 
     /// `ime_on_apps` の適用は「アプリ本体以外の入力先に初めて入ったとき 1 回だけ」
     /// （Issue #51）。2 回目以降は操作した状態を維持するので適用しない。

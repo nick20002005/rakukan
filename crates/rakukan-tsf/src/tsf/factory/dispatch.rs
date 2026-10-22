@@ -246,6 +246,56 @@ impl super::TextServiceFactory_Impl {
                 }
             }
         }
+        // ── 打鍵に追い越された BG 変換結果の採用 ─────────────────────────────
+        // 今の読みの前半に当たる結果が控えてあれば、「変換済みの前半 + かなの後半」を
+        // LiveConv として出す。続く Input は LiveConv の継続表示に乗る。
+        // 打鍵以外（Enter など）では採らない: 確定は表示済みテキストのみ (WYSIWYG)。
+        if matches!(action, UserAction::Input(_) | UserAction::InputRaw(_))
+            && crate::engine::state::caret_tail_is_empty()
+            && let Some(engine) = guard.as_mut()
+        {
+            let reading = engine.hiragana_text().to_string();
+            // 今出ている preview より先まで変換できているときだけ差し替える。
+            let wanted = match session_get() {
+                Ok(sess) => match &*sess {
+                    SessionState::Idle | SessionState::Preedit { .. } => Some(0),
+                    SessionState::LiveConv {
+                        reading: shown_reading,
+                        preview,
+                        preview_for,
+                    } if *shown_reading == reading => {
+                        Some(if preview == shown_reading { 0 } else { preview_for.len() })
+                    }
+                    _ => None,
+                },
+                Err(_) => None,
+            };
+            if let Some(covered) = wanted
+                && !reading.is_empty()
+                && let Some((key, base)) = crate::engine::state::take_live_partial(engine, &reading)
+                && key.len() > covered
+            {
+                let preedit_full = engine.preedit_display();
+                let pending = text_util::suffix_after_prefix_or_empty(
+                    &preedit_full,
+                    &reading,
+                    "live partial pending",
+                )
+                .to_string();
+                tracing::info!(
+                    "[Live] partial: applying base={:?} for={:?} reading={:?}",
+                    base,
+                    key,
+                    reading
+                );
+                if let Ok(mut sess) = session_get() {
+                    sess.set_live_conv(reading, base.clone(), key);
+                }
+                drop(guard);
+                update_composition(ctx.clone(), tid, sink.clone(), format!("{base}{pending}"))?;
+                guard = engine_try_get_or_create()?;
+            }
+        }
         // guard 再取得後に engine を更新（Phase 1B で再取得した場合に対応）
         let engine = match guard.as_mut() {
             Some(e) => e,
