@@ -17,7 +17,7 @@ use crate::{EngineConfig, RakunEngine};
 use std::ffi::{CStr, CString, c_char, c_void};
 use std::sync::OnceLock;
 
-pub const ENGINE_ABI_VERSION: u32 = 12;
+pub const ENGINE_ABI_VERSION: u32 = 13;
 
 static LOG_INIT: OnceLock<()> = OnceLock::new();
 
@@ -808,6 +808,21 @@ pub extern "C" fn engine_dict_lookup(
     let reading = unsafe { from_cstr(reading) };
     let cands = engine.dict_lookup(reading, limit as usize);
     let json = serde_json::to_string(&cands).unwrap_or_else(|_| "[]".into());
+    unsafe { to_cstr(json) }
+}
+
+/// `engine_forget(reading, s)` で消せる表記 `s` を JSON 配列で返す。
+/// 候補ウィンドウの印に使う。`engine_free_string` で解放すること。
+#[unsafe(no_mangle)]
+pub extern "C" fn engine_forgettable_surfaces(
+    handle: *mut c_void,
+    reading: *const c_char,
+) -> *mut c_char {
+    let engine = unsafe { &mut *(handle as *mut RakunEngine) };
+    inject_pending_dict(engine);
+    let reading = unsafe { from_cstr(reading) };
+    let surfaces = engine.forgettable_surfaces(reading);
+    let json = serde_json::to_string(&surfaces).unwrap_or_else(|_| "[]".into());
     unsafe { to_cstr(json) }
 }
 

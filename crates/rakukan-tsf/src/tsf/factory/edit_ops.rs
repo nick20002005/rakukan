@@ -626,6 +626,12 @@ impl super::TextServiceFactory_Impl {
             text,
             removed
         );
+        // 学習履歴に無い候補（辞書・LLM 由来）は消せない。一覧から外すと消えたように
+        // 見えて次の変換でまた出てくるので、何もしない（消せる候補には行末に印がある）。
+        if !removed {
+            return Ok(true);
+        }
+        candidate_window::forget_mark_removed(&text);
         sess.remove_current_candidate();
 
         let page_cands = sess.page_candidates();

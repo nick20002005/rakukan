@@ -555,6 +555,14 @@ impl RpcEngine {
         .unwrap_or_default()
     }
 
+    /// `forget(reading, s)` で消せる表記 `s` の一覧（候補ウィンドウの印用）。失敗時は空。
+    pub fn forgettable_surfaces(&self, reading: &str) -> Vec<String> {
+        self.call_strings(Request::ForgettableSurfaces {
+            reading: reading.into(),
+        })
+        .unwrap_or_default()
+    }
+
     /// 学習履歴から候補を削除する。`reading` に前方一致するキーも対象。
     pub fn forget(&self, reading: &str, surface: &str) -> bool {
         self.call_bool(Request::Forget {

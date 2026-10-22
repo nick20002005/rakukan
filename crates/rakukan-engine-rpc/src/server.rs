@@ -265,6 +265,7 @@ pub(crate) fn request_label(req: &Request) -> &'static str {
         Forget { .. } => "Forget",
         Predict { .. } => "Predict",
         DictLookup { .. } => "DictLookup",
+        ForgettableSurfaces { .. } => "ForgettableSurfaces",
     }
 }
 
@@ -564,6 +565,9 @@ fn dispatch_engine(eng: &mut DynEngine, req: Request) -> Response {
         Predict { reading, limit } => Response::Strings(eng.predict(&reading, limit as usize)),
         DictLookup { reading, limit } => {
             Response::Strings(eng.dict_lookup(&reading, limit as usize))
+        }
+        ForgettableSurfaces { reading } => {
+            Response::Strings(eng.forgettable_surfaces(&reading))
         }
         MergeCandidatesForReading {
             reading,

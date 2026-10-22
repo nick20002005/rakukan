@@ -1776,6 +1776,15 @@ impl RakunEngine {
         }
     }
 
+    /// `forget(reading, s)` で消せる表記の一覧（候補ウィンドウの印用）。
+    /// `predict` と違って「直近に提示した予測」を書き換えないので、何度呼んでもよい。
+    pub fn forgettable_surfaces(&self, reading: &str) -> Vec<String> {
+        self.dict_store
+            .as_ref()
+            .map(|d| d.learn_surfaces_with_prefix(reading))
+            .unwrap_or_default()
+    }
+
     pub fn is_dict_ready(&self) -> bool {
         self.dict_store.is_some()
     }

@@ -20,7 +20,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use libloading::{Library, Symbol};
 
-const EXPECTED_ENGINE_ABI_VERSION: u32 = 12;
+const EXPECTED_ENGINE_ABI_VERSION: u32 = 13;
 
 // ─── Segments モデル（CONVERTER_REDESIGN Phase A） ────────────────────────────
 
@@ -151,6 +151,7 @@ struct EngineVTable {
     forget: unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char) -> bool,
     predict: unsafe extern "C" fn(*mut c_void, *const c_char, u32) -> *mut c_char,
     dict_lookup: unsafe extern "C" fn(*mut c_void, *const c_char, u32) -> *mut c_char,
+    forgettable_surfaces: unsafe extern "C" fn(*mut c_void, *const c_char) -> *mut c_char,
 
     // 診断
     last_error: unsafe extern "C" fn() -> *mut c_char,
@@ -241,6 +242,7 @@ impl EngineVTable {
             forget: load_sym!(lib, b"engine_forget\0"),
             predict: load_sym!(lib, b"engine_predict\0"),
             dict_lookup: load_sym!(lib, b"engine_dict_lookup\0"),
+            forgettable_surfaces: load_sym!(lib, b"engine_forgettable_surfaces\0"),
             last_error: load_sym!(lib, b"engine_last_error\0"),
             dict_status: load_sym!(lib, b"engine_dict_status\0"),
             build_info: load_sym_opt!(lib, b"engine_build_info\0"),
@@ -669,6 +671,18 @@ impl DynEngine {
         let creading = Self::to_cstring(reading);
         unsafe {
             let ptr = (self.vtable.dict_lookup)(self.handle, creading.as_ptr(), limit as u32);
+            match self.take_cstr(ptr) {
+                Some(s) => serde_json::from_str(&s).unwrap_or_default(),
+                None => vec![],
+            }
+        }
+    }
+
+    /// `forget(reading, s)` で消せる表記 `s` の一覧（候補ウィンドウの印用）。
+    pub fn forgettable_surfaces(&self, reading: &str) -> Vec<String> {
+        let creading = Self::to_cstring(reading);
+        unsafe {
+            let ptr = (self.vtable.forgettable_surfaces)(self.handle, creading.as_ptr());
             match self.take_cstr(ptr) {
                 Some(s) => serde_json::from_str(&s).unwrap_or_default(),
                 None => vec![],

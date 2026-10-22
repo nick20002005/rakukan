@@ -809,7 +809,11 @@ impl ITfKeyEventSink_Impl for TextServiceFactory_Impl {
             }
         }
 
-        match self.handle_action(action.clone(), ctx, tid, sink) {
+        let result = self.handle_action(action.clone(), ctx, tid, sink);
+        // 候補リストの「Ctrl+Delete で消せる」印を今の読みに合わせる
+        // （handle_action がエンジン・セッションのロックを手放した後に呼ぶ）。
+        crate::tsf::candidate_window::refresh_forget_marks();
+        match result {
             Ok(ate) => {
                 diag::event(DiagEvent::KeyHandled {
                     vk,

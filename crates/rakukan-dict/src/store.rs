@@ -668,6 +668,32 @@ impl DictStore {
         out
     }
 
+    /// `forget_matching(reading_prefix, s)` で 1 件以上消せる表記 `s` の一覧。
+    ///
+    /// 候補ウィンドウで「Ctrl+Delete で消せる候補」に印を付けるために使う。
+    /// 判定を `forget_matching` と同じ前方一致に揃えてあるので、印が付いた候補は
+    /// 必ず消せ、付いていない候補（辞書・LLM 由来）は消せない。
+    pub fn learn_surfaces_with_prefix(&self, reading_prefix: &str) -> Vec<String> {
+        if reading_prefix.is_empty() {
+            return vec![];
+        }
+        let Ok(hist) = self.inner.learn_history.read() else {
+            return vec![];
+        };
+        let mut out: Vec<String> = Vec::new();
+        for (reading, entries) in hist.iter() {
+            if !reading.starts_with(reading_prefix) {
+                continue;
+            }
+            for e in entries {
+                if !out.contains(&e.surface) {
+                    out.push(e.surface.clone());
+                }
+            }
+        }
+        out
+    }
+
     /// `reading_prefix` に前方一致する読み（完全一致を含む）に紐づく `surface` の
     /// 学習エントリをまとめて削除する。戻り値は削除件数。
     ///
@@ -2169,6 +2195,30 @@ priority = "low"
         // 該当なしは 0 件
         assert_eq!(store.forget_matching("かんたん", "存在しない"), 0);
         assert_eq!(store.forget_matching("", "簡単"), 0);
+    }
+
+    #[test]
+    fn test_learn_surfaces_with_prefix_matches_forget_matching() {
+        let store = make_store(&[
+            ("かんたん", vec!["簡単"]),
+            ("かんたんなことばでぶんせき", vec!["簡単な言葉で分析"]),
+            ("かん", vec!["缶"]),
+        ]);
+        store.learn("かんたん", "簡単");
+        store.learn("かんたんなことばでぶんせき", "簡単な言葉で分析");
+        store.learn("かん", "缶");
+
+        // 完全一致と、より長いキー（予測）の両方。短いキー「かん」は含まない
+        let mut got = store.learn_surfaces_with_prefix("かんたん");
+        got.sort();
+        assert_eq!(got, vec!["簡単", "簡単な言葉で分析"]);
+        assert!(store.learn_surfaces_with_prefix("").is_empty());
+
+        // 印が付いた候補は必ず消せる
+        for s in &got {
+            assert!(store.forget_matching("かんたん", s) > 0);
+        }
+        assert!(store.learn_surfaces_with_prefix("かんたん").is_empty());
     }
 
     #[test]

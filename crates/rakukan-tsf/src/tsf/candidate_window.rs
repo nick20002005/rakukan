@@ -150,6 +150,11 @@ const COLOR_SEL_FG: COLORREF = COLORREF(0x00_FF_FF_FF);
 const COLOR_BG: COLORREF = COLORREF(0x00_FF_FF_FF);
 /// 通常行のテキスト色（黒）
 const COLOR_FG: COLORREF = COLORREF(0x00_00_00_00);
+/// Ctrl+Delete で消せる候補（学習履歴にある表記）の行末に付ける印。
+const FORGET_MARK: &str = "×";
+/// 印の色（通常行: 薄いグレー / 選択行: 背景の青に沈まない淡い青）
+const COLOR_MARK: COLORREF = COLORREF(0x00_A0_A0_A0);
+const COLOR_MARK_SEL: COLORREF = COLORREF(0x00_F0_C8_B0); // #B0C8F0 → BGR
 
 /// 候補ウィンドウをキャレットのどちら側に出すか。
 ///
@@ -203,6 +208,11 @@ thread_local! {
     // 瞬間に現在の (dm_ptr, hwnd) を知るために使う。focus 処理の完了時に更新される。
     static TL_CURRENT_DM: Cell<usize> = const { Cell::new(0) };
     static TL_CURRENT_HWND: Cell<usize> = const { Cell::new(0) };
+
+    /// Ctrl+Delete で消せる表記 `(問い合わせた読み, 表記)`。
+    /// `refresh_forget_marks` が読みの変わった時だけエンジンに問い合わせて更新する。
+    static TL_FORGETTABLE: RefCell<(String, Vec<String>)> =
+        const { RefCell::new((String::new(), Vec::new())) };
 }
 
 /// 現在フォーカス中の DocumentManager ポインタと root HWND を返す。
@@ -321,6 +331,8 @@ unsafe extern "system" fn wnd_proc(
         WM_TIMER => {
             if wparam.0 == WAITING_TIMER_ID {
                 crate::tsf::candidate_window::on_waiting_timer();
+                // Space 後の待機から候補表に入った時も印を付ける
+                refresh_forget_marks();
             }
             // [Live] ライブ変換タイマー
             if wparam.0 == LIVE_TIMER_ID {
@@ -359,6 +371,7 @@ unsafe fn compute_needed_width(
     candidates: &[String],
     status_line: Option<&str>,
     page_info: &str,
+    numbered: bool,
 ) -> i32 {
     // measuring DC
     let screen_dc = GetDC(HWND::default());
@@ -408,11 +421,18 @@ unsafe fn compute_needed_width(
         }
     };
 
+    // 番号付きリスト（Ctrl+Delete が効く）では行末の印の分を常に空けておく。
+    // 印の有無は表示の後に分かるので、印が付いた瞬間に幅が変わらないようにする。
+    let mark_w = if numbered {
+        measure(&format!("  {FORGET_MARK}"))
+    } else {
+        0
+    };
     let mut max_text = 0i32;
     for (i, cand) in candidates.iter().enumerate() {
         // draw 側と同じ "{n} {cand}" 形式で測る
         let text = format!("{} {}", i + 1, cand);
-        max_text = max_text.max(measure(&text));
+        max_text = max_text.max(measure(&text) + mark_w);
     }
     if let Some(s) = status_line {
         max_text = max_text.max(measure(s));
@@ -487,6 +507,7 @@ unsafe fn draw(hdc: HDC) {
     if data.candidates.is_empty() {
         return;
     }
+    let forgettable = TL_FORGETTABLE.with(|f| f.borrow().1.clone());
     let n = data.candidates.len();
     let has_pager = !data.page_info.is_empty();
     let has_status = data.status_line.is_some();
@@ -578,6 +599,20 @@ unsafe fn draw(hdc: HDC) {
             y + (lay.item_height - lay.font_height) / 2,
             &text_w,
         );
+
+        // 行末の印（Ctrl+Delete で学習履歴から消せる候補）
+        if data.numbered && forgettable.iter().any(|s| s == cand) {
+            let mark_w: Vec<u16> = FORGET_MARK.encode_utf16().collect();
+            let mut size = SIZE { cx: 0, cy: 0 };
+            let _ = GetTextExtentPoint32W(hdc, &mark_w, &mut size);
+            SetTextColor(hdc, if is_sel { COLOR_MARK_SEL } else { COLOR_MARK });
+            let _ = TextOutW(
+                hdc,
+                win_width - lay.padding_x - size.cx,
+                y + (lay.item_height - lay.font_height) / 2,
+                &mark_w,
+            );
+        }
     }
 
     // ページインジケーター行（複数ページがある場合のみ）
@@ -831,7 +866,8 @@ fn show_inner(
 
     // 最長候補 / status 行に合わせてウィンドウ幅を動的に算出する。
     // GDI で実測するので Meiryo UI の実字幅で正確。
-    let win_width = unsafe { compute_needed_width(&lay, page_candidates, status_line, page_info) };
+    let win_width =
+        unsafe { compute_needed_width(&lay, page_candidates, status_line, page_info, numbered) };
     let win_width = unsafe { clamp_width_to_work_area(x, y, win_width) };
     TL_WIN_WIDTH.with(|c| c.set(win_width));
 
@@ -993,6 +1029,63 @@ pub fn reposition(x: i32, y: i32) {
             SWP_NOACTIVATE,
         );
     }
+}
+
+/// 候補リストの「Ctrl+Delete で消せる」印を今の読みに合わせる。
+///
+/// キー処理と待機タイマーの後に呼ぶ（どちらもエンジン・セッションのロックを
+/// 手放した後）。問い合わせは読みが変わった時だけ。BlockSelecting は
+/// Ctrl+Delete の対象外なので印も出さない。
+pub fn refresh_forget_marks() {
+    use crate::engine::state::{engine_try_get, session_get};
+
+    let reading = match session_get() {
+        Ok(sess) if sess.is_selecting() => sess
+            .original_preedit()
+            .filter(|r| !r.is_empty())
+            .map(str::to_string),
+        _ => None,
+    };
+    let Some(reading) = reading else {
+        TL_FORGETTABLE.with(|f| {
+            let mut f = f.borrow_mut();
+            f.0.clear();
+            f.1.clear();
+        });
+        return;
+    };
+    if TL_FORGETTABLE.with(|f| f.borrow().0 == reading) {
+        return;
+    }
+    // ロックが取れなければ控えを更新しない＝次のキーでもう一度問い合わせる
+    let surfaces = {
+        let Ok(guard) = engine_try_get() else {
+            return;
+        };
+        let Some(engine) = guard.as_ref() else {
+            return;
+        };
+        engine.forgettable_surfaces(&reading)
+    };
+    let changed = TL_FORGETTABLE.with(|f| {
+        let mut f = f.borrow_mut();
+        let changed = f.1 != surfaces;
+        *f = (reading, surfaces);
+        changed
+    });
+    if changed {
+        let hwnd = get_hwnd();
+        if is_valid(hwnd) {
+            unsafe {
+                let _ = InvalidateRect(hwnd, None, BOOL(0));
+            }
+        }
+    }
+}
+
+/// Ctrl+Delete で消した表記を印の控えから外す（エンジンは前方一致で全部消している）。
+pub fn forget_mark_removed(surface: &str) {
+    TL_FORGETTABLE.with(|f| f.borrow_mut().1.retain(|s| s != surface));
 }
 
 /// 選択インデックスとページ情報だけ更新して再描画する（位置は変えない）。
