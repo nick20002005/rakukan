@@ -383,6 +383,23 @@ fn llm_head_not_in_dict(llm: &[String], dict: &[String], best_dict_cost: Option<
         .collect()
 }
 
+/// LLM 未着の辞書だけの候補列で、読みそのものを先頭へ移す。
+///
+/// 🔴 ライブ変換は LLM の結果が届く前に `merge_candidates_for_reading(reading, vec![], 40)`
+///    の先頭を preview にする（`on_live_timer: immediate dict preview while bg=running`）。
+///    打鍵途中の読み（`なるほ` ← `なるほど`）は辞書に珍しい人名（`成保` cost 7128）しか
+///    無いことが多く、それが preview に出たまま `ど、` と打ち進めると、確定時は画面どおり
+///    `成保ど、` が入り学習まで焼き付く（2026-10-22〜23 に 3 回。Ctrl+Delete で消しても
+///    preview から作り直されるので「消しても復活する」）。LLM の結果が届けば通常の並びに
+///    戻るので、ここでは読みを先頭にして待たせるだけ。辞書候補は後ろに残す。
+fn weak_dict_only_reading_first(merged: &mut Vec<String>, reading: &str) {
+    if merged.first().is_some_and(|c| c == reading) {
+        return;
+    }
+    merged.retain(|c| c != reading);
+    merged.insert(0, reading.to_string());
+}
+
 /// 「語＋助詞 1 文字」として組み立てる時の末尾の助詞。
 const PARTICLE_TAILS: &[char] = &[
     'か', 'が', 'を', 'に', 'は', 'も', 'で', 'と', 'の', 'や', 'へ', 'よ', 'ね', 'な', 'わ',
@@ -1908,6 +1925,7 @@ impl RakunEngine {
         // LLM は末尾だが、辞書候補が上限まで埋めても LLM の枠は確保する（#42 の 4）。
         // 長文は辞書が完全一致で引けず LLM の区切りだけで決まるので、
         // 先に n-best の並びを辞書との整合で見直す（集合は変えない）。
+        let llm_was_empty = llm_candidates.is_empty();
         let llm_candidates = self.rescore_llm_candidates(hiragana, llm_candidates);
         let llm_head: Vec<String> = llm_candidates
             .iter()
@@ -2249,6 +2267,18 @@ impl RakunEngine {
                 }
                 merged.push(c);
             }
+        }
+
+        // 9. 辞書だけの問い合わせ（LLM 未着）で、辞書が人名・地名しか持たない読みは
+        //    読みそのものを先頭にする（`weak_dict_only_reading_first` 参照）。
+        let only_weak_dict = llm_was_empty
+            && user_cands.is_empty()
+            && user_low_cands.is_empty()
+            && learn_cands.is_empty()
+            && n_fix_cands.is_empty()
+            && best_dict_cost.is_some_and(|c| c >= LLM_HEAD_WEAK_DICT_COST);
+        if only_weak_dict {
+            weak_dict_only_reading_first(&mut merged, hiragana);
         }
 
         if merged.is_empty() {
@@ -3415,6 +3445,18 @@ surfaces = ["杜野"]
         let dict = strs(&["書き", "描き", "下記"]);
         let llm = strs(&["書き", "描き", "下記", "か気"]);
         assert!(super::llm_head_not_in_dict(&llm, &dict, Some(5047)).is_empty());
+    }
+
+    #[test]
+    fn weak_dict_only_puts_reading_first() {
+        // なるほ: 辞書は人名 `成保` だけ。読みを先頭へ、辞書候補は残す
+        let mut merged = strs(&["成保", "なるほど、", "なるほ", "ナルホ"]);
+        super::weak_dict_only_reading_first(&mut merged, "なるほ");
+        assert_eq!(merged, ["なるほ", "成保", "なるほど、", "ナルホ"]);
+        // 既に先頭なら動かさない
+        let mut merged = strs(&["なるほ", "成保"]);
+        super::weak_dict_only_reading_first(&mut merged, "なるほ");
+        assert_eq!(merged, ["なるほ", "成保"]);
     }
 
     #[test]
