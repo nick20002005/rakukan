@@ -2398,12 +2398,19 @@ impl RakunEngine {
             &|top, other| rescore::noted_confidence_gap(reading, top, other),
         );
         let candidates = rescore::prefer_kana_dono_head(reading, candidates);
+        let (candidates, kana_rewrite) = rescore::prefer_learned_kana(
+            store,
+            reading,
+            candidates,
+            &|top, other| rescore::noted_confidence_gap(reading, top, other),
+        );
         let (candidates, word_rewrite) = rescore::apply_user_words(store, reading, candidates);
         let (candidates, split_rewrite) = rescore::apply_split_words(store, reading, candidates);
         let (candidates, rewrite) = rescore::apply_learned_runs(store, reading, candidates);
         let rewrite = rewrite
             .or(split_rewrite)
             .or(word_rewrite)
+            .or(kana_rewrite)
             .or(inflection_rewrite);
         // 先頭を他の学習で既に動かしたなら、語幹違いは 2 番目に出すだけにする。
         let (candidates, stem_offers, stem_rewrite) = rescore::offer_learned_stems(
@@ -2453,6 +2460,14 @@ impl RakunEngine {
                     r, word, from
                 );
                 store.learn_force(&r, &word);
+            }
+            for word in rescore::corrected_kana_words_in(reading, surface, key, offered) {
+                if learned.iter().any(|(lr, lw)| *lr == word && *lw == word) {
+                    continue;
+                }
+                learned.push((word.clone(), word.clone()));
+                info!("learn: kana word learned reading={} from={}", word, offered);
+                store.learn_force(&word, &word);
             }
         }
         offers.clear();

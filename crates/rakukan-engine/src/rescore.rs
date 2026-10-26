@@ -64,6 +64,9 @@ fn classify(c: char) -> RunKind {
         c if c.is_ascii_alphanumeric() => RunKind::Literal,
         'Ａ'..='Ｚ' | 'ａ'..='ｚ' | '０'..='９' => RunKind::Literal,
         c if c.is_ascii_punctuation() || c.is_ascii_whitespace() => RunKind::Literal,
+        // 全角の句読点も読みにそのまま現れる。漢字扱いにすると `、後` が 1 つの漢字 run に
+        // なり、読点の直後の語（`あと、後で`）を語として扱えない。
+        '、' | '。' | '！' | '？' => RunKind::Literal,
         _ => RunKind::Kanji,
     }
 }
@@ -806,6 +809,211 @@ pub fn prefer_kana_dono_head(reading: &str, candidates: Vec<String>) -> Vec<Stri
     out
 }
 
+/// かな書きで覚える語（`いったん`・`あと`）の読みの文字数。
+const KANA_WORD_MIN_READING_CHARS: usize = 2;
+const KANA_WORD_MAX_READING_CHARS: usize = 6;
+
+/// 漢字 run の途中までをかな書きにした候補（`一旦君` → `いったん君`）を n-best から
+/// 繰り上げるときの、平均 log-prob の差の上限。
+const KANA_WORD_MAX_CONFIDENCE_GAP: f32 = 0.4;
+
+/// その読みで一番前に居る学習表記が、かな書き（読みそのもの）か。
+fn prefers_kana(store: &DictStore, key: &str) -> bool {
+    store.lookup_learn(key).first().is_some_and(|s| s == key)
+}
+
+/// 候補の読み区間 `[s, e)` の表層が、読みそのもの（かな書き）か。
+fn kana_at(reading: &[char], cand: &str, s: usize, e: usize) -> bool {
+    let Some(runs) = align(&reading.iter().collect::<String>(), cand) else {
+        return false;
+    };
+    let cuts = reading_cut_points(&runs, reading.len());
+    let (Some(x), Some(y)) = (cuts[s], cuts[e]) else {
+        return false;
+    };
+    cand.chars().skip(x).take(y - x).eq(reading[s..e].iter().copied())
+}
+
+/// 提示した第 1 候補で漢字だった語を、確定した表記でかな書きに直したもの
+/// （`一旦` → `いったん`、`一旦君` → `いったん君`）の読みを返す。
+///
+/// 選び直した語の学習（`corrected_words`）は漢字・カタカナの語だけを対象にしていて、
+/// かな書きへの選び直しは文全体の学習にしか残らなかった。文全体の学習は読みの完全一致
+/// でしか効かないので、`いったん` を何度かなで確定しても、次の文ではまた `一旦` に戻る
+/// （2026-10-27 本人申告「いったん・あとがよく漢字にされる」）。
+///
+/// 確定した表記で、その語より後ろに漢字かカタカナが無いものは覚えない。打鍵に変換が
+/// 追いつかないまま Enter した文は末尾が生のかなで確定されるので、それをかな書きの
+/// 選び直しと取り違えないため。
+pub fn corrected_kana_words(reading: &str, offered: &str, accepted: &str) -> Vec<String> {
+    let (Some(before), Some(after)) = (align(reading, offered), align(reading, accepted)) else {
+        return Vec::new();
+    };
+    let r: Vec<char> = reading.chars().collect();
+    let accepted_chars: Vec<char> = accepted.chars().collect();
+    // 確定側の run の (読み開始, 読み終了, 表層開始)
+    let mut spans: Vec<(usize, usize, usize)> = Vec::with_capacity(after.len());
+    let (mut rp, mut sp) = (0usize, 0usize);
+    for run in &after {
+        let rn = run.reading.chars().count();
+        spans.push((rp, rp + rn, sp));
+        rp += rn;
+        sp += run.surface.chars().count();
+    }
+    let mut words: Vec<String> = Vec::new();
+    let mut a = 0usize;
+    for run in &before {
+        let b = a + run.reading.chars().count();
+        let start = a;
+        a = b;
+        if run.kind != RunKind::Kanji || !run.surface.chars().all(is_kanji) {
+            continue;
+        }
+        let Some(i) = spans.iter().position(|&(s, e, _)| s <= start && start < e) else {
+            continue;
+        };
+        if after[i].kind != RunKind::Hiragana {
+            continue;
+        }
+        let (s, e, surface_start) = spans[i];
+        let end = if e >= b {
+            b
+        } else if after
+            .get(i + 1)
+            .is_some_and(|n| n.kind == RunKind::Kanji && n.surface.chars().all(is_kanji))
+        {
+            // 漢字 run の頭だけをかなにした（`いったん君`）。
+            e
+        } else {
+            continue;
+        };
+        if !(KANA_WORD_MIN_READING_CHARS..=KANA_WORD_MAX_READING_CHARS).contains(&(end - start)) {
+            continue;
+        }
+        let tail: String = accepted_chars[surface_start + (end - s)..].iter().collect();
+        if !has_kanji_or_katakana(&tail) {
+            continue;
+        }
+        let word: String = r[start..end].iter().collect();
+        if !words.contains(&word) {
+            words.push(word);
+        }
+    }
+    words
+}
+
+/// `corrected_kana_words` を、確定した文全体のうち控え `(key, offered)` の区間で行う。
+pub fn corrected_kana_words_in(
+    reading: &str,
+    surface: &str,
+    key: &str,
+    offered: &str,
+) -> Vec<String> {
+    let Some(accepted) = surface_for_reading(reading, surface, key) else {
+        return Vec::new();
+    };
+    corrected_kana_words(key, offered, &accepted)
+}
+
+/// かな書きで覚えた語（`いったん`・`あと`）を、文中でもかな書きにする。
+///
+/// 第 1 候補の漢字 run の読みの頭が、学習でかな書きが一番前に居る読みなら:
+///
+/// - その区間がかな書きの候補が n-best にあれば繰り上げる。漢字 run の途中まで
+///   （`一旦君` の `いったん`）の時は、自信度の差が小さい時だけ。
+/// - 漢字 run 全体がその語（`後` = `あと`）なら、かなへ置き換えた候補を作って先頭に置く。
+///
+/// 元の第 1 候補は 2 番目に残る。置き換えた候補を断って元の候補を確定したら
+/// （`LearnedRewrite`）、その読みに漢字を学習し、次からは置き換えない。
+pub fn prefer_learned_kana(
+    store: &DictStore,
+    reading: &str,
+    candidates: Vec<String>,
+    confidence_gap: &dyn Fn(&str, &str) -> Option<f32>,
+) -> (Vec<String>, Option<LearnedRewrite>) {
+    let Some(first) = candidates.first().cloned() else {
+        return (candidates, None);
+    };
+    let Some(runs) = align(reading, &first) else {
+        return (candidates, None);
+    };
+    let r: Vec<char> = reading.chars().collect();
+    let first_chars: Vec<char> = first.chars().collect();
+    // 第 1 候補の表層への置き換え: (表層開始, 表層終了, 置き換え後)
+    let mut edits: Vec<(usize, usize, String)> = Vec::new();
+    let mut declined: Vec<(String, String)> = Vec::new();
+    let (mut a, mut x0) = (0usize, 0usize);
+    for run in &runs {
+        let b = a + run.reading.chars().count();
+        let x1 = x0 + run.surface.chars().count();
+        let (start, sx) = (a, x0);
+        a = b;
+        x0 = x1;
+        if run.kind != RunKind::Kanji || !run.surface.chars().all(is_kanji) {
+            continue;
+        }
+        let longest = (start + KANA_WORD_MAX_READING_CHARS).min(b);
+        let Some(end) = (start + KANA_WORD_MIN_READING_CHARS..=longest)
+            .rev()
+            .find(|&end| prefers_kana(store, &r[start..end].iter().collect::<String>()))
+        else {
+            continue;
+        };
+        if end == b {
+            // 漢字 run 全体がその語（`後` = `あと`）。その場でかなへ置き換える。
+            edits.push((sx, x1, r[start..end].iter().collect()));
+            declined.push((r[start..end].iter().collect(), run.surface.clone()));
+            continue;
+        }
+        // 漢字 run の途中まで（`一旦君` の `いったん`）。区切りが分からないので、その run
+        // だけが違う候補を n-best から探す。文の別の箇所まで違う候補（`タスケテ` →
+        // `助け手`）は採らない。
+        for cand in candidates.iter().skip(1) {
+            if !kana_at(&r, cand, start, end) {
+                continue;
+            }
+            let Some(cuts) = align(reading, cand).map(|rs| reading_cut_points(&rs, r.len())) else {
+                continue;
+            };
+            let (Some(cx0), Some(cx1)) = (cuts[start], cuts[b]) else {
+                continue;
+            };
+            let cand_chars: Vec<char> = cand.chars().collect();
+            if cand_chars[..cx0] != first_chars[..sx] || cand_chars[cx1..] != first_chars[x1..] {
+                continue;
+            }
+            if confidence_gap(&first, cand).is_some_and(|g| g <= KANA_WORD_MAX_CONFIDENCE_GAP) {
+                edits.push((sx, x1, cand_chars[cx0..cx1].iter().collect()));
+            }
+            break;
+        }
+    }
+    if edits.is_empty() {
+        return (candidates, None);
+    }
+    let mut base = String::new();
+    let mut pos = 0usize;
+    for (sx, ex, text) in &edits {
+        base.extend(&first_chars[pos..*sx]);
+        base.push_str(text);
+        pos = *ex;
+    }
+    base.extend(&first_chars[pos..]);
+    tracing::info!(reading = %reading, from = %first, to = %base, "rescore: preferred learned kana");
+    let mut out: Vec<String> = Vec::with_capacity(candidates.len() + 1);
+    out.push(base);
+    for c in candidates {
+        if !out.contains(&c) {
+            out.push(c);
+        }
+    }
+    let rewrite = (!declined.is_empty()).then_some(LearnedRewrite {
+        original: first,
+        runs: declined,
+    });
+    (out, rewrite)
+}
+
 /// 語幹の一族として数える、語幹の読みより後ろ（送り仮名・活用語尾）の最大文字数。
 /// `描く`=1、`描いた`=2、`描かない`=3、`描きました`=4。
 const STEM_MAX_TAIL_CHARS: usize = 4;
@@ -1510,6 +1718,82 @@ mod tests {
         let (got, rewrite) = apply_split_words(&store, "みぎはじによせる", vec![]);
         assert!(got.is_empty());
         assert!(rewrite.is_none());
+    }
+
+    #[test]
+    fn learns_kana_rewrite_of_kanji_word() {
+        // 実ログ（2026-10-26）: `一旦君に任せ…` を `いったん君に任せ…` へ選び直した。
+        assert_eq!(
+            corrected_kana_words(
+                "いったんきみにまかせちゃっていいんだろうか",
+                "一旦君に任せちゃっていいんだろうか",
+                "いったん君に任せちゃっていいんだろうか",
+            ),
+            vec!["いったん".to_string()]
+        );
+        assert_eq!(
+            corrected_kana_words("そのあとしゅうせいする", "その後修正する", "そのあと修正する"),
+            vec!["あと".to_string()]
+        );
+        // 後ろが生のかなのまま確定した文（変換が追いついていない）は覚えない。
+        assert!(corrected_kana_words("あとですこし", "後で少し", "あとですこし").is_empty());
+        // 漢字のままなら何も覚えない。
+        assert!(corrected_kana_words("あとですこし", "後で少し", "後で少し").is_empty());
+    }
+
+    #[test]
+    fn prefers_learned_kana_inside_sentence() {
+        let (_dir, store) = store_with_user_entries("");
+        store.learn_force("あと", "あと");
+        store.learn_force("いったん", "いったん");
+        let no_gap = |_: &str, _: &str| None;
+        // 漢字 run 全体なら n-best に無くても作る。断られたら漢字を学習して止まる。
+        let original = "あと、後で総集編を出す".to_string();
+        let (got, rewrite) = prefer_learned_kana(
+            &store,
+            "あと、あとでそうしゅうへんをだす",
+            vec![original.clone()],
+            &no_gap,
+        );
+        assert_eq!(got, vec!["あと、あとで総集編を出す".to_string(), original.clone()]);
+        let rewrite = rewrite.unwrap();
+        assert_eq!(rewrite.runs, vec![("あと".to_string(), "後".to_string())]);
+        // 漢字 run の途中まで（`一旦君`）は n-best から、僅差の時だけ繰り上げる。
+        let cands = vec![
+            "一旦君に任せる".to_string(),
+            "いったん君に任せる".to_string(),
+        ];
+        let small_gap = |_: &str, _: &str| Some(0.01);
+        let (got, _) =
+            prefer_learned_kana(&store, "いったんきみにまかせる", cands.clone(), &small_gap);
+        assert_eq!(got[0], "いったん君に任せる");
+        let (got, _) = prefer_learned_kana(&store, "いったんきみにまかせる", cands.clone(), &no_gap);
+        assert_eq!(got, cands);
+        // 文の別の箇所まで違う候補は採らない（実ログ: `タスケテ` → `助け手` になった）。
+        let cands = vec![
+            "タスケテを一旦作り".to_string(),
+            "助け手をいったん作り".to_string(),
+        ];
+        let (got, _) =
+            prefer_learned_kana(&store, "たすけてをいったんつくり", cands.clone(), &small_gap);
+        assert_eq!(got, cands);
+        // かな書きを学習していない読み（`あとち`→`跡地`）は触らない。`あと` の頭一致でも
+        // n-best にかな版が無ければ作らない（漢字 run の途中では切らない）。
+        let cands = vec!["跡地に建てる".to_string()];
+        let (got, rewrite) = prefer_learned_kana(&store, "あとちにたてる", cands.clone(), &small_gap);
+        assert_eq!(got, cands);
+        assert!(rewrite.is_none());
+        // 漢字を一番前に学習している読みは触らない。
+        store.forget("あと", "あと");
+        let (got, _) = prefer_learned_kana(
+            &store,
+            "あと、あとでそうしゅうへんをだす",
+            vec![original.clone()],
+            &no_gap,
+        );
+        assert_eq!(got, vec![original]);
+        let (got, rewrite) = prefer_learned_kana(&store, "あと", vec![], &no_gap);
+        assert!(got.is_empty() && rewrite.is_none());
     }
 
     #[test]
