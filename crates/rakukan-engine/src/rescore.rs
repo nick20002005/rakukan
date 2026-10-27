@@ -601,7 +601,7 @@ pub fn noted_confidence_gap(reading: &str, top: &str, other: &str) -> Option<f32
     Some(of(top)? - of(other)?)
 }
 
-fn is_kanji(c: char) -> bool {
+pub(crate) fn is_kanji(c: char) -> bool {
     matches!(c, '一'..='鿿' | '㐀'..='䶿' | '々')
 }
 

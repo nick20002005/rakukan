@@ -333,6 +333,15 @@ const PREDICTION_MIN_READING_COVERAGE: f64 = 1.0 / 3.0;
 /// 満たす予測が下位にあれば拾えるようにする。
 const PREDICTION_OVERFETCH: usize = 4;
 
+/// 予測（予測ウィンドウ・変換リストへの短文予測）に出さない表記か。
+///
+/// 漢字 1 文字は Space 変換で普通に出るうえ、予測に並ぶと長いフレーズの枠を
+/// 食うだけなので外す（2026-10-27 ユーザー指摘）。
+fn is_unwanted_prediction(surface: &str) -> bool {
+    let mut chars = surface.chars();
+    matches!((chars.next(), chars.next()), (Some(c), None) if rescore::is_kanji(c))
+}
+
 /// MOZC か LLM がひらがな表記をこの順位以内に返したら、ひらがなを 2 番目に置く。
 /// `から` `ので` のような助詞・機能語は無変換が本命なのに、文字種候補として
 /// 末尾（数ページ先）へ回されていた。
@@ -1765,7 +1774,13 @@ impl RakunEngine {
         let keyed = self
             .dict_store
             .as_ref()
-            .map(|d| d.lookup_learn_suggest_keyed(reading, limit))
+            .map(|d| {
+                d.lookup_learn_suggest_keyed(reading, limit * PREDICTION_OVERFETCH)
+                    .into_iter()
+                    .filter(|(_, s)| !is_unwanted_prediction(s))
+                    .take(limit)
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default();
         // 予測ウィンドウから確定した場合も学習キーを振り直せるよう覚えておく
         // （読みと同じキーのものは振り直す必要が無いので記録しない）。
@@ -2017,6 +2032,7 @@ impl RakunEngine {
                         self.config.prediction_max_candidates * PREDICTION_OVERFETCH,
                     )
                     .into_iter()
+                    .filter(|(_, s)| !is_unwanted_prediction(s))
                     .filter(|(key, _)| {
                         let key_chars = key.chars().count();
                         key_chars > 0
@@ -3839,6 +3855,39 @@ priority = "low"
                 .map(String::as_str),
             Some("また通常"),
             "ライブ変換の preview が予測を拾ってはいけない: {merged:?}"
+        );
+    }
+
+    #[test]
+    fn single_kanji_is_not_predicted() {
+        let dir = tempfile::tempdir().unwrap();
+        let user_path = dir.path().join("user_dict.toml");
+        fs::write(&user_path, "").unwrap();
+        let store = DictStore::load(Some(&user_path), None, None).unwrap();
+
+        let mut engine = RakunEngine::new(EngineConfig::default());
+        engine.set_dict_store(store);
+        engine.learn_force("かん", "感");
+        engine.learn_force("かんむり", "冠");
+        engine.learn_force("かんたんなことば", "簡単な言葉");
+        engine.learn_force("かんじ", "感じ");
+
+        let predicted = engine.predict("かん", 4);
+        assert!(
+            !predicted.iter().any(|c| c == "感" || c == "冠"),
+            "漢字 1 文字は予測ウィンドウに出さない: {predicted:?}"
+        );
+        assert!(predicted.contains(&"簡単な言葉".to_string()));
+        assert!(predicted.contains(&"感じ".to_string()));
+
+        let merged = engine.merge_candidates_for_reading(
+            "かんむ",
+            vec!["かんむ".to_string(), "缶む".to_string()],
+            40,
+        );
+        assert!(
+            !merged.iter().any(|c| c == "冠"),
+            "漢字 1 文字は短文予測として変換リストにも差し込まない: {merged:?}"
         );
     }
 
