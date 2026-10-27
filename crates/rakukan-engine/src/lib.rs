@@ -1519,13 +1519,17 @@ impl RakunEngine {
         let Some(store) = self.dict_store.as_ref() else {
             return vec![];
         };
+        // システム辞書は読みそのもの（`こん` → `こん`）を先頭に、しかも複数返すことが
+        // あり、それは下で捨てる。`limit` 件だけ引くと、`limit = 1` の境界探索で `こん`・
+        // `てん` のような普通の語が「辞書に無い」扱いになり Shift+← で飛ばされる。
+        const DICT_LOOKUP_SLACK: usize = 8;
         let mut out: Vec<String> = Vec::new();
         for c in store
             .lookup_user(reading)
             .into_iter()
             .chain(store.lookup_learn(reading))
             .chain(store.lookup_user_low(reading))
-            .chain(store.lookup_dict(reading, limit))
+            .chain(store.lookup_dict(reading, limit.saturating_add(DICT_LOOKUP_SLACK)))
         {
             if c.is_empty() || c == reading || out.contains(&c) {
                 continue;
