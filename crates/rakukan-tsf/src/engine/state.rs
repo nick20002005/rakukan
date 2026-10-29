@@ -900,6 +900,45 @@ fn live_partial_applies(key: &str, top: &str, reading: &str) -> bool {
         && top != key
 }
 
+/// 変換結果 `top` の末尾がカタカナ語の途中で切れているか。
+///
+/// 読みの途中で区切った変換は、カタカナ語を切った形（`ぱーふぇく → パーフェク`）や
+/// 語にならない断片のカタカナ化（`こんい → コンイ`）を返す。これに後半のかなを
+/// 足すと `パーフェクと` のように末尾だけひらがなに見える（2026-10-29）。
+/// 末尾のカタカナ run が辞書に載った語として閉じているときだけ切れていないとみなす。
+/// `rest` は後半のかな、`is_word(読み, 表記)` は辞書にその語があるか。
+fn katakana_tail_is_cut(
+    key: &str,
+    top: &str,
+    rest: &str,
+    is_word: impl FnOnce(&str, &str) -> bool,
+) -> bool {
+    let is_kata = |c: char| ('\u{30A1}'..='\u{30F6}').contains(&c) || c == 'ー';
+    let run_start = top
+        .char_indices()
+        .rev()
+        .take_while(|&(_, c)| is_kata(c))
+        .last()
+        .map(|(i, _)| i);
+    let Some(run_start) = run_start else {
+        return false;
+    };
+    let run = &top[run_start..];
+    if run.chars().all(|c| c == 'ー') {
+        return false;
+    }
+    // 長音・小書きかなで始まる後半は前の語の続き
+    if rest
+        .chars()
+        .next()
+        .is_some_and(|c| c == 'ー' || "ぁぃぅぇぉゃゅょゎっ".contains(c))
+    {
+        return true;
+    }
+    let run_reading = super::text_util::to_hiragana(run);
+    !key.ends_with(&run_reading) || !is_word(&run_reading, run)
+}
+
 /// bg が Done で持っている結果が今の読みの前半に当たるなら控える。
 fn capture_live_partial(engine: &DynEngine, reading: &str) {
     let Some(key) = LIVE_BG_LAST_KEY.lock().ok().and_then(|k| k.clone()) else {
@@ -928,7 +967,14 @@ pub fn take_live_partial(engine: &DynEngine, reading: &str) -> Option<(String, S
     {
         return None;
     }
-    let base = format!("{top}{}", &reading[key.len()..]);
+    let rest = &reading[key.len()..];
+    if katakana_tail_is_cut(&key, &top, rest, |r, w| {
+        engine.dict_lookup(r, 50).iter().any(|c| c == w)
+    }) {
+        tracing::debug!("[Live] partial: skip cut katakana top={top:?} for={key:?}");
+        return None;
+    }
+    let base = format!("{top}{rest}");
     Some((key, base))
 }
 
@@ -3400,6 +3446,24 @@ mod tests {
         // 変換しても読みのまま・結果なし
         assert!(!live_partial_applies("もっと", "もっと", "もっとおき"));
         assert!(!live_partial_applies("もっと", "", "もっとおき"));
+    }
+
+    /// カタカナ語の途中で切れた変換結果は前半として使わない。
+    #[test]
+    fn katakana_tail_cut_detection() {
+        let dict = |r: &str, w: &str| {
+            matches!((r, w), ("かたかな", "カタカナ") | ("せりふ", "セリフ"))
+        };
+        // 辞書に無いカタカナ断片
+        assert!(katakana_tail_is_cut("ぱーふぇく", "パーフェク", "と", dict));
+        assert!(katakana_tail_is_cut("こんい", "コンイ", "ろ", dict));
+        assert!(katakana_tail_is_cut("ふくすうにんがこうた", "複数人がコウタ", "い", dict));
+        // 長音・小書きかなが続く
+        assert!(katakana_tail_is_cut("かたかな", "カタカナ", "ー", dict));
+        // 辞書に載った語で閉じている・末尾がカタカナでない
+        assert!(!katakana_tail_is_cut("かたかな", "カタカナ", "の", dict));
+        assert!(!katakana_tail_is_cut("りつこがかいせつするせりふ", "リツコが解説するセリフ", "が", dict));
+        assert!(!katakana_tail_is_cut("もっとおきかえ", "もっと置き換え", "て", dict));
     }
 
     /// `ime_on_apps` の適用は「アプリ本体以外の入力先に初めて入ったとき 1 回だけ」
