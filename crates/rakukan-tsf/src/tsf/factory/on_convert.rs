@@ -2304,7 +2304,48 @@ impl super::TextServiceFactory_Impl {
 /// 存在しない」ときだけ。通常はここに入らず即座に確定する。
 #[cfg(test)]
 mod tests {
-    use super::{is_weak_merge, live_preview_confirmed_head};
+    use super::{is_weak_merge, live_preview_confirmed_head, stable_confirmed_head};
+
+    #[test]
+    fn stable_head_drops_word_cut_at_conversion_boundary() {
+        // 2026-10-27〜11-03 のログで「keep displayed」された実例。
+        // 右は追いつき変換の結果で、どれも stable head から始まっていれば採られる。
+        let cases = [
+            ("型の金属が光る間", "型の金属が光る前に、"),
+            ("このグラフの型", "このグラフの形、"),
+            ("例えば、スカートを持ちあ", "例えば、スカートを持ち上げて"),
+            ("セーラー服の上着がダボッとゆる", "セーラー服の上着がダボッと緩んでいて、"),
+            ("遅ら", "おそらくだけど、"),
+            ("ミルティナは無視", "ミルティナはむしろ、"),
+            ("寧ろ", "むしろ、"),
+            ("コッチ", "こっちも、"),
+            ("中谷育に関し", "中谷育にかんして、"),
+            ("関係の活動に関する制限が他にある可能性型", "関係の活動に関する制限が他にある可能性が高い"),
+            ("後は、この襟に乗ってるハイライト？みたいな惹か", "後は、この襟に乗ってるハイライト？みたいな光かな"),
+            ("重い", "思い？"),
+            ("は、自分で深くやっていた部", "は、自分で深くやっていた分、"),
+        ];
+        for (confirmed, merged) in cases {
+            assert!(
+                merged.starts_with(stable_confirmed_head(confirmed)),
+                "{confirmed} → {:?} / {merged}",
+                stable_confirmed_head(confirmed)
+            );
+        }
+    }
+
+    #[test]
+    fn stable_head_keeps_kanji_before_long_kana_tail() {
+        // 2026-09-09: 画面の `が変換でき` を追いつき側の `返還` で書き換えない。
+        assert_eq!(stable_confirmed_head("が変換でき"), "が変換");
+        assert!(!"が返還できなかった".starts_with(stable_confirmed_head("が変換でき")));
+    }
+
+    #[test]
+    fn stable_head_of_single_run_is_empty() {
+        assert_eq!(stable_confirmed_head("変換"), "");
+        assert_eq!(stable_confirmed_head(""), "");
+    }
 
     fn v(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
@@ -2456,7 +2497,7 @@ fn catch_up_live_preview(
             if merged != preview {
                 if let Some(confirmed) =
                     live_preview_confirmed_head(reading, &preview, converted_len)
-                    && !merged.starts_with(confirmed)
+                    && !merged.starts_with(stable_confirmed_head(confirmed))
                 {
                     tracing::info!(
                         "[Live] commit catch-up: keep displayed {:?} (catch-up said {:?}, confirmed={:?})",
@@ -2464,7 +2505,8 @@ fn catch_up_live_preview(
                         merged,
                         confirmed
                     );
-                    return (preview, false);
+                    // 古い変換＋生かなの継ぎ足しなので学習には流さない（未収束扱い）。
+                    return (preview, true);
                 }
                 tracing::info!("[Live] commit catch-up: {:?} → {:?}", preview, merged);
             }
@@ -2504,5 +2546,62 @@ fn live_preview_confirmed_head<'a>(
         None
     } else {
         Some(confirmed)
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HeadRunKind {
+    Hiragana,
+    Katakana,
+    Kanji,
+    Other,
+}
+
+fn head_run_kind(c: char) -> HeadRunKind {
+    match c {
+        'ぁ'..='ゖ' | 'ゝ' | 'ゞ' => HeadRunKind::Hiragana,
+        'ァ'..='ヶ' | 'ヽ' | 'ヾ' | 'ー' => HeadRunKind::Katakana,
+        '々' | '〆' | '\u{3400}'..='\u{4DBF}' | '\u{4E00}'..='\u{9FFF}' | '\u{F900}'..='\u{FAFF}' => {
+            HeadRunKind::Kanji
+        }
+        _ => HeadRunKind::Other,
+    }
+}
+
+/// 確定済みの頭から「変換の切れ目にかかっていた末尾の語」を外した部分を返す。
+///
+/// 🔴 確定済みの頭の末尾は、BG 変換が打鍵に追い越された時点の読みの切れ目で
+///    切られている。打鍵が速いと `まえ` の `ま` までで `間` を得て、その後ろに
+///    `えに、` を生かなで継ぎ足した preview が出る。末尾の語まで守ると
+///    `型の金属が光る間えに、` のように語の途中で割れた形が確定してしまう
+///    （2026-10-27〜11-03 のログで 1 日 20〜30 件。追いつき側はほぼ全件正しかった）。
+///
+/// 外すのは末尾の文字種の run 1 つ。それが 1 文字のひらがななら送り仮名の
+/// 途中とみなし、直前の run も外す（`寧ろ`・`遅ら`・`関し`）。2 文字以上の
+/// ひらがなで終わる頭（`が変換でき`）は漢字部分を守る（2026-09-09 の
+/// `変換` → `返還` を防ぐため）。
+fn stable_confirmed_head(confirmed: &str) -> &str {
+    fn strip_last_run(s: &str) -> (&str, Option<HeadRunKind>, usize) {
+        let mut chars = s.char_indices().rev();
+        let Some((_, last)) = chars.next() else {
+            return (s, None, 0);
+        };
+        let kind = head_run_kind(last);
+        let mut cut = s.len() - last.len_utf8();
+        let mut n = 1;
+        for (i, c) in chars {
+            if head_run_kind(c) != kind {
+                break;
+            }
+            cut = i;
+            n += 1;
+        }
+        (&s[..cut], Some(kind), n)
+    }
+    let (rest, kind, n) = strip_last_run(confirmed);
+    if kind == Some(HeadRunKind::Hiragana) && n == 1 {
+        strip_last_run(rest).0
+    } else {
+        rest
     }
 }
