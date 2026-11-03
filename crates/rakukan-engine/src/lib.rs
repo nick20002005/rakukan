@@ -409,6 +409,23 @@ fn weak_dict_only_reading_first(merged: &mut Vec<String>, reading: &str) {
     merged.insert(0, reading.to_string());
 }
 
+/// LLM の第 1 候補が読みそのもので、辞書の第 1 候補（読み以外）を LLM の上位に
+/// 含めていないか。
+///
+/// 🔴 `いいよ` の辞書は `言い寄`(cost 11514)・`言寄`・`いいよ` しか無く、LLM が
+///    `いいよ` を自信度ほぼ満点（avg_logprob -0.007）で返しても、辞書が LLM より前に
+///    並ぶので preview・確定が `言い寄` になった（2026-11-04）。`もふく`→`喪服` の
+///    ように LLM も辞書の語を上位に挙げている読みは対象外（辞書の語を残す）。
+fn llm_rejects_weak_dict_word(llm_head: &[String], dict: &[String], reading: &str) -> bool {
+    if llm_head.first().is_none_or(|c| c != reading) {
+        return false;
+    }
+    match dict.iter().find(|c| c.as_str() != reading) {
+        Some(top) => !llm_head.contains(top),
+        None => false,
+    }
+}
+
 /// 「語＋助詞 1 文字」として組み立てる時の末尾の助詞。
 const PARTICLE_TAILS: &[char] = &[
     'か', 'が', 'を', 'に', 'は', 'も', 'で', 'と', 'の', 'や', 'へ', 'よ', 'ね', 'な', 'わ',
@@ -2291,13 +2308,17 @@ impl RakunEngine {
 
         // 9. 辞書だけの問い合わせ（LLM 未着）で、辞書が人名・地名しか持たない読みは
         //    読みそのものを先頭にする（`weak_dict_only_reading_first` 参照）。
-        let only_weak_dict = llm_was_empty
-            && user_cands.is_empty()
+        //    LLM が届いていても、LLM の第 1 候補が読みそのもので辞書の語を退けている
+        //    なら同じ扱いにする（`llm_rejects_weak_dict_word` 参照）。
+        let no_explicit = user_cands.is_empty()
             && user_low_cands.is_empty()
             && learn_cands.is_empty()
-            && n_fix_cands.is_empty()
-            && best_dict_cost.is_some_and(|c| c >= LLM_HEAD_WEAK_DICT_COST);
-        if only_weak_dict {
+            && n_fix_cands.is_empty();
+        let weak_dict = best_dict_cost.is_some_and(|c| c >= LLM_HEAD_WEAK_DICT_COST);
+        let reading_first = no_explicit
+            && weak_dict
+            && (llm_was_empty || llm_rejects_weak_dict_word(&llm_head, &dict_cands, hiragana));
+        if reading_first {
             weak_dict_only_reading_first(&mut merged, hiragana);
         }
 
@@ -3492,6 +3513,21 @@ surfaces = ["杜野"]
         let mut merged = strs(&["なるほ", "成保"]);
         super::weak_dict_only_reading_first(&mut merged, "なるほ");
         assert_eq!(merged, ["なるほ", "成保"]);
+    }
+
+    #[test]
+    fn llm_reading_top_rejects_weak_dict_word() {
+        // いいよ: LLM はかなを第 1 に挙げ、辞書の `言い寄` を上位に入れていない
+        let dict = strs(&["言い寄", "言寄", "いいよ"]);
+        let llm = strs(&["いいよ", "いいよ〜", "イイよ"]);
+        assert!(super::llm_rejects_weak_dict_word(&llm, &dict, "いいよ"));
+        // LLM も辞書の語を上位に挙げていれば辞書の語を残す
+        let dict = strs(&["喪服", "茂福"]);
+        let llm = strs(&["もふく", "喪服", "も服"]);
+        assert!(!super::llm_rejects_weak_dict_word(&llm, &dict, "もふく"));
+        // LLM の第 1 候補が読みでなければ対象外
+        let llm = strs(&["朝か", "朝霞"]);
+        assert!(!super::llm_rejects_weak_dict_word(&llm, &strs(&["朝霞"]), "あさか"));
     }
 
     #[test]
