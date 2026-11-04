@@ -250,7 +250,8 @@ impl super::TextServiceFactory_Impl {
                 let punct = sess.take_punct_pending();
                 let remainder = sess.take_selecting_remainder();
                 let candidate_source = sess.current_candidate_view().map(|v| v.source);
-                let explicit_pick = sess.selecting_selected_index() > 0;
+                let explicit_pick = sess.selecting_selected_index() > 0
+                    || crate::engine::state::take_candidate_forgot(&reading);
                 sess.set_idle();
                 drop(sess);
                 candidate_window::hide();
@@ -451,7 +452,8 @@ impl super::TextServiceFactory_Impl {
                 let punct = sess.take_punct_pending();
                 let remainder = sess.take_selecting_remainder();
                 let candidate_source = sess.current_candidate_view().map(|v| v.source);
-                let explicit_pick = sess.selecting_selected_index() > 0;
+                let explicit_pick = sess.selecting_selected_index() > 0
+                    || crate::engine::state::take_candidate_forgot(&reading);
                 sess.set_idle();
                 drop(sess);
                 candidate_window::hide();

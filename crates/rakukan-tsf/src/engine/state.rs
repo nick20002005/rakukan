@@ -1108,6 +1108,64 @@ fn learn_action_with(
     }
 }
 
+// ── 明示的な選び直しの控え（2026-11-05） ──
+//
+// 次の 2 つは「ユーザーが表記を選んだ」のに、確定時の学習判定からは見えなかった。
+// - F6/F7/F8 で文字種を変えて Enter: `force_preedit` で読みが表記に置き換わり、
+//   セッションも Preedit に戻るので、確定は学習を呼ばない素の preedit 経路を通る。
+// - Ctrl+Delete で先頭候補を消し、繰り上がった読みそのものを Enter: 選択位置は 0 の
+//   ままなので「先頭を Enter＝選んでいない」扱いで Skip になる。
+// 実害: `やった` の先頭が辞書の `ヤッタ` で、何度ひらがなに直しても覚えなかった。
+
+/// F6/F7/F8 で作った表記 `(読み, 表記)`。確定時に表示中の preedit と一致した時だけ使う。
+static KANA_CONVERT_CHOICE: Mutex<Option<(String, String)>> = Mutex::new(None);
+/// Ctrl+Delete で候補を消した読み。次の Selecting 確定で読みが一致すれば明示選択扱い。
+static FORGOT_READING: Mutex<Option<String>> = Mutex::new(None);
+
+/// F6/F7/F8 の文字種変換を控える。`current` は変換前の表示、`source` は変換元の
+/// かな（F9/F10 の後なら romaji ログから戻したもの）、`converted` は変換後。
+/// 文字種を続けて変える（F7→F6）時は最初の読みを引き継ぐ。
+/// 控えは「確定する表記が `converted` と一致した時だけ」使うので、後から打鍵が
+/// 続いて表示が変われば自然に無効になる（明示的に消す必要は無い）。
+pub fn note_kana_convert(current: &str, source: &str, converted: &str) {
+    let Ok(mut slot) = KANA_CONVERT_CHOICE.lock() else {
+        return;
+    };
+    let reading = match slot.as_ref() {
+        Some((r, t)) if t == current => r.clone(),
+        _ => super::text_util::to_hiragana(source),
+    };
+    *slot = if reading.is_empty() || converted.is_empty() {
+        None
+    } else {
+        Some((reading, converted.to_string()))
+    };
+}
+
+/// 確定する `text` が直前の文字種変換の結果なら、その読みを返す（控えは消費する）。
+pub fn take_kana_convert_reading(text: &str) -> Option<String> {
+    let taken = KANA_CONVERT_CHOICE.lock().ok()?.take()?;
+    (taken.1 == text).then_some(taken.0)
+}
+
+/// Ctrl+Delete で候補を消したことを控える。
+/// 控えが古いまま残っても、効くのは「同じ読みで、読みそのものを確定した」時だけで、
+/// その時に読み→読みを学習するだけなので害は小さい。
+pub fn note_candidate_forgot(reading: &str) {
+    if let Ok(mut slot) = FORGOT_READING.lock() {
+        *slot = Some(reading.to_string());
+    }
+}
+
+/// 直前に同じ読みで候補を消していたら true（控えは消費する）。
+pub fn take_candidate_forgot(reading: &str) -> bool {
+    FORGOT_READING
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take())
+        .is_some_and(|r| r == reading)
+}
+
 pub fn is_digit_separator_auto_enabled() -> bool {
     super::config::current_config().input.digit_separator_auto
 }
@@ -3762,6 +3820,38 @@ mod tests {
         assert!(!ends_with_pending_romaji("hello"));
         // 数字・記号で終わる読み
         assert!(!ends_with_pending_romaji("2024"));
+    }
+
+    #[test]
+    fn kana_convert_choice_keeps_first_reading_and_matches_commit_text() {
+        // F7: やった → ヤッタ、続けて F6: ヤッタ → やった。読みは最初の「やった」のまま
+        note_kana_convert("やった", "やった", "ヤッタ");
+        assert_eq!(take_kana_convert_reading("ヤッタ").as_deref(), Some("やった"));
+        // 消費済み
+        assert_eq!(take_kana_convert_reading("ヤッタ"), None);
+
+        note_kana_convert("やった", "やった", "ヤッタ");
+        note_kana_convert("ヤッタ", "ヤッタ", "やった");
+        assert_eq!(take_kana_convert_reading("やった").as_deref(), Some("やった"));
+
+        // 変換後に打鍵が続いて表示が変わった → 使わない
+        note_kana_convert("やった", "やった", "ヤッタ");
+        assert_eq!(take_kana_convert_reading("ヤッタで"), None);
+
+        // F9 の後の F7: 表示はラテン文字、読みは romaji ログから戻したかな
+        note_kana_convert("yatta", "やった", "ヤッタ");
+        assert_eq!(take_kana_convert_reading("ヤッタ").as_deref(), Some("やった"));
+    }
+
+    #[test]
+    fn candidate_forgot_marks_only_same_reading_once() {
+        note_candidate_forgot("やった");
+        assert!(!take_candidate_forgot("やる"));
+        // 別の読みで取り出しても消費される（古い控えを持ち越さない）
+        assert!(!take_candidate_forgot("やった"));
+        note_candidate_forgot("やった");
+        assert!(take_candidate_forgot("やった"));
+        assert!(!take_candidate_forgot("やった"));
     }
 
     #[test]

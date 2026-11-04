@@ -1941,7 +1941,9 @@ impl super::TextServiceFactory_Impl {
                 let remainder = sess.take_selecting_remainder();
                 let remainder_reading = sess.selecting_remainder_reading_clone();
                 let candidate_source = sess.current_candidate_view().map(|v| v.source);
-                let explicit_pick = sess.selecting_selected_index() > 0;
+                // Ctrl+Delete で先頭を消した後の確定は、繰り上がった先頭でも選んだ扱い
+                let forgot = crate::engine::state::take_candidate_forgot(&reading);
+                let explicit_pick = sess.selecting_selected_index() > 0 || forgot;
                 sess.set_idle();
                 drop(sess);
                 let commit_text = if let Some(p) = punct {
@@ -2014,6 +2016,17 @@ impl super::TextServiceFactory_Impl {
             preedit: preedit.clone(),
         });
         engine.bg_reclaim();
+        // F6/F7/F8 で文字種を変えてそのまま確定した → その表記を選んだものとして学習
+        if let Some(reading) = crate::engine::state::take_kana_convert_reading(&preedit) {
+            if crate::engine::state::is_auto_learn_enabled() {
+                tracing::info!(
+                    "learning_decision action=LearnForce source=kana_convert reading={:?} text={:?}",
+                    reading,
+                    preedit
+                );
+                engine.learn_force(&reading, &preedit);
+            }
+        }
         engine.commit(&preedit.clone());
         engine.reset_preedit();
         drop(guard);

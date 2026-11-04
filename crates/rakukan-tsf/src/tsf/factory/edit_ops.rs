@@ -250,6 +250,8 @@ impl super::TextServiceFactory_Impl {
             p.clone()
         };
         let t = convert_fn(&source);
+        // 確定時に「読み→この表記」を学習するための控え（force_preedit で読みが消える）
+        crate::engine::state::note_kana_convert(&p, &source, &t);
         engine.force_preedit(t.clone());
         crate::tsf::live_session::suppress_commit_arm();
         if let Ok(mut sess) = session_get() {
@@ -632,6 +634,7 @@ impl super::TextServiceFactory_Impl {
             return Ok(true);
         }
         candidate_window::forget_mark_removed(&text);
+        crate::engine::state::note_candidate_forgot(&reading);
         sess.remove_current_candidate();
 
         let page_cands = sess.page_candidates();
