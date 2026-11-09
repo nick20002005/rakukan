@@ -1250,6 +1250,28 @@ fn has_kanji_or_katakana(s: &str) -> bool {
         .any(|c| matches!(c, 'ァ'..='ヶ' | '一'..='鿿' | '㐀'..='䶿' | '々'))
 }
 
+/// 端がかなの区間でも、選び直し語を差し替えてよいか。
+///
+/// LLM は語の頭をかな 1 文字にして残りを別の語にすることがある
+/// （`しじぶん` → `し｜自分`、2026-11-09 実ログ。`指示文` を何度選び直して学習しても
+/// 端がかなのガードで一度も差し替わらなかった）。助詞を巻き込む誤爆（`は｜飛` → `鳩`）と
+/// 分けるため、読み 4 文字以上・かなは端の 1 文字だけ・その 1 文字が助詞でない時に限る。
+fn kana_edge_split_ok(span: &[char], reading_chars: usize) -> bool {
+    const PARTICLES: &[char] = &[
+        'は', 'が', 'を', 'に', 'で', 'と', 'も', 'の', 'へ', 'や', 'か', 'ね', 'よ', 'な',
+    ];
+    if reading_chars < 4 || span.len() < 2 {
+        return false;
+    }
+    let kana: Vec<usize> = (0..span.len())
+        .filter(|&i| classify(span[i]) == RunKind::Hiragana)
+        .collect();
+    let [i] = kana[..] else {
+        return false;
+    };
+    (i == 0 || i == span.len() - 1) && !PARTICLES.contains(&span[i])
+}
+
 /// 学習表記への差し替えの強さ。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Strength {
@@ -1560,6 +1582,7 @@ fn apply_words(
             && [s, e - 1]
                 .iter()
                 .any(|&p| classify(surface_chars[p]) == RunKind::Hiragana)
+            && !kana_edge_split_ok(&surface_chars[s..e], end - start)
         {
             continue;
         }
@@ -1817,6 +1840,41 @@ mod tests {
         let (got, rewrite) = apply_split_words(&store, "とりはとんだ", cands.clone());
         assert_eq!(got, cands);
         assert!(rewrite.is_none());
+        // 端が助詞の 4 文字以上も差し替えない。
+        store.learn_force("にほんご", "日本語");
+        let cands = vec!["父に本後で".to_string()];
+        let (got, _) = apply_split_words(&store, "ちちにほんごで", cands.clone());
+        assert_eq!(got, cands);
+    }
+
+    #[test]
+    fn split_word_rewrites_kana_headed_split() {
+        // 実ログ（2026-11-09）: `指示文` を何度学習しても文中は `し自分` のままだった。
+        let (_dir, store) = store_with_user_entries("");
+        store.learn_force("しじぶん", "指示文");
+        let original = "チャットに貼れるし自分を出してくれればいい".to_string();
+        let (got, rewrite) = apply_split_words(
+            &store,
+            "ちゃっとにはれるしじぶんをだしてくれればいい",
+            vec![original.clone()],
+        );
+        assert_eq!(
+            got,
+            vec![
+                "チャットに貼れる指示文を出してくれればいい".to_string(),
+                original.clone()
+            ]
+        );
+        // 断ったら覚えて、次からは差し替えない。
+        for (r, s) in rewrite.unwrap().runs {
+            store.learn_force(&r, &s);
+        }
+        let (got, _) = apply_split_words(
+            &store,
+            "ちゃっとにはれるしじぶんをだしてくれればいい",
+            vec![original.clone()],
+        );
+        assert_eq!(got, vec![original]);
     }
 
     #[test]
