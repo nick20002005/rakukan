@@ -1449,19 +1449,27 @@ fn process_focus_change(fc: FocusChange) {
         return;
     }
 
-    let Some(new_mode) =
-        crate::engine::state::doc_mode_on_focus_change(fc.prev_ptr, fc.next_ptr, fc.hwnd_val)
-    else {
-        return;
-    };
+    let new_mode_opt =
+        crate::engine::state::doc_mode_on_focus_change(fc.prev_ptr, fc.next_ptr, fc.hwnd_val);
+    let tm_opt = TL_THREAD_MGR.with(|c| c.borrow().clone());
+    let tid = TL_CLIENT_ID.with(|c| c.get());
+    if let Some(new_mode) = new_mode_opt {
+        apply_focus_mode(tm_opt.as_ref(), tid, new_mode);
+    }
+    // 記憶の復元より後に、入力欄の種類（URL 欄など）でオフにする。
+    crate::tsf::input_scope::apply_on_focus(tm_opt.as_ref(), tid, fc.next_ptr);
+}
 
+fn apply_focus_mode(
+    tm_opt: Option<&windows::Win32::UI::TextServices::ITfThreadMgr>,
+    tid: u32,
+    new_mode: crate::engine::ime_mode::ImeMode,
+) {
     // モードを適用し、KEYBOARD_OPENCLOSE も同じ値に揃える（ターミナル判定用）。
     // この SetValue は msctf への再入だが、既に _NotifyCallbacks を抜けているので安全。
     // モードが変わらない場合もコンパートメントは書き直す（アプリ側で閉じられている
     // 可能性があるため）。
-    let tm_opt = TL_THREAD_MGR.with(|c| c.borrow().clone());
-    let tid = TL_CLIENT_ID.with(|c| c.get());
-    let from = crate::tsf::ime_sync::apply(tm_opt.as_ref(), tid, new_mode, true, "focus_change");
+    let from = crate::tsf::ime_sync::apply(tm_opt, tid, new_mode, true, "focus_change");
     if from.is_some_and(|f| f != new_mode) {
         tracing::info!(
             "OnSetFocus(deferred): mode {:?} → {:?}",

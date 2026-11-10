@@ -251,6 +251,15 @@ pub struct InputConfig {
     /// 0 = 無効（既定）。未確定文字がある・候補選択中など入力途中のときは何もしない。
     #[serde(default)]
     pub auto_off_idle_secs: u64,
+    /// URL・メールアドレス・パスワードの入力欄（TSF の InputScope で判定）に
+    /// フォーカスが入ったら IME をオフで始める（既定 `true`）。
+    /// ブラウザのアドレスバーなど。入った後にオンにすればそのまま続く。
+    #[serde(default = "default_ime_off_in_url_fields")]
+    pub ime_off_in_url_fields: bool,
+}
+
+fn default_ime_off_in_url_fields() -> bool {
+    true
 }
 
 /// `ime_off_apps` の既定値。
@@ -289,6 +298,7 @@ impl Default for InputConfig {
             ime_off_apps: default_ime_off_apps(),
             ime_on_apps: Vec::new(),
             auto_off_idle_secs: 0,
+            ime_off_in_url_fields: default_ime_off_in_url_fields(),
         }
     }
 }
@@ -751,6 +761,9 @@ ime_on_apps = []
 # アプリごとに、最後のキー入力からこの秒数が過ぎたら IME を自動でオフにする (0 = 無効)。
 # 未確定文字がある・候補選択中など入力途中のときは何もしない。
 auto_off_idle_secs = 0
+# URL・メールアドレス・パスワードの入力欄（ブラウザのアドレスバー等）に入ったら
+# IME をオフで始める。入った後にオンにすればそのまま続く。
+ime_off_in_url_fields = true
 
 [live_conversion]
 enabled = false
@@ -872,6 +885,16 @@ ime_off_apps = []
         )
         .expect("parse");
         assert!(none.input.ime_off_apps.is_empty());
+    }
+
+    #[test]
+    fn ime_off_in_url_fields_defaults_to_true() {
+        assert!(AppConfig::default().input.ime_off_in_url_fields);
+        let parsed: AppConfig = toml::from_str("[input]\ndefault_mode = \"off\"\n").expect("parse");
+        assert!(parsed.input.ime_off_in_url_fields);
+        let off: AppConfig =
+            toml::from_str("[input]\nime_off_in_url_fields = false\n").expect("parse");
+        assert!(!off.input.ime_off_in_url_fields);
     }
 
     #[test]
