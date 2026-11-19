@@ -2179,43 +2179,23 @@ impl RakunEngine {
             }
         }
 
-        // 6. 短文予測（Google 日本語入力相当）: 読みが前方一致する学習済みの長い
-        //    フレーズを、実候補の直後に差し込む。先頭を奪わないのは、ライブ変換の
-        //    preview が先頭の実候補を採用するため（打鍵途中に長文が出続けるのを避ける）。
-        //
-        //    🔴 挿入位置は固定の 1 番目ではなく「**読みと異なる最初の候補**の直後」。
-        //    ライブ変換の preview は `merge_candidates_for_reading(reading, .., 40)` の
-        //    結果から `find(|c| c != reading)` で先頭の実候補を採る。MOZC はひらがな
-        //    表記を先頭に返すことが多く（`たしかに → ["たしかに", "たし蟹", ..]`）、
-        //    固定で 1 番目に入れると候補 0 番が読みそのものだったときに予測が
-        //    preview へ昇格し、打鍵の途中で過去の長文が composition に出てしまう
-        //    （2026-08-31 に「たしかに」→「確かに、なんか」で実害）。
-        //
-        //    🔴 読みと異なる候補が 1 件も無いときは予測を入れない。merged が
-        //    空、あるいは読みしか無い状態で予測を足すと、それが preview に昇格して
-        //    「打っている途中で過去の長文が勝手に確定される」事故になる。予測はあくまで
-        //    「実候補の隣に並べる」もので、単独で preview に立たせない。Space 変換では
-        //    LLM 候補が入るので、この条件で予測が落ちることは実質起きない。
-        if let Some(first_real) = merged
-            .iter()
-            .position(|c| c != hiragana)
-            .filter(|_| !prediction_cands.is_empty())
-        {
-            // 重複した予測は挿入しないので、挿入位置は「実際に入れた数」で進める
-            // （enumerate の添字で進めると len を超えて insert が panic する）。
-            let mut at = first_real + 1;
-            let mut inserted: Vec<(String, String)> = Vec::new();
+        // 6. 読みの続きまで含む予測は、通常の変換候補を並べ終えた後に足す。
+        // 先頭の誤変換を削除したときも、次の通常候補を長文予測より先に選べる。
+        // ライブ変換は読みと異なる最初の候補を採るので、読みしかないときは足さない。
+        if merged.iter().any(|c| c != hiragana) {
+            let mut inserted = Vec::new();
             for (key, c) in &prediction_cands {
+                if merged.len() >= limit {
+                    break;
+                }
                 // 既に merged にある = この読みからも直接引ける表記なので、
                 // 予測由来としては記録しない（学習を振り直す必要が無い）。
                 if merged.contains(c) {
                     continue;
                 }
-                merged.insert(at, c.clone());
+                merged.push(c.clone());
                 inserted.push((key.clone(), c.clone()));
-                at += 1;
             }
-            merged.truncate(limit.max(1));
             self.remember_predictions(hiragana, inserted);
         }
 
@@ -2484,9 +2464,20 @@ impl RakunEngine {
     }
 
     fn learn_split_words(&self, store: &DictStore, reading: &str, surface: &str) {
-        let Ok(mut offers) = self.last_split_offers.lock() else {
-            return;
+        let offers = {
+            let Ok(mut offers) = self.last_split_offers.lock() else {
+                return;
+            };
+            std::mem::take(&mut *offers)
         };
+        // 文全体の提示と確定が同じなら、打鍵途中の表記との差は変換が追いついた
+        // 結果。選び直しとして単語を登録すると文中の誤変換まで単独変換に定着する。
+        if offers
+            .iter()
+            .any(|(key, offered)| key == reading && offered == surface)
+        {
+            return;
+        }
         // 打鍵途中の読み（`みぎはじ`・`みぎはじに`…）ごとに控えがあるので、同じ語が
         // 何度も取り出される。1 回の確定で学習回数を水増ししないよう 1 語 1 回にする。
         let mut learned: Vec<(String, String)> = Vec::new();
@@ -2511,7 +2502,6 @@ impl RakunEngine {
                 store.learn_force(&word, &word);
             }
         }
-        offers.clear();
     }
 
     /// 学習語の差し替え（`rescore::apply_learned_runs`）を断って元の候補を確定したら、
@@ -3380,6 +3370,22 @@ mod candidate_merge_tests {
     }
 
     #[test]
+    fn accepting_the_full_offer_does_not_learn_a_word_from_a_partial_offer() {
+        let mut engine = RakunEngine::new(EngineConfig::default());
+        engine.set_dict_store(DictStore::load(None, None, None).unwrap());
+        let reading = "さいだいかをためす";
+        let auto_converted = "最大下を試す";
+        engine.rescore_llm_candidates("さいだいか", vec!["最大か".into()]);
+        engine.rescore_llm_candidates(reading, vec![auto_converted.into()]);
+
+        engine.learn_force(reading, auto_converted);
+
+        let store = engine.dict_store.as_ref().unwrap();
+        assert!(store.lookup_learn("さいだいか").is_empty());
+        assert_eq!(store.lookup_learn(reading), vec![auto_converted]);
+    }
+
+    #[test]
     fn learned_surface_outranks_user_dict_entry() {
         // Issue #13: ユーザー辞書「杜野」を登録した読みで「森の」を選んで確定すると、
         // 次回は学習した「森の」が先頭になる（旧順序では永久に「杜野」が先頭だった）。
@@ -3870,11 +3876,13 @@ priority = "low"
         let merged = engine.merge_candidates_for_reading("またつうじょう", vec![], 40);
         assert_eq!(merged, vec!["またつうじょう".to_string()]);
 
-        // 実候補があるときは 2 番目に並べる（従来どおり）
-        let merged =
-            engine.merge_candidates_for_reading("またつうじょう", vec!["また通常".to_string()], 40);
-        assert_eq!(merged.first().map(String::as_str), Some("また通常"));
-        assert_eq!(merged.get(1).map(String::as_str), Some("また通常の候補"));
+        // 読みに対応する候補を予測が押し下げない。
+        let merged = engine.merge_candidates_for_reading(
+            "またつうじょう",
+            vec!["又通常".into(), "また通常".into()],
+            40,
+        );
+        assert_eq!(&merged[..3], ["又通常", "また通常", "また通常の候補"]);
 
         // 候補 0 番が読みそのもの（MOZC はひらがな表記を先頭に返しがち）でも、
         // 予測はその次ではなく「読みと異なる最初の候補」の後ろに入る。
