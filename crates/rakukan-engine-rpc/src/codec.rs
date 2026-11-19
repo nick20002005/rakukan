@@ -94,6 +94,18 @@ mod tests {
         // [len=4bytes LE][varint discriminant]
         let payload = &buf[4..];
         assert_eq!(payload.len(), 1, "Shutdown must stay a 1-byte discriminant");
+        assert_eq!(payload[0], 49);
+        assert_eq!(
+            discriminant(&Request::ForgettableSurfaces { reading: String::new() }),
+            57
+        );
+        assert_eq!(
+            discriminant(&Request::LearnCorrection {
+                reading: String::new(),
+                surface: String::new(),
+            }),
+            58
+        );
     }
 
     fn discriminant(req: &Request) -> u8 {

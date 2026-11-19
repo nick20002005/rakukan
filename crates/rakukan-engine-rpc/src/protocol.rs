@@ -271,6 +271,12 @@ pub enum Request {
         reading: String,
     },
 
+    /// 候補を明示的に選び直したときの確定。既存の学習要求は読み全体だけを覚える。
+    LearnCorrection {
+        reading: String,
+        surface: String,
+    },
+
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

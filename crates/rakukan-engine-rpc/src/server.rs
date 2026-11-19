@@ -256,6 +256,7 @@ pub(crate) fn request_label(req: &Request) -> &'static str {
         AvailableModelsJson => "AvailableModelsJson",
         Learn { .. } => "Learn",
         LearnForce { .. } => "LearnForce",
+        LearnCorrection { .. } => "LearnCorrection",
         MergeCandidatesForReading { .. } => "MergeCandidatesForReading",
         LastError => "LastError",
         DictStatus => "DictStatus",
@@ -559,6 +560,11 @@ fn dispatch_engine(eng: &mut DynEngine, req: Request) -> Response {
         LearnForce { reading, surface } => {
             warn_if_dict_missing(eng, "LearnForce", &reading);
             eng.learn_force(&reading, &surface);
+            Response::Unit
+        }
+        LearnCorrection { reading, surface } => {
+            warn_if_dict_missing(eng, "LearnCorrection", &reading);
+            eng.learn_correction(&reading, &surface);
             Response::Unit
         }
         Forget { reading, surface } => Response::Bool(eng.forget(&reading, &surface)),

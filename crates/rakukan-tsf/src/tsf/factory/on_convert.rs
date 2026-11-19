@@ -1888,18 +1888,14 @@ impl super::TextServiceFactory_Impl {
             if sess.is_block_selecting() {
                 let full_text = sess.block_selecting_full_text().unwrap_or_default();
                 let full_reading = sess.block_selecting_full_reading().unwrap_or_default();
+                let choices = sess.block_selecting_explicit_choices();
                 // ドキュメントへ書き戻すのは composition に載っている範囲だけ
                 // （先行実装で確定済みのブロックがあれば既にアプリ側にある）。
                 let pending_text = sess.block_selecting_pending_text().unwrap_or_default();
                 sess.set_idle();
                 drop(sess);
                 candidate_window::hide();
-                if crate::engine::state::is_auto_learn_enabled()
-                    && full_text != full_reading
-                    && !full_reading.is_empty()
-                {
-                    engine.learn_force(&full_reading, &full_text);
-                }
+                crate::engine::state::learn_block_commit(engine, &full_reading, &full_text, &choices);
                 engine.commit(&full_text);
                 engine.reset_preedit();
                 drop(guard);
@@ -1951,18 +1947,13 @@ impl super::TextServiceFactory_Impl {
                 } else {
                     text.clone()
                 };
-                match crate::engine::state::learn_action(
+                crate::engine::state::learn_candidate(
+                    engine,
                     &reading,
                     &text,
                     candidate_source,
                     explicit_pick,
-                ) {
-                    crate::engine::state::LearnAction::LearnForce => {
-                        engine.learn_force(&reading, &text)
-                    }
-                    crate::engine::state::LearnAction::Learn => engine.learn(&reading, &text),
-                    crate::engine::state::LearnAction::Skip => {}
-                }
+                );
                 candidate_window::hide();
                 candidate_window::stop_live_timer();
                 let confirmed = format!("{prefix}{commit_text}");

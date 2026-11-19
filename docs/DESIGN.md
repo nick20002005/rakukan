@@ -452,7 +452,12 @@ TSF DLL 側は `rakukan-engine-rpc` 経由で Named Pipe ごしに呼び出す�
 | 辞書 | `merge_candidates_for_reading` | 辞書＋LLM 候補マージ（読みを明示。旧 `merge_candidates` は host から呼ばない） |
 | 診断 | `build_info`（任意シンボル `engine_build_info`） | version / git sha / ビルド時刻 / ABI / DLL 内ログ初期化結果。host が起動時に自分の識別子と突き合わせ、別ビルドなら WARN（Issue #8） |
 | 初期化 | `start_load_model`, `start_load_dict`, `is_kanji_ready`, `is_dict_ready` | 非同期ロード |
-| 学習 | `learn` | 学習履歴 (`learn_history.bin`) への記録。MOZC/ユーザー辞書由来 surface のみ対象 |
+| 学習 | `learn`, `learn_force` | 確定した読みと表記の組を学習履歴に記録。`learn` は辞書ガードを適用 |
+| 選び直しの学習 | `learn_correction`（任意シンボル） | 明示的な候補選択を学習。同じ読みの提示候補と比較して文中の語を学習できる |
+
+自動確定は、途中の変換結果と最終表記の差を単語として学習しない。例えば「速やか」を確定しただけでは、途中の `すみ` に `速` を登録しない。文節の候補を選び直した場合は、選んだ文節の読みと表記をそのまま学習する。短文予測を確定した場合は、予測元の長い読みで表記を記録する。
+
+旧 TSF からの `Learn` / `LearnForce` でも、エンジン更新後は確定した読みと表記の組だけを保存する。選び直し専用の要求は既存の番号を維持して RPC の末尾に追加した。学習履歴のファイル形式は同じ。
 
 ### バックエンド選択
 

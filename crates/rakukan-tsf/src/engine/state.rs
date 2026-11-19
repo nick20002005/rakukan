@@ -1045,6 +1045,42 @@ pub enum LearnAction {
     Learn,
     /// `engine.learn_force()`（辞書ガードなし。LLM 候補と、読みそのものの明示選択）
     LearnForce,
+    /// `engine.learn_correction()`（表示された同じ読みの候補から選び直したとき）
+    LearnCorrection,
+}
+
+pub fn learn_candidate(
+    engine: &DynEngine,
+    reading: &str,
+    text: &str,
+    source: Option<CandidateViewSource>,
+    explicit_pick: bool,
+) {
+    match learn_action(reading, text, source, explicit_pick) {
+        LearnAction::Learn => engine.learn(reading, text),
+        LearnAction::LearnForce => engine.learn_force(reading, text),
+        LearnAction::LearnCorrection => engine.learn_correction(reading, text),
+        LearnAction::Skip => {}
+    }
+}
+
+pub fn learn_block_commit(
+    engine: &DynEngine,
+    reading: &str,
+    text: &str,
+    choices: &[(String, String)],
+) {
+    if !is_auto_learn_enabled() {
+        return;
+    }
+    for (block_reading, block_text) in choices {
+        if block_reading != reading || block_text != text {
+            engine.learn_force(block_reading, block_text);
+        }
+    }
+    if !reading.is_empty() && (text != reading || !choices.is_empty()) {
+        engine.learn_force(reading, text);
+    }
 }
 
 /// 学習判定の中央ヘルパ。`auto_learn` 設定 / `text == reading` / `source` 判定を一括し、
@@ -1099,6 +1135,9 @@ fn learn_action_with(
         } else {
             LearnAction::Skip
         };
+    }
+    if explicit_pick && source.is_none_or(is_candidate_learning_target) {
+        return LearnAction::LearnCorrection;
     }
     match source {
         Some(CandidateViewSource::Bg) => LearnAction::LearnForce,
@@ -2160,6 +2199,17 @@ impl SessionState {
         } else {
             None
         }
+    }
+
+    pub fn block_selecting_explicit_choices(&self) -> Vec<(String, String)> {
+        let SessionState::BlockSelecting { blocks, .. } = self else {
+            return Vec::new();
+        };
+        blocks
+            .iter()
+            .filter(|block| block.selected > 0 && !block.reading.is_empty())
+            .map(|block| (block.reading.clone(), block.current_candidate().to_string()))
+            .collect()
     }
 
     /// BlockSelecting: **まだドキュメントへ物理コミットしていない**ブロック
@@ -3895,6 +3945,10 @@ mod tests {
     #[test]
     fn learn_action_keeps_source_rules_for_converted_text() {
         use super::{LearnAction, learn_action_with};
+        assert_eq!(
+            learn_action_with(true, "すごい", "凄い", Some(CandidateViewSource::Bg), true),
+            LearnAction::LearnCorrection
+        );
         assert_eq!(
             learn_action_with(true, "すごい", "凄い", Some(CandidateViewSource::Bg), false),
             LearnAction::LearnForce

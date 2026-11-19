@@ -1009,12 +1009,13 @@ pub struct RakunEngine {
     tail_closed_at: Option<(usize, String)>,
     committed: String,
     dict_store: Option<DictStore>,
-    /// 直近に「短文予測」として提示した候補: `(提示した読み, [(登録キー, surface)])`。
+    /// 読みごとに「短文予測」として提示した候補を保持する。文節を移動しても、
+    /// 先に表示した文節の予測を元の長い読みで学習できるようにする。
     ///
     /// 予測候補は現在の読みより**長いキー**の学習フレーズなので、確定時にそのまま
     /// 現在の読みで学習すると「読みに無い文字を含む表記」が完全一致エントリになる
     /// （`learn_rekeyed_to_prediction` 参照）。学習を元のキーへ振り直すために覚える。
-    last_predictions: Mutex<Option<(String, Vec<(String, String)>)>>,
+    last_predictions: Mutex<Vec<(String, Vec<(String, String)>)>>,
     /// 直近に学習語で差し替えた候補: `(読み, 差し替え内容)`。
     /// 元の候補が確定されたら `learn_declined_rewrite` が使う。
     last_learned_rewrite: Mutex<Option<(String, rescore::LearnedRewrite)>>,
@@ -1038,7 +1039,7 @@ impl RakunEngine {
             tail_closed_at: None,
             committed: String::new(),
             dict_store: None,
-            last_predictions: Mutex::new(None),
+            last_predictions: Mutex::new(Vec::new()),
             last_learned_rewrite: Mutex::new(None),
             last_split_offers: Mutex::new(Vec::new()),
             last_stem_offers: Mutex::new(None),
@@ -1615,6 +1616,7 @@ impl RakunEngine {
     }
 
     pub fn commit(&mut self, text: &str) {
+        self.clear_correction_offers();
         info!("engine::commit: {:?}", text);
         if is_context_echo_risk(text) {
             // 未変換のまま確定されたひらがな文を context に入れると、同じ読みの
@@ -1704,10 +1706,6 @@ impl RakunEngine {
     /// 学習語を DictStore に即時反映してファイルにも保存する。
     pub fn learn(&mut self, reading: &str, surface: &str) {
         if let Some(store) = &self.dict_store {
-            if !self.learn_declined_rewrite(store, reading, surface) {
-                self.learn_accepted_stem_offer(store, reading, surface);
-                self.learn_split_words(store, reading, surface);
-            }
             let key = self.learn_key_for(reading, surface);
             store.learn(&key, surface);
         } else {
@@ -1717,10 +1715,6 @@ impl RakunEngine {
 
     pub fn learn_force(&mut self, reading: &str, surface: &str) {
         if let Some(store) = &self.dict_store {
-            if !self.learn_declined_rewrite(store, reading, surface) {
-                self.learn_accepted_stem_offer(store, reading, surface);
-                self.learn_split_words(store, reading, surface);
-            }
             let key = self.learn_key_for(reading, surface);
             store.learn_force(&key, surface);
         } else {
@@ -1728,25 +1722,44 @@ impl RakunEngine {
         }
     }
 
+    /// 明示的な候補選び直し。入力中の候補と比較して学習するのはこの経路だけ。
+    pub fn learn_correction(&mut self, reading: &str, surface: &str) {
+        let Some(store) = &self.dict_store else {
+            tracing::warn!("learn_correction: dict_store not initialized");
+            return;
+        };
+        let key = self.learn_key_for(reading, surface);
+        // 長い予測候補を確定した場合は、予測元の読みで表記全体だけを学習する。
+        if key == reading && !self.learn_declined_rewrite(store, reading, surface) {
+            self.learn_accepted_stem_offer(store, reading, surface);
+            self.learn_split_words(store, reading, surface);
+        }
+        store.learn_force(&key, surface);
+    }
+
     /// 直近に提示した予測候補（`predict` / merge の 6. ブロック）を覚える。
     fn remember_predictions(&self, reading: &str, inserted: Vec<(String, String)>) {
         if inserted.is_empty() {
             return;
         }
-        let Ok(mut slot) = self.last_predictions.lock() else {
+        let Ok(mut predictions) = self.last_predictions.lock() else {
             return;
         };
         // 同じ読みなら足し込む。予測ウィンドウ（`predict`）と変換候補（merge）は
         // どちらが後に呼ばれるか決まっていないので、上書きすると片方が消える。
-        match slot.as_mut() {
-            Some((prev_reading, entries)) if prev_reading == reading => {
-                for e in inserted {
-                    if !entries.contains(&e) {
-                        entries.push(e);
-                    }
-                }
+        let (key, mut entries) = predictions
+            .iter()
+            .position(|(key, _)| key == reading)
+            .map(|i| predictions.remove(i))
+            .unwrap_or_else(|| (reading.to_string(), Vec::new()));
+        for entry in inserted {
+            if !entries.contains(&entry) {
+                entries.push(entry);
             }
-            _ => *slot = Some((reading.to_string(), inserted)),
+        }
+        predictions.push((key, entries));
+        if predictions.len() > 16 {
+            predictions.remove(0);
         }
     }
 
@@ -1763,12 +1776,9 @@ impl RakunEngine {
         let Ok(slot) = self.last_predictions.lock() else {
             return reading.to_string();
         };
-        let Some((pred_reading, entries)) = slot.as_ref() else {
+        let Some((_, entries)) = slot.iter().find(|(key, _)| key == reading) else {
             return reading.to_string();
         };
-        if pred_reading != reading {
-            return reading.to_string();
-        }
         for (key, pred_surface) in entries {
             if pred_surface == surface && key != reading {
                 info!(
@@ -2441,15 +2451,19 @@ impl RakunEngine {
             &|top, other| rescore::noted_confidence_gap(reading, top, other),
             rewrite.is_none(),
         );
-        if !stem_offers.is_empty()
-            && let Ok(mut slot) = self.last_stem_offers.lock()
-        {
-            *slot = Some((reading.to_string(), stem_offers));
+        if let Ok(mut slot) = self.last_stem_offers.lock() {
+            if !stem_offers.is_empty() {
+                *slot = Some((reading.to_string(), stem_offers));
+            } else if slot.as_ref().is_some_and(|(key, _)| key == reading) {
+                *slot = None;
+            }
         }
-        if let Some(rewrite) = rewrite.or(stem_rewrite)
-            && let Ok(mut slot) = self.last_learned_rewrite.lock()
-        {
-            *slot = Some((reading.to_string(), rewrite));
+        if let Ok(mut slot) = self.last_learned_rewrite.lock() {
+            if let Some(rewrite) = rewrite.or(stem_rewrite) {
+                *slot = Some((reading.to_string(), rewrite));
+            } else if slot.as_ref().is_some_and(|(key, _)| key == reading) {
+                *slot = None;
+            }
         }
         if let Some(first) = candidates.first()
             && let Ok(mut offers) = self.last_split_offers.lock()
@@ -2464,43 +2478,35 @@ impl RakunEngine {
     }
 
     fn learn_split_words(&self, store: &DictStore, reading: &str, surface: &str) {
-        let offers = {
+        let offered = {
             let Ok(mut offers) = self.last_split_offers.lock() else {
                 return;
             };
-            std::mem::take(&mut *offers)
+            let Some(i) = offers.iter().position(|(key, _)| key == reading) else {
+                return;
+            };
+            offers.remove(i).1
         };
-        // 文全体の提示と確定が同じなら、打鍵途中の表記との差は変換が追いついた
-        // 結果。選び直しとして単語を登録すると文中の誤変換まで単独変換に定着する。
-        if offers
-            .iter()
-            .any(|(key, offered)| key == reading && offered == surface)
-        {
+        // 確定対象と同じ読みの候補だけを比較する。短い途中候補には語の境界がない。
+        if offered == surface {
             return;
         }
-        // 打鍵途中の読み（`みぎはじ`・`みぎはじに`…）ごとに控えがあるので、同じ語が
-        // 何度も取り出される。1 回の確定で学習回数を水増ししないよう 1 語 1 回にする。
         let mut learned: Vec<(String, String)> = Vec::new();
-        for (key, offered) in offers.iter() {
-            for (r, word, from) in rescore::corrected_words_in(reading, surface, key, offered) {
-                if learned.iter().any(|(lr, lw)| *lr == r && *lw == word) {
-                    continue;
-                }
-                learned.push((r.clone(), word.clone()));
-                info!(
-                    "learn: split word learned reading={} word={} from={}",
-                    r, word, from
-                );
-                store.learn_force(&r, &word);
+        for (r, word, from) in rescore::corrected_words_in(reading, surface, reading, &offered) {
+            if learned.iter().any(|(lr, lw)| *lr == r && *lw == word) {
+                continue;
             }
-            for word in rescore::corrected_kana_words_in(reading, surface, key, offered) {
-                if learned.iter().any(|(lr, lw)| *lr == word && *lw == word) {
-                    continue;
-                }
-                learned.push((word.clone(), word.clone()));
-                info!("learn: kana word learned reading={} from={}", word, offered);
-                store.learn_force(&word, &word);
+            info!("learn: split word learned reading={r} word={word} from={from}");
+            store.learn_force(&r, &word);
+            learned.push((r, word));
+        }
+        for word in rescore::corrected_kana_words(reading, &offered, surface) {
+            if learned.iter().any(|(lr, lw)| *lr == word && *lw == word) {
+                continue;
             }
+            info!("learn: kana word learned reading={word} from={offered}");
+            store.learn_force(&word, &word);
+            learned.push((word.clone(), word));
         }
     }
 
@@ -2514,9 +2520,7 @@ impl RakunEngine {
         let Some((rewrite_reading, rewrite)) = slot.as_ref() else {
             return false;
         };
-        if rescore::surface_for_reading(reading, surface, rewrite_reading).as_deref()
-            != Some(rewrite.original.as_str())
-        {
+        if rewrite_reading != reading || rewrite.original != surface {
             return false;
         }
         for (run_reading, llm_surface) in &rewrite.runs {
@@ -2528,7 +2532,7 @@ impl RakunEngine {
         }
         *slot = None;
         if let Ok(mut offers) = self.last_split_offers.lock() {
-            offers.clear();
+            offers.retain(|(key, _)| key != reading);
         }
         true
     }
@@ -2537,7 +2541,6 @@ impl RakunEngine {
     /// （`かき → 描き`）を学習する。文全体の学習だけでは語幹の一族に数えられず、
     /// 次に別の活用形を打ったとき「最後に選んだ漢字」が古いままになる。
     ///
-    /// 文節ごとの変換では確定時の読みが文全体になるので、読み・表記とも包含で照合する。
     fn learn_accepted_stem_offer(&self, store: &DictStore, reading: &str, surface: &str) {
         let Ok(mut slot) = self.last_stem_offers.lock() else {
             return;
@@ -2545,10 +2548,10 @@ impl RakunEngine {
         let Some((offer_reading, offers)) = slot.as_ref() else {
             return;
         };
-        if !reading.contains(offer_reading.as_str()) {
+        if offer_reading != reading {
             return;
         }
-        let Some(offer) = offers.iter().find(|o| surface.contains(o.sentence.as_str())) else {
+        let Some(offer) = offers.iter().find(|o| o.sentence == surface) else {
             return;
         };
         info!(
@@ -2557,6 +2560,21 @@ impl RakunEngine {
         );
         store.learn_force(&offer.key, &offer.surface);
         *slot = None;
+    }
+
+    fn clear_correction_offers(&mut self) {
+        if let Ok(predictions) = self.last_predictions.get_mut() {
+            predictions.clear();
+        }
+        if let Ok(offers) = self.last_split_offers.get_mut() {
+            offers.clear();
+        }
+        if let Ok(rewrite) = self.last_learned_rewrite.get_mut() {
+            *rewrite = None;
+        }
+        if let Ok(stems) = self.last_stem_offers.get_mut() {
+            *stems = None;
+        }
     }
 
     /// key が一致する BG 変換結果を取得し、converter を engine に戻す。
@@ -2600,6 +2618,7 @@ impl RakunEngine {
     }
 
     pub fn reset_all(&mut self) {
+        self.clear_correction_offers();
         self.hiragana_buf.clear();
         self.committed.clear();
         self.romaji = RomajiConverter::new();
@@ -3333,56 +3352,75 @@ mod candidate_merge_tests {
     }
 
     #[test]
-    fn split_word_learning_survives_sentence_and_block_commits() {
-        for block in [false, true] {
-            for forced in [false, true] {
-                let mut engine = RakunEngine::new(EngineConfig::default());
-                engine.set_dict_store(DictStore::load(None, None, None).unwrap());
-                let key = if block {
-                    "みぎはじ"
-                } else {
-                    "みぎはじはさすがにいちどでへんかんしてほしい"
-                };
-                let offered = if block {
-                    "右は字"
-                } else {
-                    "右は字はさすがに一度で変換してほしい"
-                };
-                engine.rescore_llm_candidates(key, vec![offered.into()]);
-                let reading = "みぎはじはさすがにいちどでへんかんしてほしい";
-                let accepted = "右端はさすがに一度で変換してほしい";
-                if forced {
-                    engine.learn_force(reading, accepted);
-                } else {
-                    engine.learn(reading, accepted);
-                }
-                let store = engine.dict_store.as_ref().unwrap();
-                assert!(store.lookup_learn("みぎはじ").contains(&"右端".to_string()));
-                let got = engine
-                    .rescore_llm_candidates("みぎはじによせる", vec!["右は字に寄せる".into()]);
-                assert_eq!(got[0], "右端に寄せる");
-                engine.learn("みぎはじによせる", "右は字に寄せる");
-                let got = engine
-                    .rescore_llm_candidates("みぎはじによせる", vec!["右は字に寄せる".into()]);
-                assert_eq!(got[0], "右は字に寄せる");
-            }
-        }
+    fn explicit_correction_learns_words_from_the_same_reading() {
+        let mut engine = RakunEngine::new(EngineConfig::default());
+        engine.set_dict_store(DictStore::load(None, None, None).unwrap());
+        let reading = "みぎはじはさすがにいちどでへんかんしてほしい";
+        let accepted = "右端はさすがに一度で変換してほしい";
+        engine.rescore_llm_candidates("みぎはじ", vec!["右は字".into()]);
+        engine.learn_correction(reading, accepted);
+        assert!(engine.dict_store_ref().unwrap().lookup_learn("みぎはじ").is_empty());
+
+        engine.rescore_llm_candidates(reading, vec!["右は字はさすがに一度で変換してほしい".into()]);
+        engine.learn_correction(reading, accepted);
+        assert_eq!(engine.dict_store_ref().unwrap().lookup_learn("みぎはじ"), ["右端"]);
+        let got = engine.rescore_llm_candidates("みぎはじによせる", vec!["右は字に寄せる".into()]);
+        assert_eq!(got[0], "右端に寄せる");
+        engine.learn_correction("みぎはじによせる", "右は字に寄せる");
+        let got = engine.rescore_llm_candidates("みぎはじによせる", vec!["右は字に寄せる".into()]);
+        assert_eq!(got[0], "右は字に寄せる");
     }
 
     #[test]
-    fn accepting_the_full_offer_does_not_learn_a_word_from_a_partial_offer() {
+    fn ordinary_commit_learns_only_the_full_input_even_with_differing_offers() {
         let mut engine = RakunEngine::new(EngineConfig::default());
         engine.set_dict_store(DictStore::load(None, None, None).unwrap());
         let reading = "さいだいかをためす";
         let auto_converted = "最大下を試す";
         engine.rescore_llm_candidates("さいだいか", vec!["最大か".into()]);
-        engine.rescore_llm_candidates(reading, vec![auto_converted.into()]);
+        engine.rescore_llm_candidates(reading, vec!["最大かを試す".into()]);
 
         engine.learn_force(reading, auto_converted);
 
         let store = engine.dict_store.as_ref().unwrap();
         assert!(store.lookup_learn("さいだいか").is_empty());
         assert_eq!(store.lookup_learn(reading), vec![auto_converted]);
+    }
+
+    #[test]
+    fn ordinary_commit_does_not_learn_a_rejected_rewrite() {
+        let mut engine = RakunEngine::new(EngineConfig::default());
+        engine.set_dict_store(DictStore::load(None, None, None).unwrap());
+        let reading = "まっくら";
+        let original = "真っ暗";
+        *engine.last_learned_rewrite.get_mut().unwrap() = Some((
+            reading.into(),
+            crate::rescore::LearnedRewrite {
+                original: original.into(),
+                runs: vec![("くら".into(), "暗".into())],
+            },
+        ));
+
+        engine.learn_force(reading, original);
+        assert!(engine.dict_store_ref().unwrap().lookup_learn("くら").is_empty());
+        engine.commit(original);
+        engine.learn_correction(reading, original);
+        assert!(engine.dict_store_ref().unwrap().lookup_learn("くら").is_empty());
+    }
+
+    #[test]
+    fn learn_rekeyed_to_prediction() {
+        let mut engine = RakunEngine::new(EngineConfig::default());
+        engine.set_dict_store(DictStore::load(None, None, None).unwrap());
+        engine.learn_force("ないようをかく", "内容を書く");
+        engine.learn_force("そのつぎにすすむ", "その次に進む");
+        assert_eq!(engine.predict("ない", 8), ["内容を書く"]);
+        assert_eq!(engine.predict("その", 8), ["その次に進む"]);
+
+        engine.learn_correction("ない", "内容を書く");
+
+        assert!(engine.dict_store_ref().unwrap().lookup_learn("ない").is_empty());
+        assert_eq!(engine.dict_store_ref().unwrap().lookup_learn("ないようをかく"), ["内容を書く"]);
     }
 
     #[test]

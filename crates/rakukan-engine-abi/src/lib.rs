@@ -148,6 +148,7 @@ struct EngineVTable {
     // 学習
     learn: unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char),
     learn_force: unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char),
+    learn_correction: Option<unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char)>,
     forget: unsafe extern "C" fn(*mut c_void, *const c_char, *const c_char) -> bool,
     predict: unsafe extern "C" fn(*mut c_void, *const c_char, u32) -> *mut c_char,
     dict_lookup: unsafe extern "C" fn(*mut c_void, *const c_char, u32) -> *mut c_char,
@@ -239,6 +240,7 @@ impl EngineVTable {
             available_models_json: load_sym!(lib, b"engine_available_models_json\0"),
             learn: load_sym!(lib, b"engine_learn\0"),
             learn_force: load_sym!(lib, b"engine_learn_force\0"),
+            learn_correction: load_sym_opt!(lib, b"engine_learn_correction\0"),
             forget: load_sym!(lib, b"engine_forget\0"),
             predict: load_sym!(lib, b"engine_predict\0"),
             dict_lookup: load_sym!(lib, b"engine_dict_lookup\0"),
@@ -652,6 +654,16 @@ impl DynEngine {
         unsafe {
             (self.vtable.learn_force)(self.handle, r.as_ptr(), s.as_ptr());
         }
+    }
+
+    pub fn learn_correction(&mut self, reading: &str, surface: &str) {
+        let Some(learn_correction) = self.vtable.learn_correction else {
+            self.learn_force(reading, surface);
+            return;
+        };
+        let r = Self::to_cstring(reading);
+        let s = Self::to_cstring(surface);
+        unsafe { learn_correction(self.handle, r.as_ptr(), s.as_ptr()) };
     }
 
     /// 入力中の予測候補を返す（学習履歴のみ、LLM/MOZC は引かない）。

@@ -762,7 +762,7 @@ pub extern "C" fn engine_learn(
     engine.learn(&reading, &surface);
 }
 
-/// 辞書ガードなしで学習する（候補ウィンドウからの明示選択、案C）。
+/// 渡された読みと表記を辞書ガードなしで学習する。
 #[unsafe(no_mangle)]
 pub extern "C" fn engine_learn_force(
     handle: *mut c_void,
@@ -777,6 +777,22 @@ pub extern "C" fn engine_learn_force(
         return;
     }
     engine.learn_force(&reading, &surface);
+}
+
+/// 候補を明示的に選び直したときに呼ぶ。
+#[unsafe(no_mangle)]
+pub extern "C" fn engine_learn_correction(
+    handle: *mut c_void,
+    reading: *const c_char,
+    surface: *const c_char,
+) {
+    let engine = unsafe { &mut *(handle as *mut RakunEngine) };
+    inject_pending_dict(engine);
+    let reading = unsafe { from_cstr(reading) };
+    let surface = unsafe { from_cstr(surface) };
+    if !reading.is_empty() && !surface.is_empty() {
+        engine.learn_correction(reading, surface);
+    }
 }
 
 /// 入力中の予測候補を JSON 配列で返す（学習履歴のみを引く軽量経路）。

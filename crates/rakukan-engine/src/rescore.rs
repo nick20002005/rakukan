@@ -902,19 +902,6 @@ pub fn corrected_kana_words(reading: &str, offered: &str, accepted: &str) -> Vec
     words
 }
 
-/// `corrected_kana_words` を、確定した文全体のうち控え `(key, offered)` の区間で行う。
-pub fn corrected_kana_words_in(
-    reading: &str,
-    surface: &str,
-    key: &str,
-    offered: &str,
-) -> Vec<String> {
-    let Some(accepted) = surface_for_reading(reading, surface, key) else {
-        return Vec::new();
-    };
-    corrected_kana_words(key, offered, &accepted)
-}
-
 /// かな書きで覚えた語（`いったん`・`あと`）を、文中でもかな書きにする。
 ///
 /// 第 1 候補の漢字 run の読みの頭が、学習でかな書きが一番前に居る読みなら:

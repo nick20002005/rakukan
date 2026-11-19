@@ -724,11 +724,7 @@ impl super::TextServiceFactory_Impl {
             text.clone()
         };
         // 番号キーで選んだ候補は、それが読みそのものでも明示選択として扱う
-        match crate::engine::state::learn_action(&reading, &text, candidate_source, true) {
-            crate::engine::state::LearnAction::LearnForce => engine.learn_force(&reading, &text),
-            crate::engine::state::LearnAction::Learn => engine.learn(&reading, &text),
-            crate::engine::state::LearnAction::Skip => {}
-        }
+        crate::engine::state::learn_candidate(engine, &reading, &text, candidate_source, true);
         candidate_window::hide();
         let confirmed = format!("{prefix}{commit_text}");
         if !remainder_reading.is_empty() {

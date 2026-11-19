@@ -537,6 +537,19 @@ impl RpcEngine {
         });
     }
 
+    pub fn learn_correction(&self, reading: &str, surface: &str) {
+        if self
+            .call_unit(Request::LearnCorrection {
+                reading: reading.into(),
+                surface: surface.into(),
+            })
+            .is_err()
+        {
+            // 旧ホストは追加の要求を解釈できない。従来の学習要求に戻す。
+            self.learn_force(reading, surface);
+        }
+    }
+
     /// 入力中の予測候補を返す（学習履歴のみ）。失敗時は空。
     pub fn predict(&self, reading: &str, limit: usize) -> Vec<String> {
         self.call_strings(Request::Predict {
