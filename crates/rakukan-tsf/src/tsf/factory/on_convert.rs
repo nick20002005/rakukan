@@ -1910,12 +1910,50 @@ impl super::TextServiceFactory_Impl {
                 end_composition(ctx, tid, pending_text)?;
                 return Ok(true);
             }
-            // ── Waiting（⏳変換中）: ひらがなのままコミット ──
+            // ── Waiting（⏳変換中）: 変換の到着を待って第1候補で確定 ──
+            //
+            // Space 直後（LLM がインライン待ちの 250ms に間に合わず Waiting に入った所）で
+            // Enter を押すと、以前はひらがなのまま確定していた（実害 2026-11-25:
+            // 31 文字の文を Space→Enter したら全部ひらがなで入った。Space から Enter まで
+            // 450ms、裏の変換はその直後に終わる所だった）。利用者は Space で変換を頼んで
+            // いるので、最大 WAITING_COMMIT_WAIT_MS だけ待ち、取れれば第1候補で確定する。
+            // 取れなければ従来どおりひらがなで確定する。
             if sess.is_waiting() {
-                let text = sess.preedit_text().unwrap_or("").to_string();
+                const WAITING_COMMIT_WAIT_MS: u64 = 2000;
+                const DICT_LIMIT_WAIT: usize = 40;
+                let raw = sess.preedit_text().unwrap_or("").to_string();
                 sess.set_idle();
                 drop(sess);
                 candidate_window::hide();
+                candidate_window::stop_waiting_timer();
+                if engine.bg_status() == "running" {
+                    let done = engine.bg_wait_ms(WAITING_COMMIT_WAIT_MS);
+                    tracing::debug!("on_commit_raw[Waiting]: bg wait done={done}");
+                }
+                let mut text = raw.clone();
+                if engine.bg_status() == "done" {
+                    // bg のキーは hiragana_buf。raw は未確定ローマ字を含むことがある
+                    // （waiting-poll と同じく両方で試す）。
+                    let hira_key = engine.hiragana_text().to_string();
+                    let taken = match engine.bg_take_candidates(&raw) {
+                        Some(c) => Some((raw.clone(), c)),
+                        None if hira_key != raw => engine
+                            .bg_take_candidates(&hira_key)
+                            .map(|c| (hira_key.clone(), c)),
+                        None => None,
+                    };
+                    if let Some((key, llm_cands)) = taken {
+                        let merged =
+                            engine.merge_candidates_for_reading(&key, llm_cands, DICT_LIMIT_WAIT);
+                        if let Some(first) = merged.into_iter().find(|c| !c.is_empty()) {
+                            let suffix = crate::engine::state::pending_suffix_display(&raw, &key);
+                            text = format!("{first}{suffix}");
+                        }
+                    }
+                }
+                if text == raw {
+                    tracing::warn!("on_commit_raw[Waiting]: 変換が間に合わずひらがなで確定");
+                }
                 engine.bg_reclaim();
                 engine.commit(&text);
                 engine.reset_preedit();

@@ -408,7 +408,11 @@ impl super::TextServiceFactory_Impl {
         // Cancel/CancelAll はこのポーリングをスキップして on_cancel に直接渡す
         // （ポーリングで Waiting→Preedit 遷移すると on_cancel が fallthrough して全消去になる）
         let is_cancel = matches!(action, UserAction::Cancel | UserAction::CancelAll);
-        if !is_cancel {
+        // Enter（CommitRaw）も通さない: ここで Selecting へ遷移すると Enter が
+        // 「候補を開く」に化けて確定されない。Waiting の Enter は on_commit_raw が
+        // 変換の到着を待って第1候補で確定する。
+        let is_commit_raw = matches!(action, UserAction::CommitRaw);
+        if !is_cancel && !is_commit_raw {
             const DICT_LIMIT_WAIT: usize = 40;
             if let Ok(mut sess) = session_get()
                 && let Some((wait_preedit, pos_x, pos_y)) =
